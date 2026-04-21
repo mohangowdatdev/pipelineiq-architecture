@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(az account list *)",
+      "Bash(python3.11 --version)",
+      "Bash(brew list *)",
+      "Bash(brew install *)",
+      "Bash(brew tap *)",
+      "Bash(HOMEBREW_NO_AUTO_UPDATE=1 ACCEPT_EULA=Y brew install msodbcsql18 mssql-tools18)",
+      "Bash(/opt/homebrew/opt/python@3.11/bin/python3.11 --version)",
+      "Bash(direnv --version)",
+      "Bash(/opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv)",
+      "Bash(.venv/bin/python --version)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(direnv allow *)",
+      "Bash(az account *)",
+      "Bash(az storage account check-name *)",
+      "Bash(az cognitiveservices *)",
+      "Bash(az provider *)",
+      "Bash(az postgres *)",
+      "Bash(az sql *)",
+      "Bash(export AZURE_RESOURCE_GROUP=pipelineiq-rg-dev)",
+      "Bash(bash scripts/bootstrap_state.sh)",
+      "Bash(az group *)",
+      "Bash(az storage *)",
+      "Bash(terraform version *)",
+      "Bash(ps -p 14226 -o pid,state,command)",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(ps -p 14226 -o pid,state)",
+      "Bash(terraform fmt *)",
+      "Bash(terraform init *)",
+      "Bash(terraform validate *)",
+      "Bash(terraform plan *)",
+      "Bash(terraform -chdir=/Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-IaC/clients/velora plan -out=tfplan)",
+      "Bash(ps -p 14226 -o pid,state,etime)",
+      "Bash(kill 15352 14226 13926)"
+    ]
+  }
+}

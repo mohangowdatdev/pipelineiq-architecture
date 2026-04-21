@@ -1,0 +1,414 @@
+"""
+PipelineIQ Velora Data Generator — entry point.
+
+Runs as an Azure Function (timer trigger, 6am daily) or as a CLI for
+testing and historical backfill.
+
+Execution order:
+  1. Load config and initialise random state
+  2. Connect to Azure SQL
+  3. Seed catalogue if first run (products, stores, reps)
+  4. Load catalogue and existing customer pool into memory
+  5. Generate customers (new registrations + SCD updates)
+  6. Generate orders and order_lines
+  7. Generate status updates for existing orders
+  8. Generate dimension changes (prices, launches, rep reassignments)
+  9. Apply failure injection if requested
+ 10. Write all generated data to Azure SQL in a single transaction
+ 11. Write inventory snapshot (full refresh, 189k rows — separate transaction)
+ 12. Log run summary and exit
+
+CLI usage:
+  python main.py --date 2025-01-15 --dry-run
+  python main.py --date 2025-01-15 --failure schema_drift
+  python main.py --seed 999
+
+Azure Function: Azure Functions runtime calls main(mytimer) automatically.
+"""
+
+import argparse
+import logging
+import sys
+from datetime import date, datetime, timezone
+from typing import Dict, Optional
+
+import numpy as np
+import pyodbc
+from dotenv import load_dotenv
+from faker import Faker
+
+import config
+import catalogue as cat_module
+import customers as cust_module
+import orders as orders_module
+import status_updates as status_module
+import dimension_changes as dim_module
+import failure_injector as fi
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("generator.main")
+
+
+def run(
+    run_date: date,
+    dry_run: bool = False,
+    failure_type: Optional[str] = None,
+    seed: int = config.RANDOM_SEED,
+) -> Dict:
+    """
+    Main orchestration function.
+
+    Returns a dict of record counts per table for logging and test assertions.
+    """
+    logger.info(
+        "Generator run: date=%s dry_run=%s failure=%s seed=%d",
+        run_date, dry_run, failure_type, seed,
+    )
+
+    rng = np.random.default_rng(seed)
+    Faker.seed(seed)
+    fake = Faker(["en_IN"])
+
+    conn = pyodbc.connect(config.get_connection_string())
+    conn.autocommit = False
+
+    try:
+        # ── 1. Seed catalogue on first run ────────────────────────────────────
+        if not cat_module.is_catalogue_seeded(conn):
+            logger.info("Catalogue not seeded — generating and seeding now")
+            catalogue = cat_module.build_catalogue(seed=seed)
+            if not dry_run:
+                cursor = conn.cursor()
+                cat_module.seed_to_db(catalogue, cursor)
+                conn.commit()
+                logger.info("Catalogue seeded successfully")
+        else:
+            catalogue = None  # loaded from DB below
+
+        # ── 2. Load catalogue from DB ─────────────────────────────────────────
+        live_catalogue = cat_module.load_from_db(conn)
+        products_df = live_catalogue["products"]
+        pricing_df  = live_catalogue["pricing"]
+        stores_list = config.STORES
+        reps_df     = live_catalogue["reps"]
+
+        # ── 3. Load existing customers ────────────────────────────────────────
+        existing_customers_df = cust_module.load_existing_customers(conn)
+        all_cust_ids   = existing_customers_df["customer_id"].tolist()
+        d2c_cust_ids   = existing_customers_df[
+            existing_customers_df["account_type"] == "D2C"
+        ]["customer_id"].tolist()
+        b2b_cust_ids   = existing_customers_df[
+            existing_customers_df["account_type"] == "B2B"
+        ]["customer_id"].tolist()
+
+        # ── 4. Generate all data ──────────────────────────────────────────────
+        new_cust_count = config.get_adjusted_volume(
+            config.VOLUME_NEW_CUSTOMERS_MIN,
+            config.VOLUME_NEW_CUSTOMERS_MAX,
+            run_date, rng,
+        )
+        new_customers_df, new_addresses_df = cust_module.generate_new_customers(
+            count=new_cust_count,
+            cities=config.CITIES,
+            rng=rng,
+            fake=fake,
+            run_date=run_date,
+        )
+
+        upd_count = config.get_adjusted_volume(
+            config.VOLUME_CUSTOMER_UPDATES_MIN,
+            config.VOLUME_CUSTOMER_UPDATES_MAX,
+            run_date, rng,
+        )
+        customer_updates_df = cust_module.generate_customer_updates(
+            existing_df=existing_customers_df,
+            count=upd_count,
+            rng=rng,
+            cities=config.CITIES,
+            run_date=run_date,
+        )
+
+        # Combine existing + new customer IDs so new-customer orders are possible
+        new_cust_ids = new_customers_df["customer_id"].tolist() if not new_customers_df.empty else []
+        all_cust_ids_combined   = all_cust_ids + new_cust_ids
+        d2c_new = new_customers_df[new_customers_df["account_type"] == "D2C"]["customer_id"].tolist() if not new_customers_df.empty else []
+        b2b_new = new_customers_df[new_customers_df["account_type"] == "B2B"]["customer_id"].tolist() if not new_customers_df.empty else []
+        d2c_cust_ids_combined = d2c_cust_ids + d2c_new or all_cust_ids_combined
+        b2b_cust_ids_combined = b2b_cust_ids + b2b_new or all_cust_ids_combined
+
+        orders_df, order_lines_df = orders_module.generate_orders(
+            run_date=run_date,
+            all_customer_ids=all_cust_ids_combined or ["PLACEHOLDER"],
+            d2c_customer_ids=d2c_cust_ids_combined,
+            b2b_customer_ids=b2b_cust_ids_combined,
+            products_df=products_df,
+            pricing_df=pricing_df,
+            stores=stores_list,
+            reps_df=reps_df,
+            rng=rng,
+        )
+
+        open_orders_df = status_module.load_open_orders(conn, run_date)
+        delivered_df   = status_module.load_recently_delivered_orders(conn, run_date)
+        status_log_df, order_updates_df = status_module.generate_status_updates(
+            open_orders_df=open_orders_df,
+            delivered_df=delivered_df,
+            run_date=run_date,
+            rng=rng,
+        )
+
+        new_pricing_df, old_pricing_ids = dim_module.generate_price_changes(
+            products_df=products_df,
+            run_date=run_date,
+            rng=rng,
+        )
+        new_products_df, new_prod_pricing_df = dim_module.generate_product_launches(
+            products_df=products_df,
+            run_date=run_date,
+            rng=rng,
+        )
+        new_assignments_df, rep_ids_to_close = dim_module.generate_rep_reassignments(
+            reps_df=reps_df,
+            run_date=run_date,
+            rng=rng,
+        )
+
+        # ── 5. Assemble batch for failure injection ───────────────────────────
+        batch = {
+            "orders":                orders_df,
+            "order_lines":           order_lines_df,
+            "new_customers":         new_customers_df,
+            "new_addresses":         new_addresses_df,
+            "customer_updates":      customer_updates_df,
+            "_existing_customer_ids": all_cust_ids,
+        }
+        batch = fi.inject(failure_type, batch, rng)
+
+        # Pull back (possibly modified) DataFrames
+        orders_df      = batch["orders"]
+        order_lines_df = batch["order_lines"]
+        new_customers_df    = batch["new_customers"]
+        new_addresses_df    = batch["new_addresses"]
+        customer_updates_df = batch["customer_updates"]
+
+        # ── 6. Count summary ──────────────────────────────────────────────────
+        counts = {
+            "new_customers":        len(new_customers_df),
+            "new_addresses":        len(new_addresses_df),
+            "customer_updates":     len(customer_updates_df),
+            "new_orders":           len(orders_df),
+            "new_order_lines":      len(order_lines_df),
+            "status_log_entries":   len(status_log_df),
+            "orders_status_updated": len(order_updates_df),
+            "price_changes":        len(new_pricing_df),
+            "product_launches":     len(new_products_df),
+            "rep_reassignments":    len(new_assignments_df),
+        }
+
+        _log_counts(run_date, counts)
+
+        if dry_run:
+            logger.info("DRY RUN — no data written to Azure SQL")
+            return counts
+
+        # ── 7. Write all data in a single transaction ─────────────────────────
+        cursor = conn.cursor()
+
+        cust_module.write_new_customers(new_customers_df, new_addresses_df, cursor)
+        cust_module.write_customer_updates(customer_updates_df, cursor)
+        orders_module.write_orders(orders_df, order_lines_df, cursor)
+        status_module.write_status_updates(status_log_df, order_updates_df, cursor)
+        dim_module.write_dimension_changes(
+            new_pricing_df=new_pricing_df,
+            old_pricing_product_ids=old_pricing_ids,
+            new_products_df=new_products_df,
+            new_product_pricing_df=new_prod_pricing_df,
+            new_assignments_df=new_assignments_df,
+            rep_ids_to_close=rep_ids_to_close,
+            run_date=run_date,
+            cursor=cursor,
+        )
+
+        # Handle dependency_violation flag: write a control record to trigger
+        # ADF out-of-order execution on the next pipeline run
+        if batch.get("_dependency_violation"):
+            _write_dependency_violation_flag(cursor, run_date)
+
+        conn.commit()
+        logger.info("Transaction committed successfully")
+
+        # ── 8. Inventory snapshot (separate transaction — full refresh) ───────
+        inv_count = _write_inventory_snapshot(conn, products_df, run_date, rng)
+        counts["inventory_snapshot_rows"] = inv_count
+
+        return counts
+
+    except Exception:
+        conn.rollback()
+        logger.exception("Generator run failed — transaction rolled back")
+        raise
+    finally:
+        conn.close()
+
+
+def _write_inventory_snapshot(
+    conn,
+    products_df,
+    run_date: date,
+    rng: np.random.Generator,
+) -> int:
+    """
+    Full refresh daily inventory snapshot for all 4,200 products × 45 stores.
+
+    Written in a separate transaction from the main batch because:
+    - It's 189,000 rows — too large to combine with the main transaction
+    - It's idempotent by snapshot_date: running it twice for the same date
+      just inserts duplicate rows (handled by UNIQUE constraint in bootstrap_sql.sql)
+    """
+    import uuid as _uuid
+    from datetime import timezone as _tz
+
+    now = datetime.now(timezone.utc)
+    stores = config.STORES
+    rows = []
+
+    for _, prod in products_df.iterrows():
+        for store in stores:
+            opening = int(rng.integers(0, 150))
+            units_sold = int(rng.integers(0, min(opening + 1, 50)))
+            units_returned = int(rng.integers(0, max(1, units_sold // 10)))
+            closing = max(0, opening - units_sold + units_returned)
+            reorder_point = int(rng.integers(10, 40))
+
+            rows.append((
+                str(_uuid.UUID(int=int(rng.integers(0, 2**31)) + (int(rng.integers(0, 2**31)) << 32))),
+                str(prod["product_id"]),
+                store["store_id"],
+                run_date,
+                opening,
+                units_sold,
+                units_returned,
+                closing,
+                1 if closing <= 0 else 0,
+                reorder_point,
+                now,
+                "VELORA_PIM",
+            ))
+
+    sql = (
+        "INSERT INTO velora_pim.inventory_snapshot "
+        "(snapshot_id, product_id, store_id, snapshot_date, opening_stock, "
+        "units_sold, units_returned, closing_stock, stockout_flag, reorder_point, "
+        "created_at, source_system) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    conn.autocommit = False
+    cursor = conn.cursor()
+    try:
+        batch = config.SQL_INSERT_BATCH_SIZE
+        for i in range(0, len(rows), batch):
+            cursor.executemany(sql, rows[i: i + batch])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.autocommit = True
+
+    logger.info("Inventory snapshot: wrote %d rows for date %s", len(rows), run_date)
+    return len(rows)
+
+
+def _write_dependency_violation_flag(cursor, run_date: date) -> None:
+    """
+    Insert a control record that ADF reads to trigger out-of-order Gold execution.
+    Used only during dependency_violation failure injection.
+    """
+    cursor.execute(
+        "INSERT INTO velora_oms.control_flags (flag_name, flag_value, set_at) "
+        "VALUES ('force_early_fact_run', '1', ?)",
+        [datetime.now(timezone.utc)],
+    )
+    logger.warning("dependency_violation: control flag written to force early fact run")
+
+
+def _log_counts(run_date: date, counts: Dict) -> None:
+    logger.info(
+        "Run summary for %s: "
+        "%d new customers, %d SCD updates, "
+        "%d orders, %d order_lines, "
+        "%d status transitions, "
+        "%d price changes, %d launches, %d rep reassignments",
+        run_date,
+        counts["new_customers"],
+        counts["customer_updates"],
+        counts["new_orders"],
+        counts["new_order_lines"],
+        counts["status_log_entries"],
+        counts["price_changes"],
+        counts["product_launches"],
+        counts["rep_reassignments"],
+    )
+
+
+# ── Azure Function entry point ────────────────────────────────────────────────
+
+def main(mytimer=None) -> None:
+    """Azure Functions timer trigger entry point (6am daily)."""
+    today = date.today()
+    try:
+        counts = run(run_date=today)
+        logger.info("Azure Function completed: %s", counts)
+    except Exception as exc:
+        logger.exception("Azure Function failed: %s", exc)
+        raise
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Velora synthetic data generator"
+    )
+    parser.add_argument(
+        "--date",
+        type=lambda s: date.fromisoformat(s),
+        default=date.today(),
+        help="Run date in YYYY-MM-DD format (default: today)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate data and validate but do not write to Azure SQL",
+    )
+    parser.add_argument(
+        "--failure",
+        choices=fi.ALL_FAILURE_TYPES,
+        default=None,
+        help="Inject a specific failure scenario",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=config.RANDOM_SEED,
+        help=f"Random seed (default: {config.RANDOM_SEED})",
+    )
+    args = parser.parse_args()
+
+    result = run(
+        run_date=args.date,
+        dry_run=args.dry_run,
+        failure_type=args.failure,
+        seed=args.seed,
+    )
+
+    print("\nRun complete:")
+    for key, val in result.items():
+        print(f"  {key}: {val:,}")

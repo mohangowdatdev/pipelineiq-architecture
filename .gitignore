@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Environment variables — NEVER commit filled-in secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfstate.d/
+*.tfplan
+tfplan
+*.tfvars
+!*.tfvars.example
+.terraform.tfstate.lock.info
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Databricks
+.databricks/
+.databrickscfg
+
+# Node / React
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
+dist/
+build/
+.next/
+.nuxt/
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Azure Functions local settings (contains connection strings)
+local.settings.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Certificates
+*.pem
+*.key
+*.crt

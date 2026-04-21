@@ -1,0 +1,30 @@
+# PipelineIQ — shared Python dependencies
+# Used across generator, functions, and fastapi.
+# Each service also has its own requirements.txt for service-specific deps.
+
+# Azure SDK
+azure-storage-blob>=12.19.0
+azure-identity>=1.15.0
+
+# Database
+pyodbc>=5.0.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+
+# Data generation
+faker>=24.0.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+# AI
+openai>=1.12.0
+
+# Web framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Configuration
+python-dotenv>=1.0.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
