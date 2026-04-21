@@ -94,11 +94,11 @@ Client-specific source system provisioning. Lives in
 | 3.1 | Azure SQL logical server `pipelineiq-sql-velora-dev` | Done | 2026-04-21 | `PipelineIQ-IaC/source_connectors/azure_sql/main.tf` | v12.0, TLS 1.2 min, AAD admin = current user + dual password auth (DECISIONS #36) |
 | 3.2 | Azure SQL Database `velora_oms` (serverless, 2 vCore max) | Done | 2026-04-21 | `PipelineIQ-IaC/source_connectors/azure_sql/main.tf` | `GP_S_Gen5_2`, min 0.5 vCore, auto-pause 60 min, 32 GB max |
 | 3.3a | Firewall rule: allow Azure services | Done | 2026-04-21 | Terraform `allow_azure_services` rule | 0.0.0.0–0.0.0.0 (Azure-internal) |
-| 3.3b | Firewall rule: local dev IP | Blocked | 2026-04-21 | `current_ip` var in `clients/velora/terraform.tfvars` | IP lookup blocked by hook; resume by user pasting IP via `! curl -s ifconfig.me` or adding via Portal/Cloud Shell |
+| 3.3b | Firewall rule: local dev IP | Done | 2026-04-21 | `current_ip` var in `clients/velora/terraform.tfvars` | `69.5.168.130` added to both PG + SQL via tf apply |
 | 3.4 | SQL admin password + connection string in Key Vault | Done | 2026-04-21 | `clients/velora/main.tf` → `azurerm_key_vault_secret` `sql-admin-password` + `sql-connection-string` | Generated via `random_password`, 24 chars |
-| 3.5 | `bootstrap_sql.sql` executed against `velora_oms` | Blocked | 2026-04-21 | `sqlcmd -S pipelineiq-sql-velora-dev.database.windows.net -d velora_oms -G -i scripts/bootstrap_sql.sql` | Waits on 3.3b firewall IP or Cloud Shell run |
+| 3.5 | `bootstrap_sql.sql` executed against `velora_oms` | Done | 2026-04-21 | `.venv/bin/python scripts/run_bootstrap_sql.py` | 18 T-SQL batches all OK. Ran via pyodbc + AAD token (old ODBC sqlcmd doesn't support `--authentication-method`). All 4 schemas + 11 tables + control_flags created. |
 
-Blocker for Tier 5: 3.5 Done (firewall IP needed).
+Blocker for Tier 5: none.
 
 ---
 
@@ -113,9 +113,9 @@ pgvector IaC embeddings. Lives in `pipelineiq-iac/core/postgres.tf` and
 | 4.1 | PostgreSQL Flexible Server `pipelineiq-pg-dev` (B2s) | Done | 2026-04-21 | `PipelineIQ-IaC/core/postgres/main.tf` | B_Standard_B2s, PG 16, 32 GB, zone 1, dual auth (password + AAD) |
 | 4.2 | `pgvector` extension enabled (server allowlist) | Done | 2026-04-21 | `allowed_extensions = ["vector", "pg_trgm", "uuid-ossp"]` | Values MUST be lowercase (DECISIONS #37). `CREATE EXTENSION` still needed in bootstrap_postgres.sql |
 | 4.3a | Firewall rule: allow Azure services | Done | 2026-04-21 | Terraform `allow_azure_services` rule | |
-| 4.3b | Firewall rule: local dev IP | Blocked | 2026-04-21 | `current_ip` var | Same blocker as 3.3b |
+| 4.3b | Firewall rule: local dev IP | Done | 2026-04-21 | `current_ip` var | `69.5.168.130` |
 | 4.4 | Postgres admin password + connection string in Key Vault | Done | 2026-04-21 | `azurerm_key_vault_secret` `postgres-admin-password` + `postgres-connection-string` | Generated via `random_password`, 24 chars; AAD admin = current user is the preferred path |
-| 4.5 | `bootstrap_postgres.sql` executed against `postgres` DB | Blocked | 2026-04-21 | `psql -h pipelineiq-pg-dev.postgres.database.azure.com -U mohan.gowda@SailAnalyticsAP.onmicrosoft.com -d postgres -f scripts/bootstrap_postgres.sql` (AAD token as PGPASSWORD) | Waits on 4.3b firewall IP or Cloud Shell run |
+| 4.5 | `bootstrap_postgres.sql` executed against `postgres` DB | Done | 2026-04-21 | `PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv) psql ...` | `pipeline` + `pipelineiq` schemas, 6 control tables, pgvector extension, `iac_embeddings` ivfflat index, 10 entity_registry rows seeded |
 | 4.6 | Azure Functions app `pipelineiq-functions-dev` (Python 3.11, consumption) | Pending | — | `PipelineIQ-IaC/core/functions/` | Managed identity + Key Vault reference. Module not yet written. |
 
 Blocker for Tier 7: 4.5–4.6 Done.
@@ -217,4 +217,4 @@ actually works end-to-end.
 
 ---
 
-*Created 2026-04-21 (Session 1). Updated 2026-04-21 (Session 3) — Tier 2 applied in full, Tier 3/4/7 modules written + applied; 28 Azure resources live. Only blockers remaining on Phase 0: laptop-IP firewall rules on Postgres + Azure SQL, needed to run bootstrap SQL from local shell. Update the status column whenever any item changes state.*
+*Created 2026-04-21 (Session 1). Updated 2026-04-21 (Session 3, end) — Tier 2/3/4/5.1/7 all applied, bootstrap SQL complete on both PG and Azure SQL. 30 Azure resources in state. Remaining Phase 0 work: Tier 5.2-5.7 Unity Catalog (needs databricks provider), Tier 4.6 Functions app, Tier 6 ADF (Bicep). Phase 1 end-to-end verification (generator dry-run against live Azure SQL) is the natural next step. Update the status column whenever any item changes state.*

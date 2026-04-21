@@ -2,35 +2,37 @@
 
 ## Current phase
 
-**Phase 0 — Foundation** (late-stage)
+**Phase 0 — Foundation** (complete for core infra + schemas; deferred items remain)
 
-All Tier 2–4 Azure resources live: Key Vault, Log Analytics, ADLS Gen2 + 5 filesystems,
-PostgreSQL Flex + pgvector allowlist, Azure SQL server + `velora_oms` DB, Databricks
-Premium workspace, Azure OpenAI (South India) with gpt-4o deployment, 6 Key Vault secrets.
-**28 resources in state.** Only remaining Phase 0 item: bootstrap SQL execution — blocked
-on laptop-IP firewall access. See `docs/build_order.md` for granular per-item status.
+All Tier 2/3/4/5.1/7 Azure resources live. Bootstrap SQL complete on both Postgres and
+Azure SQL. **30 resources in state.** Postgres control plane: `pipeline` + `pipelineiq`
+schemas, pgvector extension, entity_registry seeded with 10 rows. Azure SQL Velora source:
+4 schemas (`velora_oms`, `velora_crm`, `velora_pim`, `velora_hrm`) + 11 tables including
+`control_flags`. Narrow firewall rules (69.5.168.130) on both servers.
 
 ## Next task
 
-**First action next session: unblock bootstrap SQL execution** (build_order items 3.3b,
-3.5, 4.3b, 4.5). Pick one path:
+**First action next session: Phase 1 end-to-end verification — generator dry-run, then
+seed run against live `velora_oms`.**
 
-(a) **Add laptop IP to firewalls via Terraform.** Run `curl -s ifconfig.me` in your
-local shell, set `current_ip = "<ip>"` in
-`PipelineIQ-IaC/clients/velora/terraform.tfvars`, `terraform apply` — adds 2 firewall
-rules (Postgres + SQL). Then:
-   - `psql -h pipelineiq-pg-dev.postgres.database.azure.com -U mohan.gowda@SailAnalyticsAP.onmicrosoft.com -d postgres -f scripts/bootstrap_postgres.sql` (use AAD token as PGPASSWORD)
-   - `sqlcmd -S pipelineiq-sql-velora-dev.database.windows.net -d velora_oms -G -U mohan.gowda@SailAnalyticsAP.onmicrosoft.com -i scripts/bootstrap_sql.sql`
+```
+cd /Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-Architecture
+.venv/bin/python generator/main.py --date 2026-01-15 --dry-run
+# If clean:
+.venv/bin/python generator/main.py --date 2026-01-15
+```
 
-(b) **Run bootstrap from Azure Cloud Shell** (shell.azure.com) — inside Azure, covered
-by the existing `allow-azure-services` rule. Shell has `psql` + `sqlcmd` pre-installed.
+Generator reads connection string from Key Vault secret `sql-connection-string`
+(or accepts `--connection-string`). Expected: catalogue seed (~60s for 4,200 products)
++ day 1 batch (customers, orders, order_lines, status updates, inventory snapshot).
 
-After bootstrap:
-1. Generator dry-run: `cd generator && python main.py --date 2026-01-15 --dry-run` against live Azure SQL (Phase 1 end-to-end verification)
-2. Generator seed run (real): `python main.py --date 2026-01-15`
-3. Tier 5 Unity Catalog metastore + external locations (needs `databricks` provider, account-level credential — separate apply stage)
-4. Tier 4.6 Azure Functions app module
-5. Tier 6 ADF (Bicep-first for pipelines/linked services)
+Then, in order:
+1. Tier 5.2–5.7 Unity Catalog + clusters + SQL Warehouse via `databricks` provider
+   (separate apply stage — account-level creds needed)
+2. Tier 4.6 Azure Functions app module
+3. Tier 6 ADF (Bicep — linked services + parameterised datasets + copy pipeline to
+   `landing`)
+4. Phase 2 kickoff: Bronze → Silver → Gold notebooks
 
 Use `docs/build_order.md` to pick up the exact next row — it's
 dependency-ordered and has a status column.
@@ -39,7 +41,7 @@ dependency-ordered and has a status column.
 
 | Phase | Status | Exit criteria | Result |
 |---|---|---|---|
-| Phase 0 | **In progress** | terraform apply clean, all resources exist, Unity Catalog shows 3 schemas, RBAC verified | 28/~32 Azure resources live. Missing: UC metastore + schemas, Functions app, ADF. Bootstrap SQL blocked on firewall IP. |
+| Phase 0 | **In progress (core done)** | terraform apply clean, all resources exist, Unity Catalog shows 3 schemas, RBAC verified | 30/~34 Azure resources live. Bootstrap SQL complete on both DBs. Remaining: UC metastore + schemas, Functions app, ADF. |
 | Phase 1 | **COMPLETE** | Generator populates all 10 Azure SQL tables. All 6 failure classes produce correct bad records. | Code complete, requires Azure SQL to verify end-to-end |
 | Phase 2 | Not started | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | — |
 | Phase 3 | Not started | Inject each failure class. Structured event in PostgreSQL within 5 minutes. | — |
@@ -192,9 +194,9 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 - Unity Catalog setup: `core/databricks/` currently creates only the workspace. UC metastore + external locations + catalog hierarchy need the `databricks` Terraform provider authenticated against the workspace. That's a second apply stage (post-workspace-creation). Architecture is straightforward; just didn't land it this session.
 - `gpt-4o` model version `2024-11-20` is hardcoded as default — may need updating when a newer version ships. Azure OpenAI model versions rotate quarterly.
 
-**Next:** (1) Unblock bootstrap SQL — either add `current_ip` to tfvars or run bootstrap from Azure Cloud Shell. (2) Run generator end-to-end dry-run then real seed against live `velora_oms`. (3) Tier 5.2–5.7 Unity Catalog + clusters + SQL Warehouse via `databricks` provider. (4) Tier 4.6 Functions app. (5) Tier 6 ADF (Bicep).
+**Next:** (1) Generator end-to-end dry-run then real seed against live `velora_oms` — Phase 1 verification. (2) Tier 5.2–5.7 Unity Catalog + clusters + SQL Warehouse via `databricks` provider. (3) Tier 4.6 Functions app. (4) Tier 6 ADF (Bicep).
 
-**Summary:** Moved Phase 0 from "Tier 2 planned but not applied" to "Tier 2/3/4/7 all live, 28 Azure resources in state, 4 new Terraform modules written + wired, 5 new architectural decisions captured (#35–#39), 2 multi-session blockers cleared (msodbcsql + untouched-tfplan)." Only Phase 0 item remaining is bootstrap SQL execution, blocked purely on needing the laptop's public IP in two firewall rules — a 30-second unblock next session. The infrastructure spine of PipelineIQ — Key Vault for secrets, Log Analytics for observability, ADLS for the medallion layers, Postgres for control plane + pgvector, Azure SQL for Velora source, Databricks Premium for compute, Azure OpenAI for RCA — is provisioned and consistent. Every secret is wired into Key Vault so downstream code never hardcodes a credential. The architecture contract in CLAUDE.md is faithfully implemented in IaC.
+**Summary:** Moved Phase 0 from "Tier 2 planned but not applied" to "Tier 2/3/4/5.1/7 all live, bootstrap SQL complete on both PG + Azure SQL, 30 Azure resources in state, 4 new Terraform modules written + wired, 5 new architectural decisions captured (#35–#39), 2 multi-session blockers cleared (msodbcsql + untouched-tfplan), 1 in-session blocker cleared (firewall IP)." End-of-session state after this session's final actions: laptop's public IP (`69.5.168.130`) added to both PG + SQL firewall rules via tf apply; `bootstrap_postgres.sql` ran via psql + AAD access token (8 tables, pgvector, 10 entity_registry rows); `bootstrap_sql.sql` ran via new `scripts/run_bootstrap_sql.py` (pyodbc + AAD token, 18 T-SQL batches OK, 4 schemas + 11 tables + control_flags). The architecture spine of PipelineIQ — Key Vault for secrets, Log Analytics for observability, ADLS for medallion layers, Postgres for control plane + pgvector, Azure SQL for Velora source with full schema, Databricks Premium for compute, Azure OpenAI for RCA — is provisioned AND schema-initialized. Phase 0 core is behind us; Phase 1 verification is a single generator command away next session.
 
 ### 2026-04-21 (Session 2)
 **Objective:** Put all three PipelineIQ repos under public source control on GitHub with proper identity separation. Write/refine READMEs. Restore AI incident generation on the live Portal demo.
