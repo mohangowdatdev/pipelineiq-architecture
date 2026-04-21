@@ -200,11 +200,11 @@ actually works end-to-end.
 
 | # | Item | Status | Date | Command | Notes |
 |---|---|---|---|---|---|
-| 9.1 | Generator dry-run against provisioned Azure SQL | Pending | — | `cd generator && python main.py --date 2025-01-01 --dry-run` | Verifies schema + connection |
-| 9.2 | Generator seed run (first batch) | Pending | — | `python main.py --date 2025-01-01` | ~60s for catalogue + day 1 batch |
-| 9.3 | ADF copy activity → landing verified | Pending | — | ADF debug run | Parquet files land in ADLS |
-| 9.4 | Bronze → Silver → Gold full run | Pending | — | Databricks Job | End-to-end Phase 2 exit |
-| 9.5 | Inject each of 6 failure classes → verify incident row in PostgreSQL | Pending | — | `python main.py --failure <class>` per class | Phase 3 exit |
+| 9.1 | Generator dry-run against provisioned Azure SQL | Skipped | 2026-04-21 | — | Dry-run mode has a known bug: skips catalogue INSERT then tries to `pd.read_sql` products, gets empty DF, fails in orders module. Skipped in favour of 9.2 since catalogue seed is idempotent (UUID5 deterministic). Fix in a later session. |
+| 9.2 | Generator seed run (first batch) | Done | 2026-04-21 | `AZURE_SQL_PASSWORD=$(az keyvault secret show ...) .venv/bin/python generator/main.py --date 2026-01-15` | Ran in ~5:30 against live velora_oms. Catalogue (4,200 products / 45 stores / 30 reps) + day 1 data (15 customers, 308 orders [176 D2C / 41 B2B / 91 Store], 1,177 order lines) + inventory snapshot (189K rows). 2 generator bugs found + fixed mid-verification (cursor-vs-conn, fast_executemany — see DECISIONS #40 + commit `7149cb4`). |
+| 9.3 | ADF copy activity → landing verified | Pending | — | ADF debug run | Parquet files land in ADLS. Blocked on Tier 6 ADF Bicep. |
+| 9.4 | Bronze → Silver → Gold full run | Pending | — | Databricks Job | End-to-end Phase 2 exit. Blocked on Tier 5.2 UC + Bronze notebook. |
+| 9.5 | Inject each of 6 failure classes → verify incident row in PostgreSQL | Pending | — | `python generator/main.py --failure <class>` per class | Phase 3 exit. Requires Phase 3 infra (ADF diagnostic settings → Log Analytics → FastAPI poller → incident_store). |
 
 ---
 
@@ -217,4 +217,4 @@ actually works end-to-end.
 
 ---
 
-*Created 2026-04-21 (Session 1). Updated 2026-04-21 (Session 3, end) — Tier 2/3/4/5.1/7 all applied, bootstrap SQL complete on both PG and Azure SQL. 30 Azure resources in state. Remaining Phase 0 work: Tier 5.2-5.7 Unity Catalog (needs databricks provider), Tier 4.6 Functions app, Tier 6 ADF (Bicep). Phase 1 end-to-end verification (generator dry-run against live Azure SQL) is the natural next step. Update the status column whenever any item changes state.*
+*Created 2026-04-21 (Session 1). Updated 2026-04-21 (Session 3, end) — Tier 2/3/4/5.1/7 all applied, bootstrap SQL complete on both PG + Azure SQL, **Phase 1 end-to-end verified** (generator seeded 2026-01-15 against live velora_oms). 30 Azure resources + first batch of real data in state. Remaining Phase 0 work: Tier 5.2-5.7 Unity Catalog (needs databricks provider), Tier 4.6 Functions app, Tier 6 ADF (Bicep). Next: (a) seed more days + inject a failure for later RCA fixtures, or (b) jump to Tier 5.2 UC + first Bronze notebook. Update the status column whenever any item changes state.*

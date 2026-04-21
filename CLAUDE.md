@@ -194,7 +194,7 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | Code complete, unverified | Phase 1 — waits on bootstrap SQL |
+| generator/ | **Verified end-to-end (S3)** | Phase 1 complete — seeded 2026-01-15 against live velora_oms |
 | notebooks/bronze/ | Pending | Phase 2 |
 | notebooks/silver/ | Pending | Phase 2 |
 | notebooks/gold/ | Pending | Phase 2 |
@@ -354,17 +354,13 @@ Claude needs that cannot be derived from reading the project files directly.
 Active items that cross session boundaries. Remove a row once resolved — do
 not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`.
 
-- **Bootstrap SQL execution blocked on firewall IP** (since 2026-04-21 S3). Both
-  `pipelineiq-pg-dev` (PostgreSQL Flex) and `pipelineiq-sql-velora-dev` (Azure SQL)
-  have only the `allow-azure-services` rule. Laptop IP not whitelisted. Unblock via
-  either: (a) get the laptop public IP (`curl -s ifconfig.me` in a local shell — or
-  type `! curl -s ifconfig.me` in a Claude Code prompt so the result lands in the
-  session), put it in `PipelineIQ-IaC/clients/velora/terraform.tfvars` as
-  `current_ip = "X.Y.Z.W"`, run `terraform apply` — adds narrow rules on both
-  servers; then run `scripts/bootstrap_postgres.sql` via psql + `scripts/bootstrap_sql.sql`
-  via sqlcmd (AAD auth with `-G`). (b) Run the bootstrap SQL from Azure Cloud Shell
-  at https://shell.azure.com — inside Azure, covered by `allow-azure-services`. Blocks
-  Phase 1 end-to-end verification (generator dry-run + seed).
+- **Generator `--dry-run` mode is broken (known).** Skips catalogue INSERT then
+  later calls `pd.read_sql` to load products; gets empty DF and fails in orders
+  module with `ValueError: product_pool is empty`. Workaround: skip dry-run and go
+  straight to real seed (catalogue is idempotent via UUID5 per DECISIONS #19).
+  Proper fix: have dry-run keep the generated catalogue DataFrame in memory and
+  short-circuit `pd.read_sql`. Low priority — real seed works end-to-end. Build_order
+  item 9.1.
 - **Unity Catalog setup deferred** (since 2026-04-21 S3). `core/databricks/` module
   creates the workspace only. UC metastore + external locations + catalog hierarchy
   need the `databricks` Terraform provider (requires account-level credentials +

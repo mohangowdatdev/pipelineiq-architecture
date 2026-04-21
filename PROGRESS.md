@@ -2,37 +2,101 @@
 
 ## Current phase
 
-**Phase 0 — Foundation** (complete for core infra + schemas; deferred items remain)
+**Phase 0 core — Done. Phase 1 — Done (end-to-end verified).**
 
-All Tier 2/3/4/5.1/7 Azure resources live. Bootstrap SQL complete on both Postgres and
-Azure SQL. **30 resources in state.** Postgres control plane: `pipeline` + `pipelineiq`
-schemas, pgvector extension, entity_registry seeded with 10 rows. Azure SQL Velora source:
-4 schemas (`velora_oms`, `velora_crm`, `velora_pim`, `velora_hrm`) + 11 tables including
-`control_flags`. Narrow firewall rules (69.5.168.130) on both servers.
+30 Azure resources live, schemas initialized on both Postgres + Azure SQL, generator
+successfully seeded `velora_oms` with day 1 (2026-01-15) data: 4,200 products +
+45 stores + 30 reps catalogue, 15 customers, 308 orders (176 D2C / 41 B2B / 91 Store),
+1,177 order lines, 189,000 inventory snapshot rows. Runtime ~5:30. Two generator bugs
+found + fixed during verification (cursor-vs-conn, fast_executemany) — see git log.
+
+Phase 0 loose ends still open: Tier 5.2–5.7 Unity Catalog, Tier 4.6 Functions app,
+Tier 6 ADF. Can proceed in parallel with Phase 2 notebook work.
 
 ## Next task
 
-**First action next session: Phase 1 end-to-end verification — generator dry-run, then
-seed run against live `velora_oms`.**
+**First action next session: pick one of (a) or (b). Auto-mode default: (b).**
 
-```
+### (a) Build time-series before Phase 2 (cheap, 3 min)
+
+Seed 5 more days so Bronze/Silver/Gold notebooks have interesting data to work on,
+plus one failure injection for later RCA fixture use:
+
+```bash
 cd /Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-Architecture
-.venv/bin/python generator/main.py --date 2026-01-15 --dry-run
-# If clean:
-.venv/bin/python generator/main.py --date 2026-01-15
+for d in 16 17 18 19 20; do .venv/bin/python generator/main.py --date 2026-01-$d; done
+.venv/bin/python generator/main.py --date 2026-01-21 --failure schema_drift
 ```
 
-Generator reads connection string from Key Vault secret `sql-connection-string`
-(or accepts `--connection-string`). Expected: catalogue seed (~60s for 4,200 products)
-+ day 1 batch (customers, orders, order_lines, status updates, inventory snapshot).
+Connection env vars (same as verification run, copy from `## Commands` section below
+or from `scripts/run_bootstrap_sql.py` comment).
 
-Then, in order:
-1. Tier 5.2–5.7 Unity Catalog + clusters + SQL Warehouse via `databricks` provider
-   (separate apply stage — account-level creds needed)
-2. Tier 4.6 Azure Functions app module
-3. Tier 6 ADF (Bicep — linked services + parameterised datasets + copy pipeline to
-   `landing`)
-4. Phase 2 kickoff: Bronze → Silver → Gold notebooks
+### (b) Start Phase 2 — Tier 5.2 Unity Catalog + Bronze notebook
+
+First actual Phase 2 work. Two parts:
+
+**1. UC infrastructure (Terraform):**
+- Add `databricks` provider to `PipelineIQ-IaC/clients/velora/providers.tf`. Needs
+  account-level auth — the workspace URL is `https://adb-<id>.<region>.azuredatabricks.net`.
+- New module `core/databricks_uc/`: metastore assignment, external locations pointing
+  at ADLS `bronze/silver/gold/landing/quarantine` filesystems, catalog hierarchy, secret
+  scope backed by Key Vault.
+- `tf plan + apply`.
+
+**2. Bronze notebook (Databricks):**
+- Parameterised PySpark notebook in `notebooks/bronze/`. Reads `landing/{entity}/` Parquet,
+  appends audit columns (`_source_file`, `_ingestion_timestamp`, `_pipeline_run_id`),
+  writes to `bronze/{entity}` Delta. Append-only, no dedup, no business logic.
+- One notebook per entity (or one parameterised notebook with entity as widget input
+  — prefer the parameterised version per CLAUDE.md entity_registry pattern).
+- Job config uses Jobs Compute cluster (DS3_v2, 1-2 workers, auto-term 30 min).
+
+### Phase 0 loose ends (interleave as convenient)
+
+1. **Tier 4.6 Azure Functions app module.** Python 3.11 consumption plan, managed
+   identity, Key Vault reference permissions. Will host watermark/control-plane APIs
+   later. Blocker for Phase 4+.
+2. **Tier 6 ADF (Bicep).** Linked services (SQL, ADLS, KV, Databricks) + parameterised
+   datasets + copy pipeline `velora_oms.*` → `landing/` with watermark-based incremental.
+   Pre-req for any Bronze notebook trigger from ADF.
+3. **Unity Catalog smoke test** — first `databricks` Terraform provider run on a
+   Sponsorship-sub workspace. Might hit account-admin-assignment friction.
+4. **Move generator to Azure Function** per its existing `function.json` + `host.json`
+   so nightly runs don't need laptop access.
+
+### Phase 2 → 8 (rough order)
+
+1. Bronze → Silver → Gold notebooks (Phase 2)
+2. ADF orchestration binds it all (Phase 2 end)
+3. Failure injection + incident capture pipeline (Phase 3)
+4. pgvector IaC ingestion + RCA prompt chain (Phase 4)
+5. FastAPI + Slack webhook (Phase 5)
+6. React dashboard merged with Portal code (Phase 6)
+7. Pattern memory + drift detection (Phase 7)
+8. End-to-end demo polish (Phase 8)
+
+## Commands (copy-paste reference)
+
+```bash
+# Generator with KV-sourced password (works from laptop or Azure Function)
+cd /Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-Architecture
+AZURE_SQL_SERVER=pipelineiq-sql-velora-dev.database.windows.net \
+AZURE_SQL_DATABASE=velora_oms \
+AZURE_SQL_USERNAME=pipelineiqadmin \
+AZURE_SQL_PASSWORD="$(az keyvault secret show --vault-name pipelineiq-kv-dev --name sql-admin-password --query value -o tsv)" \
+  .venv/bin/python generator/main.py --date 2026-01-15
+
+# psql (AAD token) — for pgvector / control plane tables
+PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv) \
+  psql "host=pipelineiq-pg-dev.postgres.database.azure.com port=5432 dbname=postgres user=mohan.gowda@SailAnalyticsAP.onmicrosoft.com sslmode=require"
+
+# Azure SQL (AAD token via pyodbc) — for Velora source inspection
+.venv/bin/python scripts/run_bootstrap_sql.py  # reference pattern
+
+# Terraform — always plan-out-then-apply
+cd /Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-IaC/clients/velora
+terraform plan -out=tfplan && terraform apply tfplan
+```
 
 Use `docs/build_order.md` to pick up the exact next row — it's
 dependency-ordered and has a status column.
@@ -42,7 +106,8 @@ dependency-ordered and has a status column.
 | Phase | Status | Exit criteria | Result |
 |---|---|---|---|
 | Phase 0 | **In progress (core done)** | terraform apply clean, all resources exist, Unity Catalog shows 3 schemas, RBAC verified | 30/~34 Azure resources live. Bootstrap SQL complete on both DBs. Remaining: UC metastore + schemas, Functions app, ADF. |
-| Phase 1 | **COMPLETE** | Generator populates all 10 Azure SQL tables. All 6 failure classes produce correct bad records. | Code complete, requires Azure SQL to verify end-to-end |
+| Phase 1 | **COMPLETE (verified end-to-end)** | Generator populates all 10 Azure SQL tables. All 6 failure classes produce correct bad records. | 2026-01-15 seed ran against live velora_oms: catalogue + 308 orders + 1177 lines + 189K inventory rows. 6 failure classes still unverified (default `--failure` not yet exercised against live DB). |
+| Phase 1 (original row — superseded above) | COMPLETE | — | See updated row for post-verification status |
 | Phase 2 | Not started | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | — |
 | Phase 3 | Not started | Inject each failure class. Structured event in PostgreSQL within 5 minutes. | — |
 | Phase 4 | Not started | 3 different error messages → semantically relevant IaC chunks returned. | — |
@@ -194,9 +259,11 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 - Unity Catalog setup: `core/databricks/` currently creates only the workspace. UC metastore + external locations + catalog hierarchy need the `databricks` Terraform provider authenticated against the workspace. That's a second apply stage (post-workspace-creation). Architecture is straightforward; just didn't land it this session.
 - `gpt-4o` model version `2024-11-20` is hardcoded as default — may need updating when a newer version ships. Azure OpenAI model versions rotate quarterly.
 
-**Next:** (1) Generator end-to-end dry-run then real seed against live `velora_oms` — Phase 1 verification. (2) Tier 5.2–5.7 Unity Catalog + clusters + SQL Warehouse via `databricks` provider. (3) Tier 4.6 Functions app. (4) Tier 6 ADF (Bicep).
+**Phase 1 verification (post-bootstrap, same session):** `generator/main.py --date 2026-01-15` against live `velora_oms`. First attempt hit two bugs — fixed and re-ran: catalogue (4,200 products + pricing + 45 stores + 30 reps) + day 1 (15 customers, 308 orders [176 D2C / 41 B2B / 91 Store], 1,177 order lines) + inventory snapshot (189K rows). Total runtime 5:30. Bug fixes in `ffa4016`-successor commit `7149cb4`. Phase 1 is officially COMPLETE end-to-end; generator proven against live DB.
 
-**Summary:** Moved Phase 0 from "Tier 2 planned but not applied" to "Tier 2/3/4/5.1/7 all live, bootstrap SQL complete on both PG + Azure SQL, 30 Azure resources in state, 4 new Terraform modules written + wired, 5 new architectural decisions captured (#35–#39), 2 multi-session blockers cleared (msodbcsql + untouched-tfplan), 1 in-session blocker cleared (firewall IP)." End-of-session state after this session's final actions: laptop's public IP (`69.5.168.130`) added to both PG + SQL firewall rules via tf apply; `bootstrap_postgres.sql` ran via psql + AAD access token (8 tables, pgvector, 10 entity_registry rows); `bootstrap_sql.sql` ran via new `scripts/run_bootstrap_sql.py` (pyodbc + AAD token, 18 T-SQL batches OK, 4 schemas + 11 tables + control_flags). The architecture spine of PipelineIQ — Key Vault for secrets, Log Analytics for observability, ADLS for medallion layers, Postgres for control plane + pgvector, Azure SQL for Velora source with full schema, Databricks Premium for compute, Azure OpenAI for RCA — is provisioned AND schema-initialized. Phase 0 core is behind us; Phase 1 verification is a single generator command away next session.
+**Next:** (1) Optionally seed 5 more days + one failure injection to prep richer data for Phase 2 (3 min). (2) Tier 5.2–5.7 Unity Catalog + clusters + SQL Warehouse via `databricks` provider — first actual Phase 2 infra work. (3) Bronze notebook (parameterised PySpark) as the first Phase 2 code. (4) In parallel: Tier 4.6 Functions app, Tier 6 ADF (Bicep).
+
+**Summary:** Moved Phase 0 from "Tier 2 planned but not applied" to "Tier 2/3/4/5.1/7 all live, bootstrap SQL complete on both PG + Azure SQL, 30 Azure resources in state, 4 new Terraform modules written + wired, 5 new architectural decisions captured (#35–#39), 2 multi-session blockers cleared (msodbcsql + untouched-tfplan), 1 in-session blocker cleared (firewall IP)." End-of-session state after this session's final actions: laptop's public IP (`69.5.168.130`) added to both PG + SQL firewall rules via tf apply; `bootstrap_postgres.sql` ran via psql + AAD access token (8 tables, pgvector, 10 entity_registry rows); `bootstrap_sql.sql` ran via new `scripts/run_bootstrap_sql.py` (pyodbc + AAD token, 18 T-SQL batches OK, 4 schemas + 11 tables + control_flags). **Then Phase 1 was verified end-to-end in the same session**: generator seeded `velora_oms` with day 1 2026-01-15 data (catalogue + 308 orders + 1,177 lines + 189K inventory rows) in ~5:30. Two generator bugs caught + fixed: main.py cursor-vs-conn mix-up, and missing `fast_executemany` on cursors (DECISIONS #40). The architecture spine of PipelineIQ — Key Vault for secrets, Log Analytics for observability, ADLS for medallion layers, Postgres for control plane + pgvector, Azure SQL for Velora source with full schema + real data, Databricks Premium for compute, Azure OpenAI for RCA — is provisioned, schema-initialized, AND holds its first real data. Phase 0 core + Phase 1 both behind us in one session. Session 4 opens with a clean choice: build more day-batches before Phase 2, or jump straight into Tier 5.2 Unity Catalog + Bronze notebook.
 
 ### 2026-04-21 (Session 2)
 **Objective:** Put all three PipelineIQ repos under public source control on GitHub with proper identity separation. Write/refine READMEs. Restore AI incident generation on the live Portal demo.
