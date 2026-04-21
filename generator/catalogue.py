@@ -386,6 +386,7 @@ def _bulk_insert(cursor, table: str, columns: List[str],
         for _, row in df.iterrows()
     ]
 
+    cursor.fast_executemany = True
     batch_size = config.SQL_INSERT_BATCH_SIZE
     for start in range(0, len(rows), batch_size):
         cursor.executemany(sql, rows[start: start + batch_size])

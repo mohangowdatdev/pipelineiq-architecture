@@ -83,8 +83,7 @@ def run(
             logger.info("Catalogue not seeded — generating and seeding now")
             catalogue = cat_module.build_catalogue(seed=seed)
             if not dry_run:
-                cursor = conn.cursor()
-                cat_module.seed_to_db(catalogue, cursor)
+                cat_module.seed_to_db(catalogue, conn)
                 conn.commit()
                 logger.info("Catalogue seeded successfully")
         else:
@@ -219,6 +218,7 @@ def run(
 
         # ── 7. Write all data in a single transaction ─────────────────────────
         cursor = conn.cursor()
+        cursor.fast_executemany = True
 
         cust_module.write_new_customers(new_customers_df, new_addresses_df, cursor)
         cust_module.write_customer_updates(customer_updates_df, cursor)
@@ -311,6 +311,7 @@ def _write_inventory_snapshot(
 
     conn.autocommit = False
     cursor = conn.cursor()
+    cursor.fast_executemany = True
     try:
         batch = config.SQL_INSERT_BATCH_SIZE
         for i in range(0, len(rows), batch):
