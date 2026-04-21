@@ -134,20 +134,57 @@ Failure runbook written in docs/runbooks/inject_failure.md.
    env var) or download Microsoft's macOS .pkg directly. Blocks Tier 3 (`sqlcmd` for
    `bootstrap_sql.sql`) and Tier 9 (pyodbc runtime for generator verification).
 
-7. **UNCOMMITTED STATE:** Both `PipelineIQ-Architecture/` and `PipelineIQ-IaC/` have
-   local changes not yet committed. IaC repo was `git init`'d but has zero commits
-   yet — entire scaffold is unstaged. Commit early in Session 3 before more work lands.
+7. **SOURCE CONTROL LIVE (Session 2).** All three repos are public on GitHub under
+   `mohangowdat-sail`: `pipelineiq-architecture`, `pipelineiq-iac`, `pipelineiq-portal`.
+   Per-repo identity `Mohan Gowda T <mohan.gowda@sail-analytics.com>`; global stays
+   on the client `sailanalyticsap.onmicrosoft.com`. First commits + first pushes done.
 
 8. **READY TO APPLY:** `PipelineIQ-IaC/clients/velora/tfplan` exists and plans 10 Azure
-   resource additions. First action in Session 3 is `terraform apply tfplan` from that
-   directory.
+   resource additions. First action next session is still `terraform apply tfplan`
+   — untouched this session.
+
+9. **Portal demo live (Session 2).** https://pipelineiq-portal.vercel.app is wired to
+   GitHub via Vercel Git integration (Root Directory = `frontend`). Push to `main` →
+   production deploy in ~20s. Slack alerts + AI incident generation + chat-over-incident
+   all functional end-to-end.
+
+10. **Portal housekeeping.** Only Production scope has `AZURE_OPENAI_API_KEY` in Vercel
+    (CLI constraints blocked Preview + Development; dashboard overrides both — do later
+    if/when PR previews or `vercel dev` are needed). Azure Key 1 first/last 8 chars
+    appeared in the Session 2 transcript; rotation recommended as hygiene.
 
 ---
-*Updated: 2026-04-21. Update this file at the end of every session before closing.*
+*Updated: 2026-04-21 (Session 2). Update this file at the end of every session before closing.*
 
 ---
 
 ## Session Log
+
+### 2026-04-21 (Session 2)
+**Objective:** Put all three PipelineIQ repos under public source control on GitHub with proper identity separation. Write/refine READMEs. Restore AI incident generation on the live Portal demo.
+
+**Built:**
+- **Source control:** `git init` + initial commit + public GitHub repos + first push for all three. Repos created via `gh repo create --public --source --remote=origin --push`: [`pipelineiq-architecture`](https://github.com/mohangowdat-sail/pipelineiq-architecture), [`pipelineiq-iac`](https://github.com/mohangowdat-sail/pipelineiq-iac), [`pipelineiq-portal`](https://github.com/mohangowdat-sail/pipelineiq-portal). Per-repo identity `Mohan Gowda T <mohan.gowda@sail-analytics.com>` set via `git config user.email` inside each repo; global identity stays on the client `sailanalyticsap.onmicrosoft.com` so commits in client work aren't re-attributed.
+- **READMEs:** new `README.md` for Architecture (tagline, why-this-exists, 6 failure classes, full architecture diagram, tech stack table, companion-repo links, getting-started, phase tracker). Enhanced `README.md` for IaC (live Tier 0–8 provisioning tracker referencing `docs/build_order.md`, design conventions citing DECISIONS #27–30, new-client walkthrough). New `README.md` for Portal (layout, prerequisites, getting-started, deployment flow, Phase 6 supersession note).
+- **Portal git scaffolding:** root `.gitignore` covering Python venv/`node_modules/`/`.vercel/`/`.env`/`dist/`/`.vite/`/IDE/OS. New `backend/.env.example` documenting `APP_PASSWORD` / `DATABASE_URL` / `JWT_SECRET` / `SLACK_WEBHOOK_URL`.
+- **Portal live on Vercel with Git-connected auto-deploy.** Root Directory = `frontend` via dashboard import. Slack alerts + AI incident generation (`/api/generate-incident`) + chat-over-incident (`/api/chat-incident`) all verified with HTTP 200 response and real Azure OpenAI output. Production env vars `AZURE_OPENAI_API_KEY` + `SLACK_WEBHOOK_URL` set via CLI + dashboard.
+- **CLAUDE.md:** refined `## Session discipline rules` into an explicit end-of-session checklist — every file (PROGRESS always; DECISIONS when choices made; build_order when items change; CLAUDE for guardrails/pending; PLANNING for arch shifts; SCHEMA for data model changes; docs/{phase} at phase end) has a named when-to-update criterion. Added `## Pending / carry-overs` section for cross-session items.
+- **DECISIONS.md:** #33 (Portal live-demo backend architecture — React SPA + Vercel Serverless Functions in `frontend/api/`; FastAPI deferred). #34 (Azure AI resource `pipeline-iq-resource` actual location — Sponsorship sub, `rg-pipelineiq`, centralus, kind `AIServices`).
+
+**Worked:** `gh repo create --public --source --remote=origin --push` in one shot for each repo — init + remote + first push in a single command. Vercel dashboard import with Root Directory = `frontend` + env vars on the import screen is the cleanest path to Git integration; CLI `vercel git connect` was a dead end (Vercel GitHub App install flow requires browser). The split of `frontend/api/*.js` as Vercel Serverless Functions (the live demo's actual backend) vs `backend/` FastAPI (local-dev only, not deployed) turns out to be a valid hybrid — matches Vercel's serverless model, keeps the live demo zero-infra, and reserves FastAPI for when persistent CRUD is needed in Phase 6.
+
+**Broke:**
+- AI incident generation returned HTTP 500 with Azure 401 for most of the session. Walked through five speculative code paths before isolating root cause: `fetch` vs SDK, `api-key` vs `Authorization: Bearer`, `chat/completions` vs `/responses`, `openai.azure.com` vs `services.ai.azure.com`. All failed identically. Finally retrieved the live Key 1 via `az cognitiveservices account keys list --subscription "Microsoft Azure Sponsorship" -n pipeline-iq-resource -g rg-pipelineiq --query key1 -o tsv` and curl-tested — the original reverted code (`chat.completions.create()` on `openai.azure.com/openai/v1/`) returned HTTP 200 immediately. Root cause: the `AZURE_OPENAI_API_KEY` value stored in Vercel did not match either Key 1 or Key 2 on the actual resource. All five "fix" commits were reverted to initial state; only the env-var rotation (via `vercel env rm` + `vercel env add --value --yes --sensitive` piped from `az`) actually mattered. Lesson: run the raw-curl auth check first when the first response is 401, not after five iterations.
+- Vercel CLI `vercel env add` has sharp edges: Preview scope requires `--git-branch` or dashboard; Development scope refuses `--sensitive`. Production + `--value "$K" --yes --sensitive` is the working non-interactive path.
+
+**Uncertainty:**
+- Preview and Development scopes of `AZURE_OPENAI_API_KEY` unset (Production only). Dashboard required to finish. Does not block the live demo.
+- Rotate Key 1 on `pipeline-iq-resource` as hygiene — `first8=G2F8oS21 last8=ACOGwlg6` appeared in this session's transcript during debug (16 of 84 chars). Low exposure but worth doing.
+- The original wrong key the user pasted (`8uW2IuvsLi...`) is not any current key on the resource. Likely a stale snapshot from pre-rotation state or a different Azure portal blade. Not worth chasing.
+
+**Next:** Resume Phase 0 — `terraform apply tfplan` from `PipelineIQ-IaC/clients/velora/` (carry-over from Session 1, unchanged — Terraform was not touched this session). Then continue down `docs/build_order.md` Tier 2.3–2.5 verify + Tier 3 scaffolding.
+
+**Summary:** All three PipelineIQ repos are now public on GitHub with proper per-repo identity separation, and the Portal demo is fully functional with push-to-deploy on Vercel. The load-bearing discovery of the session is captured in DECISIONS.md #34: the Azure AI resource backing Portal lives on the Sponsorship subscription as an `AIServices`-kind resource (not classic Azure OpenAI), at `rg-pipelineiq`/centralus — future sessions will find the resource immediately instead of hunting. CLAUDE.md's session discipline is now an explicit end-of-session checklist so the cross-file update cadence can't be skipped by accident. **Terraform was not touched this session** — the pending `apply tfplan` carries forward untouched into the next session.
 
 ### 2026-04-21
 **Objective:** Kick off Phase 0. Bootstrap Terraform state backend. Scaffold `PipelineIQ-IaC/` as a sibling repo. Write Tier 2 core Terraform modules (Key Vault, Log Analytics, ADLS Gen2). Reach a clean `terraform plan` ready to apply.

@@ -352,15 +352,25 @@ Claude needs that cannot be derived from reading the project files directly.
 Active items that cross session boundaries. Remove a row once resolved — do
 not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`.
 
-- **msodbcsql18 + mssql-tools18 install blocked** (2026-04-21). Brew deadlocked
-  on interactive EULA despite `ACCEPT_EULA=Y`. Retry with `HOMEBREW_ACCEPT_EULA=Y`
-  or Microsoft's direct macOS .pkg. Blocks Tier 3 `sqlcmd` + Tier 9 pyodbc.
-- **Uncommitted state** (2026-04-21). Both `PipelineIQ-Architecture/` and
-  `PipelineIQ-IaC/` have local changes not yet committed. `PipelineIQ-IaC/` has
-  zero commits — entire scaffold is unstaged. Commit early next session.
-- **Tier 2 `tfplan` ready to apply** (2026-04-21). `PipelineIQ-IaC/clients/velora/tfplan`
-  plans 10 resource additions (Key Vault, Log Analytics, ADLS Gen2 + filesystems).
-  First action next session: `terraform apply tfplan`.
+- **msodbcsql18 + mssql-tools18 install blocked** (since 2026-04-21 S1). Brew
+  deadlocked on interactive EULA despite `ACCEPT_EULA=Y`. Retry with
+  `HOMEBREW_ACCEPT_EULA=Y` or Microsoft's direct macOS .pkg. Blocks Tier 3
+  `sqlcmd` + Tier 9 pyodbc.
+- **Tier 2 `tfplan` ready to apply** (since 2026-04-21 S1, untouched in S2).
+  `PipelineIQ-IaC/clients/velora/tfplan` plans 10 resource additions (Key Vault,
+  Log Analytics, ADLS Gen2 + filesystems). First action next session:
+  `terraform apply tfplan`.
+- **Portal Preview + Development env vars** (2026-04-21 S2). Only Production has
+  `AZURE_OPENAI_API_KEY` in Vercel — CLI blocked Preview on branch-scoping and
+  Development on the `--sensitive` flag. Dashboard overrides both. Not blocking
+  the live site; finish via dashboard if/when PR previews or `vercel dev` are
+  needed.
+- **Rotate Key 1 on `pipeline-iq-resource`** (2026-04-21 S2). First/last 8 chars
+  (`G2F8oS21...ACOGwlg6`, 16 of 84) appeared in S2 transcript during debug. Azure
+  Portal → resource → Keys and Endpoint → Regenerate Key 1 → update the Vercel
+  env var (`az cognitiveservices account keys list ...` piped to
+  `vercel env add AZURE_OPENAI_API_KEY production --value "$K" --yes --sensitive`).
+  Low exposure; recommended as hygiene.
 
 ---
 
