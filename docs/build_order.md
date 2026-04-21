@@ -38,9 +38,9 @@ Machine-level setup needed before any cloud work. One-time per developer.
 | 0.5 | Generator Python deps installed | Done | 2026-04-21 | `pip install -r generator/requirements.txt` | pandas, numpy, faker, pyodbc, sqlalchemy, azure-identity |
 | 0.6 | direnv installed + hooked | Done | 2026-04-21 | `brew install direnv` + `~/.zshrc` hook | Auto-activates venv + loads .env on cd |
 | 0.7 | `.envrc` + `.env` written, `direnv allow` run | Done | 2026-04-21 | `.envrc` committed, `.env` gitignored | Sponsorship sub + Sail tenant IDs in .env |
-| 0.8 | Microsoft ODBC Driver 18 for SQL Server | Blocked | 2026-04-21 | Retry tomorrow | Brew install deadlocked 55 min on interactive EULA despite `ACCEPT_EULA=Y`. Killed. Retry with `HOMEBREW_ACCEPT_EULA=Y` or direct Microsoft .pkg. Blocks Tier 3 sqlcmd + Tier 9 pyodbc runs. |
+| 0.8 | Microsoft ODBC Driver 18 for SQL Server | Done | 2026-04-21 | `HOMEBREW_ACCEPT_EULA=Y brew install msodbcsql18 mssql-tools18` | `msodbcsql18` 18.6.2.1 + `mssql-tools18` 18.6.2.1 installed (S3). `HOMEBREW_ACCEPT_EULA=Y` was the right env var (not `ACCEPT_EULA=Y`). `sqlcmd` + `bcp` at `/opt/homebrew/bin/`. |
 | 0.9 | Terraform CLI (>= 1.6) | Done | 2026-04-21 | `brew install hashicorp/tap/terraform` | v1.14.8. HashiCorp's own tap — `brew install terraform` on default registry is stale/absent |
-| 0.10 | Microsoft ODBC Driver 18 install finished | Blocked | 2026-04-21 | — | Duplicate of 0.8 (remove in next cleanup). Same blocker. |
+| 0.10 | Microsoft ODBC Driver 18 install finished | Done | 2026-04-21 | — | Duplicate of 0.8 — resolved same session. |
 | 0.11 | `PipelineIQ-IaC/` sibling repo scaffolded + git init | Done | 2026-04-21 | `mkdir` + `git init` | Folder structure per CLAUDE.md: `core/`, `source_connectors/*`, `clients/velora/`, `pipelineiq_app/`, `bicep/adf/`, `scripts/`. CLAUDE.md + README.md + .gitignore + .terraform-version written. Separate git repo, not pushed yet. |
 
 ---
@@ -74,12 +74,12 @@ to diagnostic settings.
 | 2.3a | Core submodules written (`keyvault/`, `log_analytics/`, `adls/`) | Done | 2026-04-21 | `PipelineIQ-IaC/core/{keyvault,log_analytics,adls}/` | Submodule pattern per DECISIONS.md #29. Each: main.tf + variables.tf + outputs.tf |
 | 2.3b | Velora composition wired | Done | 2026-04-21 | `PipelineIQ-IaC/clients/velora/main.tf` | Calls all 3 core modules with common tags and name prefix/suffix |
 | 2.3c | `terraform plan` clean | Done | 2026-04-21 | `tfplan` saved | 10 resources to add: KV + 2 role assignments + LAW + Storage + 5 ADLS filesystems |
-| 2.3 | Key Vault `pipelineiq-kv-dev` applied | **Pending** | — | `terraform apply tfplan` | **Next session's first task** — RBAC-auth, purge protection off, soft-delete 7d |
-| 2.4 | Log Analytics workspace `pipelineiq-logs-dev` applied | **Pending** | — | `terraform apply tfplan` | 30-day retention, PerGB2018, no daily quota |
-| 2.5 | ADLS Gen2 `pipelineiqadlsdev` + filesystems applied | **Pending** | — | `terraform apply tfplan` | HNS enabled; filesystems: landing/bronze/silver/gold/quarantine |
+| 2.3 | Key Vault `pipelineiq-kv-dev` applied | Done | 2026-04-21 | `terraform apply tfplan` (S3) | RBAC-auth, purge protection off, soft-delete 7d. Required Owner role on RG — user elevated mid-session (DECISIONS #35). |
+| 2.4 | Log Analytics workspace `pipelineiq-logs-dev` applied | Done | 2026-04-21 | `terraform apply tfplan` (S3) | 30-day retention, PerGB2018, no daily quota |
+| 2.5 | ADLS Gen2 `pipelineiqadlsdev` + filesystems applied | Done | 2026-04-21 | `terraform apply tfplan` (S3) | HNS enabled; 5 filesystems all live: landing/bronze/silver/gold/quarantine |
 | 2.6 | Managed identities for ADF + Databricks + Functions | Deferred | — | — | Deferred per DECISIONS.md #31 — system-assigned identities created alongside each downstream resource instead |
 
-Blocker for next tier: 2.3–2.5 applied (tfplan exists and is ready).
+Blocker for next tier: none — all Done.
 
 ---
 
@@ -91,13 +91,14 @@ Client-specific source system provisioning. Lives in
 
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
-| 3.1 | Azure SQL logical server `pipelineiq-sql-dev` | Pending | — | `source_connectors/azure_sql/server.tf` | AAD auth + SQL auth |
-| 3.2 | Azure SQL Database `velora` (serverless, 2 vCore max) | Pending | — | `source_connectors/azure_sql/database.tf` | Auto-pause 60 min |
-| 3.3 | Firewall rule: allow Azure services + local dev IP | Pending | — | `source_connectors/azure_sql/firewall.tf` | Dev only |
-| 3.4 | SQL admin password in Key Vault | Pending | — | Terraform + Key Vault secret | Reference from connection strings |
-| 3.5 | `bootstrap_sql.sql` executed against `velora` | Pending | — | `sqlcmd -S … -d velora -i scripts/bootstrap_sql.sql` | Creates all 10 source tables + control_flags |
+| 3.1 | Azure SQL logical server `pipelineiq-sql-velora-dev` | Done | 2026-04-21 | `PipelineIQ-IaC/source_connectors/azure_sql/main.tf` | v12.0, TLS 1.2 min, AAD admin = current user + dual password auth (DECISIONS #36) |
+| 3.2 | Azure SQL Database `velora_oms` (serverless, 2 vCore max) | Done | 2026-04-21 | `PipelineIQ-IaC/source_connectors/azure_sql/main.tf` | `GP_S_Gen5_2`, min 0.5 vCore, auto-pause 60 min, 32 GB max |
+| 3.3a | Firewall rule: allow Azure services | Done | 2026-04-21 | Terraform `allow_azure_services` rule | 0.0.0.0–0.0.0.0 (Azure-internal) |
+| 3.3b | Firewall rule: local dev IP | Blocked | 2026-04-21 | `current_ip` var in `clients/velora/terraform.tfvars` | IP lookup blocked by hook; resume by user pasting IP via `! curl -s ifconfig.me` or adding via Portal/Cloud Shell |
+| 3.4 | SQL admin password + connection string in Key Vault | Done | 2026-04-21 | `clients/velora/main.tf` → `azurerm_key_vault_secret` `sql-admin-password` + `sql-connection-string` | Generated via `random_password`, 24 chars |
+| 3.5 | `bootstrap_sql.sql` executed against `velora_oms` | Blocked | 2026-04-21 | `sqlcmd -S pipelineiq-sql-velora-dev.database.windows.net -d velora_oms -G -i scripts/bootstrap_sql.sql` | Waits on 3.3b firewall IP or Cloud Shell run |
 
-Blocker for Tier 5: 3.1–3.5 Done.
+Blocker for Tier 5: 3.5 Done (firewall IP needed).
 
 ---
 
@@ -109,14 +110,15 @@ pgvector IaC embeddings. Lives in `pipelineiq-iac/core/postgres.tf` and
 
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
-| 4.1 | PostgreSQL Flexible Server `pipelineiq-postgres-dev` (B2s) | Pending | — | `pipelineiq-iac/core/postgres.tf` | Burstable tier, stop on nights |
-| 4.2 | `pgvector` extension enabled | Pending | — | `allowlisted_extensions = ["PGVECTOR", ...]` | Server parameter |
-| 4.3 | Firewall rule: allow Azure services + local dev IP | Pending | — | Terraform | Dev only |
-| 4.4 | Postgres admin password in Key Vault | Pending | — | Terraform + Key Vault secret | |
-| 4.5 | `bootstrap_postgres.sql` executed against `pipelineiq` DB | Pending | — | `psql $POSTGRES_URL -f scripts/bootstrap_postgres.sql` | Control plane schema + iac_embeddings |
-| 4.6 | Azure Functions app `pipelineiq-functions-dev` (Python 3.11, consumption) | Pending | — | `pipelineiq-iac/core/functions.tf` | Managed identity + Key Vault reference |
+| 4.1 | PostgreSQL Flexible Server `pipelineiq-pg-dev` (B2s) | Done | 2026-04-21 | `PipelineIQ-IaC/core/postgres/main.tf` | B_Standard_B2s, PG 16, 32 GB, zone 1, dual auth (password + AAD) |
+| 4.2 | `pgvector` extension enabled (server allowlist) | Done | 2026-04-21 | `allowed_extensions = ["vector", "pg_trgm", "uuid-ossp"]` | Values MUST be lowercase (DECISIONS #37). `CREATE EXTENSION` still needed in bootstrap_postgres.sql |
+| 4.3a | Firewall rule: allow Azure services | Done | 2026-04-21 | Terraform `allow_azure_services` rule | |
+| 4.3b | Firewall rule: local dev IP | Blocked | 2026-04-21 | `current_ip` var | Same blocker as 3.3b |
+| 4.4 | Postgres admin password + connection string in Key Vault | Done | 2026-04-21 | `azurerm_key_vault_secret` `postgres-admin-password` + `postgres-connection-string` | Generated via `random_password`, 24 chars; AAD admin = current user is the preferred path |
+| 4.5 | `bootstrap_postgres.sql` executed against `postgres` DB | Blocked | 2026-04-21 | `psql -h pipelineiq-pg-dev.postgres.database.azure.com -U mohan.gowda@SailAnalyticsAP.onmicrosoft.com -d postgres -f scripts/bootstrap_postgres.sql` (AAD token as PGPASSWORD) | Waits on 4.3b firewall IP or Cloud Shell run |
+| 4.6 | Azure Functions app `pipelineiq-functions-dev` (Python 3.11, consumption) | Pending | — | `PipelineIQ-IaC/core/functions/` | Managed identity + Key Vault reference. Module not yet written. |
 
-Blocker for Tier 7: 4.1–4.6 Done.
+Blocker for Tier 7: 4.5–4.6 Done.
 
 ---
 
@@ -128,8 +130,8 @@ secrets referenced via Key Vault).
 
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
-| 5.1 | Databricks workspace `pipelineiq-databricks-dev` (Premium) | Pending | — | `pipelineiq-iac/core/databricks.tf` | Premium for Unity Catalog, audit, RBAC |
-| 5.2 | Unity Catalog metastore attached | Pending | — | `databricks_metastore_assignment` | One per region |
+| 5.1 | Databricks workspace `pipelineiq-dbx-dev` (Premium) | Done | 2026-04-21 | `PipelineIQ-IaC/core/databricks/main.tf` | Premium SKU, managed RG `pipelineiq-dbx-dev-managed-rg`. Workspace module deliberately minimal — UC setup deferred to 5.2. |
+| 5.2 | Unity Catalog metastore attached | Pending | — | `databricks_metastore_assignment` | One per region. Needs the `databricks` provider (account-level credential) — next session |
 | 5.3 | External location: ADLS containers `landing`, `bronze`, `silver`, `gold`, `quarantine` | Pending | — | `databricks_external_location` | Access via managed identity |
 | 5.4 | Unity Catalog schemas: `bronze`, `silver`, `gold` | Pending | — | Notebook or `databricks_schema` | |
 | 5.5 | Jobs Compute cluster policy | Pending | — | Terraform | DS3_v2, auto-terminate 30m |
@@ -167,9 +169,9 @@ immaterial. See DECISIONS.md #25.
 
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
-| 7.1 | Azure OpenAI account `pipelineiq-openai-dev` (South India) | Pending | — | `pipelineiq-iac/core/openai.tf` | Region override — see DECISIONS.md #25 |
-| 7.2 | GPT-4o model deployment | Pending | — | `azurerm_cognitive_deployment` | Standard throughput |
-| 7.3 | OpenAI key stored in Key Vault | Pending | — | Terraform | Referenced by Functions + FastAPI |
+| 7.1 | Azure OpenAI account `pipelineiq-openai-dev` (South India) | Done | 2026-04-21 | `PipelineIQ-IaC/core/openai/main.tf` | S0 SKU, custom_subdomain = account name → `https://pipelineiq-openai-dev.openai.azure.com/` |
+| 7.2 | GPT-4o model deployment | Done | 2026-04-21 | `azurerm_cognitive_deployment.this["gpt-4o"]` | Model version `2024-11-20`, Standard SKU, capacity 10. South India hosts GPT-4o — confirmed. |
+| 7.3 | OpenAI key + endpoint stored in Key Vault | Done | 2026-04-21 | `azurerm_key_vault_secret` `openai-api-key` + `openai-endpoint` | |
 | 7.4 | Container Apps environment `pipelineiq-aca-dev` | Pending | — | `pipelineiq-iac/core/container_apps.tf` | Central India |
 | 7.5 | FastAPI Container App `pipelineiq-fastapi-dev` | Pending | — | Terraform | Managed identity + Key Vault refs |
 | 7.6 | Ingress: public HTTPS with managed cert | Pending | — | Terraform | |
@@ -215,4 +217,4 @@ actually works end-to-end.
 
 ---
 
-*Created 2026-04-21. Update the status column whenever any item changes state.*
+*Created 2026-04-21 (Session 1). Updated 2026-04-21 (Session 3) — Tier 2 applied in full, Tier 3/4/7 modules written + applied; 28 Azure resources live. Only blockers remaining on Phase 0: laptop-IP firewall rules on Postgres + Azure SQL, needed to run bootstrap SQL from local shell. Update the status column whenever any item changes state.*

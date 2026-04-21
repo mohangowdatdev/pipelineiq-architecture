@@ -194,13 +194,15 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | In progress | Phase 1 |
-| notebooks/bronze/ | In progress | Phase 2 |
-| notebooks/silver/ | In progress | Phase 2 |
-| notebooks/gold/ | In progress | Phase 2 |
-| functions/ | In progress | Phase 2 |
-| fastapi/ | In progress | Phase 5 |
-| react/ | In progress | Phase 6 |
+| generator/ | Code complete, unverified | Phase 1 — waits on bootstrap SQL |
+| notebooks/bronze/ | Pending | Phase 2 |
+| notebooks/silver/ | Pending | Phase 2 |
+| notebooks/gold/ | Pending | Phase 2 |
+| functions/ | Pending | Phase 2 |
+| fastapi/ | Pending | Phase 5 |
+| react/ | Pending | Phase 6 |
+| IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
+| IaC source_connectors/azure_sql | Stable | Phase 0 — applied |
 
 ---
 
@@ -352,14 +354,26 @@ Claude needs that cannot be derived from reading the project files directly.
 Active items that cross session boundaries. Remove a row once resolved — do
 not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`.
 
-- **msodbcsql18 + mssql-tools18 install blocked** (since 2026-04-21 S1). Brew
-  deadlocked on interactive EULA despite `ACCEPT_EULA=Y`. Retry with
-  `HOMEBREW_ACCEPT_EULA=Y` or Microsoft's direct macOS .pkg. Blocks Tier 3
-  `sqlcmd` + Tier 9 pyodbc.
-- **Tier 2 `tfplan` ready to apply** (since 2026-04-21 S1, untouched in S2).
-  `PipelineIQ-IaC/clients/velora/tfplan` plans 10 resource additions (Key Vault,
-  Log Analytics, ADLS Gen2 + filesystems). First action next session:
-  `terraform apply tfplan`.
+- **Bootstrap SQL execution blocked on firewall IP** (since 2026-04-21 S3). Both
+  `pipelineiq-pg-dev` (PostgreSQL Flex) and `pipelineiq-sql-velora-dev` (Azure SQL)
+  have only the `allow-azure-services` rule. Laptop IP not whitelisted. Unblock via
+  either: (a) get the laptop public IP (`curl -s ifconfig.me` in a local shell — or
+  type `! curl -s ifconfig.me` in a Claude Code prompt so the result lands in the
+  session), put it in `PipelineIQ-IaC/clients/velora/terraform.tfvars` as
+  `current_ip = "X.Y.Z.W"`, run `terraform apply` — adds narrow rules on both
+  servers; then run `scripts/bootstrap_postgres.sql` via psql + `scripts/bootstrap_sql.sql`
+  via sqlcmd (AAD auth with `-G`). (b) Run the bootstrap SQL from Azure Cloud Shell
+  at https://shell.azure.com — inside Azure, covered by `allow-azure-services`. Blocks
+  Phase 1 end-to-end verification (generator dry-run + seed).
+- **Unity Catalog setup deferred** (since 2026-04-21 S3). `core/databricks/` module
+  creates the workspace only. UC metastore + external locations + catalog hierarchy
+  need the `databricks` Terraform provider (requires account-level credentials +
+  workspace URL). Build as a second apply stage — `clients/velora/databricks_uc.tf`
+  or a separate module. Covers `docs/build_order.md` items 5.2–5.7.
+- **Tier 4.6 Azure Functions app not yet written.** Module stub needed at
+  `PipelineIQ-IaC/core/functions/` — Python 3.11, consumption plan, managed identity
+  with Key Vault reference permissions. Required before any watermark / incident API
+  work in Phase 2+.
 - **Portal Preview + Development env vars** (2026-04-21 S2). Only Production has
   `AZURE_OPENAI_API_KEY` in Vercel — CLI blocked Preview on branch-scoping and
   Development on the `--sensitive` flag. Dashboard overrides both. Not blocking
