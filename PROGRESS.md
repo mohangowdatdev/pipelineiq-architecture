@@ -30,12 +30,24 @@ table, query via SQL Warehouse — 158 rows, all audit columns present).
 
 **Session 6 plan (Phase 2 continuation, suggested order):**
 
-1. **Backfill the remaining 9 Bronze tables.** Run `scripts/run_bronze_smoke.py`
-   for each entity (`orders`, `order_lines`, `order_status_log`, `customer_addresses`,
-   `products`, `product_pricing`, `inventory_snapshot`, `sales_reps`,
-   `territory_assignments`). The notebook is entity-agnostic so no code changes.
-   Cluster reuse should make subsequent runs ~2 min each. Total ~25 min. Pick this
-   up first — you'll want all 10 Bronze tables before Silver dev starts.
+1. **Backfill the remaining 8 Bronze tables.** Already ingested in S5:
+   `customers` (158 rows) and `orders` (4,001 rows incl. duplicates from
+   partial export runs — see Notes #10). Still to do:
+   `order_lines`, `order_status_log`, `customer_addresses`, `products`,
+   `product_pricing`, `inventory_snapshot`, `sales_reps`,
+   `territory_assignments`. Run `scripts/run_bronze_smoke.py --entity X`
+   per entity. The notebook is entity-agnostic — no code changes. Cluster
+   reuse makes subsequent runs ~2 min each. Total ~20 min. **Note:**
+   before backfilling, consider wiping `landing/orders/date=2026-01-15..19/`
+   duplicate Parquet files first (or `DROP TABLE bronze.default.orders` and
+   re-ingest cleanly) — see Notes #10. Cleanest is just to clean orders
+   then go.
+
+   **Also note** the daily Function will have run by then (DECISIONS #49) —
+   `velora_oms` will now hold day 22, day 23, etc. depending on when you
+   resume. Re-run `scripts/export_velora_to_landing.py` first to land the
+   new days as Parquet, then ingest Bronze. Or do that as a single step
+   per entity inside the Bronze backfill.
 2. **First Silver notebook.** Pattern target: dedup-on-business-key MERGE into
    `silver.default.{entity}`, add DQ flags + rejection_reason, partition by
    `_silver_timestamp::date`. Per CLAUDE.md: Silver is where unification +
