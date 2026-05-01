@@ -65,13 +65,14 @@ def run(
 
     Returns a dict of record counts per table for logging and test assertions.
     """
+    effective_seed = seed + run_date.toordinal()
     logger.info(
-        "Generator run: date=%s dry_run=%s failure=%s seed=%d",
-        run_date, dry_run, failure_type, seed,
+        "Generator run: date=%s dry_run=%s failure=%s seed=%d effective_seed=%d",
+        run_date, dry_run, failure_type, seed, effective_seed,
     )
 
-    rng = np.random.default_rng(seed)
-    Faker.seed(seed)
+    rng = np.random.default_rng(effective_seed)
+    Faker.seed(effective_seed)
     fake = Faker(["en_IN"])
 
     conn = pyodbc.connect(config.get_connection_string())

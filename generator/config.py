@@ -253,7 +253,7 @@ def get_connection_string() -> str:
         f"DATABASE={SQL_DATABASE};"
         f"UID={SQL_USERNAME};"
         f"PWD={SQL_PASSWORD};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=90;"
     )
 
 

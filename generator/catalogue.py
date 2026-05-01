@@ -320,6 +320,11 @@ def seed_to_db(catalogue: Dict, conn) -> None:
                   "created_at", "source_system"],
                  catalogue["product_pricing"])
 
+    _bulk_insert(cursor, "velora_pim.stores",
+                 ["store_id", "store_name", "city", "state",
+                  "territory_id", "store_tier", "is_active", "opened_date"],
+                 catalogue["stores"])
+
     _bulk_insert(cursor, "velora_hrm.sales_reps",
                  ["rep_id", "full_name", "email", "phone", "hire_date",
                   "is_active", "created_at", "updated_at", "source_system"],
