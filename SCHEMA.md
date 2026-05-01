@@ -6,6 +6,172 @@ for every table in the architecture.
 
 ---
 
+## Data lifecycle, frequency, volume
+
+How data enters the source DB, how often, and how much accumulates per
+unit time. **Read this before reasoning about retention, partitioning, or
+performance.** Per-table column specs live further down.
+
+### How the source is fed
+
+The Velora OLTP DB is fed by `generator/main.py` — a manual command-line
+script invoked **once per logical date**:
+
+```bash
+.venv/bin/python generator/main.py --date 2026-01-15
+```
+
+There is no automation today. The 7 days currently in `velora_oms`
+(2026-01-15 through 2026-01-21) reflect 7 manual invocations across
+Sessions 3 and 4. A half-built Azure Function deployment hook
+(`generator/function.json` + `host.json`) would let it run on a schedule
+once deployed; that work is a Phase 0 loose end (see PROGRESS.md). To
+extend the dataset, fire the script for each new date.
+
+### Four data-evolution patterns at the source
+
+Each Velora table follows one of four patterns. Pipeline design
+(SCD-Type, MERGE keys, partitioning, quarantine logic) flows from this
+classification.
+
+#### 1. Append-only event tables — immutable history
+
+Each row is a discrete event. Once written, never updated. Re-running
+the generator for the same date is idempotent (deterministic UUIDs from
+date-derived RNG seed per DECISIONS #41).
+
+| Table | Event | Daily rows (typical) |
+|---|---|---|
+| `velora_oms.orders` | A new order placed that day | ~340 |
+| `velora_oms.order_lines` | Line items for those orders | ~1,200 |
+| `velora_oms.order_status_log` | A status transition (`PENDING → PROCESSING` → …) | ~470 |
+| `velora_pim.product_pricing` | A price-change record (with `effective_from` + `effective_to`) | sporadic, ~6 over 7 days |
+| `velora_hrm.territory_assignments` | A sales-rep territory change | sporadic |
+
+Querying `orders WHERE order_date = 2026-01-15` always returns the same
+308 rows. ADF watermark for these in production: `updated_at` (or
+`created_at` for the append-only-by-design ones), but the generator's
+audit columns currently hold seed time, not logical date — see
+DECISIONS #47 for why the export script (`scripts/export_velora_to_landing.py`)
+pivots on business-date columns instead.
+
+#### 2. Mutable dimension tables — UPDATEd in place, prior values lost at source
+
+Rows are inserted on first appearance, then **mutated** when the entity
+changes. The source DB does not preserve history — if customer X's
+segment changes from `INDIVIDUAL` to `BUSINESS` on day 18, the source
+row is overwritten and the prior segment is gone from `velora_crm.customers`.
+
+| Table | Mutations |
+|---|---|
+| `velora_crm.customers` | New customers added daily; `segment`, `city`, `is_active` may change for existing rows |
+| `velora_crm.customer_addresses` | New addresses added; `is_primary` flag flips |
+| `velora_pim.products` | New launches; `is_active` flips (rare) |
+| `velora_hrm.sales_reps` | New onboards; minor field updates |
+
+Daily mutation volume is small (~3–10 changes/day per table) — driven
+by `generator/dimension_changes.py`. **This is where SCD-Type-2 logic in
+Gold earns its keep:** Silver captures the prior value before each MERGE
+so `gold.dim_customer` keeps both rows with `valid_from`/`valid_to`/
+`is_current` and can answer "what was the segment on Jan 16?". Without
+that capture, source mutation = irreversible loss.
+
+#### 3. Daily full-snapshot table — `velora_pim.inventory_snapshot`
+
+The architectural outlier. Every run captures a **full state of every
+product × every store × that date**:
+
+```
+4,200 products × 45 stores = 189,000 rows per day
+```
+
+Each row reports `opening_stock`, `units_sold`, `units_returned`,
+`closing_stock`, `stockout_flag`, `reorder_point` for that
+`(product_id, store_id, snapshot_date)` triple. Day N's snapshot is
+**independent** of day N-1's — there is no event log connecting them.
+`gold.fact_inventory_daily` reads these directly.
+
+ADF watermark: `snapshot_date` (DATE, not DATETIME2 — see per-table
+spec below).
+
+#### 4. Static reference tables — seeded once, never updated
+
+| Table | Why static |
+|---|---|
+| `velora_pim.stores` | 45 stores, fixed retail footprint |
+| `velora_pim.product_categories` | 35 entries, fixed taxonomy |
+| `velora_oms.control_flags` | Operational toggles (e.g. `force_early_fact_run`), not business data |
+
+These are loaded by `generator/catalogue.py::seed_to_db` on first run
+and **not extracted by ADF** — Gold loads them directly from the source
+seed. Listed here only so future notebook authors don't accidentally
+ingest them.
+
+### Volume forecast
+
+Worst-case (`inventory_snapshot`) projections — all other tables
+combined add <1% of the inventory volume.
+
+| Horizon | Inventory rows | Compressed Parquet | All tables combined |
+|---|---:|---:|---:|
+| 7 days (today) | 1,323,000 | ~31 MB | ~33 MB |
+| 30 days | 5,670,000 | ~135 MB | ~145 MB |
+| 90 days | 17,010,000 | ~405 MB | ~430 MB |
+| 365 days | 68,985,000 | ~1.6 GB | ~1.7 GB |
+
+Bytes per row measured at ~23 bytes (snappy-compressed Parquet, observed
+on day-15 file: 4.44 MB / 189,000 rows). Storage cost on ADLS at
+$0.018/GB/month: a full year of data = **~3¢/month**. Storage is not
+the constraint at any horizon we'd realistically build to.
+
+Query performance: with date partitioning + Z-ORDER on
+`(product_id, store_id)` at Gold, point-in-time queries stay fast even
+on the full year. Aggregate scans across 12 months on a 2X-Small SQL
+warehouse complete in ~10-30 seconds — fine for analytics, slow for
+operational dashboards (use cached aggregates if the dashboard needs
+sub-second).
+
+### Real-world scale comparison
+
+Velora's volume is **small** by retail standards. Reference points:
+
+| Retailer (rough) | SKUs × stores | Inventory rows/day | rows/year |
+|---|---|---:|---:|
+| Velora (this project) | 4,200 × 45 | 189K | 69M |
+| Mid-size India retailer (Croma, Westside) | ~30K × ~200 | 6M | 2.2B |
+| Walmart-scale | ~50K × ~4,700 | 235M | 86B |
+
+Daily-snapshot inventory is the standard pattern at every scale —
+real warehouses use date-partitioned Parquet on S3/ADLS exactly the way
+we are. The architecture scales linearly; only the partition / Z-order /
+warehouse-size knobs need turning.
+
+### Operational guidance for PipelineIQ specifically
+
+This is a demo project. **Don't backfill beyond 60-90 days.** A year of
+data adds no demonstrable value — every chart, SCD example, failure
+scenario, and RCA narrative works on 30 days. Beyond ~90 days, query
+times during dev get noticeably slower and cluster minutes add up
+without changing what you can show.
+
+When you do extend the dataset:
+```bash
+for d in $(seq 22 31); do
+  .venv/bin/python generator/main.py --date 2026-01-$(printf %02d $d)
+done
+```
+
+**If you ever needed to scale beyond 90 days** in a real deployment,
+the architectural lever is **CDC (delta) instead of full snapshot** —
+record only inventory *changes* (units_sold, restocks, returns) and
+reconstruct state by replay. Trades storage for compute. Real warehouses
+typically do **both** — CDC for transactional truth, daily snapshots for
+fast point-in-time queries. PipelineIQ stays on snapshots-only because
+the demo narrative is "look at end-of-day state" — adding CDC would
+increase complexity without changing what we demonstrate.
+
+---
+
 ## Azure SQL Database — Velora source tables
 
 Most transactional tables carry these audit columns:
@@ -633,6 +799,26 @@ schema evolves. Always read this before writing data code.*
 
 Append-only record of every schema edit. New rows on top. Never edit
 or remove prior rows — superseded entries get a "superseded by #N" note.
+
+### #4 — 2026-05-01 (Session 5) — `## Data lifecycle, frequency, volume` section added at top of SCHEMA.md
+
+- **Change:** new top-level section before the per-table specs covering
+  generator cadence (manual cmd-line, no automation), four data-evolution
+  patterns (append-only events, mutable dimensions, daily snapshot, static
+  reference), per-day / 30-day / 90-day / 1-year volume forecast, and
+  real-world retail scale comparison (Velora vs. Croma vs. Walmart).
+- **Why:** during Session 5 wrap, the user surfaced a recurring confusion
+  about whether the source runs daily, what `inventory_snapshot` actually
+  captures (snapshot vs. CDC), and whether the volume scales — answered
+  inline, then asked for it durably documented. The section answers four
+  distinct future-author questions in one place: (1) "is the source
+  generating new rows right now?" (no), (2) "what gets UPDATEd in place
+  vs. appended?" (table-by-table), (3) "how big does this get over time?"
+  (concrete projections), (4) "is this realistic?" (yes — under-provisioned
+  vs. real retail, see comparison table).
+- **Generator impact:** none. The section is descriptive of existing
+  behavior; no code changes.
+- **Reference:** the conversation in the Session 5 transcript.
 
 ### #3 — 2026-04-22 (Session 4) — `velora_hrm.territories` clarified as non-existent
 
