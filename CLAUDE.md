@@ -198,7 +198,7 @@ managed_by  = "terraform"
 | notebooks/bronze/ | **First entity ingested (S5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). `bronze.default.customers` verified end-to-end. Backfill 9 more Bronze tables in S6 task 1. |
 | notebooks/silver/ | Pending | Phase 2 — start with `silver.orders` |
 | notebooks/gold/ | Pending | Phase 2 — `gold.dim_customer` first |
-| functions/ | Pending | Phase 2 |
+| functions/ | **Stable (S5 add.)** | Daily generator timer trigger live (`pipelineiq-functions-dev`); `core/functions/` IaC stable. DECISIONS #49. ADF replacements for Bronze chain still pending in Tier 6. |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
 | IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
@@ -390,10 +390,9 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Proper fix: have dry-run keep the generated catalogue DataFrame in memory and
   short-circuit `pd.read_sql`. Low priority — real seed works end-to-end. Build_order
   item 9.1.
-- **Tier 4.6 Azure Functions app not yet written.** Module stub needed at
-  `PipelineIQ-IaC/core/functions/` — Python 3.11, consumption plan, managed identity
-  with Key Vault reference permissions. Required before any watermark / incident API
-  work in Phase 2+.
+- ~~Tier 4.6 Azure Functions app~~ **Done (S5 addendum, 2026-05-01).** Function App
+  `pipelineiq-functions-dev` live; daily generator timer trigger verified. See
+  DECISIONS #49 + `core/functions/` IaC module.
 - **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
   + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
   `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —

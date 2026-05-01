@@ -243,18 +243,26 @@ SQL_USERNAME = os.getenv("AZURE_SQL_USERNAME", "")
 SQL_PASSWORD = os.getenv("AZURE_SQL_PASSWORD", "")
 SQL_DRIVER   = "ODBC Driver 18 for SQL Server"
 
+# Auth mode: "password" (default, for laptop/CI) or "msi" (Azure Function with
+# system-assigned managed identity). When "msi", UID/PWD are ignored and ODBC
+# negotiates a token via the host's MSI endpoint.
+SQL_AUTH_MODE = os.getenv("AZURE_SQL_AUTH_MODE", "password").lower()
+
 SQL_INSERT_BATCH_SIZE = 1_000  # rows per executemany batch
 
 
 def get_connection_string() -> str:
-    return (
+    base = (
         f"DRIVER={{{SQL_DRIVER}}};"
         f"SERVER={SQL_SERVER};"
         f"DATABASE={SQL_DATABASE};"
-        f"UID={SQL_USERNAME};"
-        f"PWD={SQL_PASSWORD};"
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=90;"
     )
+    if SQL_AUTH_MODE == "msi":
+        # System-assigned managed identity (Azure Function MSI auth).
+        return base + "Authentication=ActiveDirectoryMsi;"
+    # Password auth — laptop / CI.
+    return base + f"UID={SQL_USERNAME};PWD={SQL_PASSWORD};"
 
 
 def get_adjusted_volume(base_min: int, base_max: int, run_date: date,

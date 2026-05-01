@@ -116,7 +116,7 @@ pgvector IaC embeddings. Lives in `pipelineiq-iac/core/postgres.tf` and
 | 4.3b | Firewall rule: local dev IP | Done | 2026-04-21 | `current_ip` var | `69.5.168.130` |
 | 4.4 | Postgres admin password + connection string in Key Vault | Done | 2026-04-21 | `azurerm_key_vault_secret` `postgres-admin-password` + `postgres-connection-string` | Generated via `random_password`, 24 chars; AAD admin = current user is the preferred path |
 | 4.5 | `bootstrap_postgres.sql` executed against `postgres` DB | Done | 2026-04-21 | `PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv) psql ...` | `pipeline` + `pipelineiq` schemas, 6 control tables, pgvector extension, `iac_embeddings` ivfflat index, 10 entity_registry rows seeded |
-| 4.6 | Azure Functions app `pipelineiq-functions-dev` (Python 3.11, consumption) | Pending | — | `PipelineIQ-IaC/core/functions/` | Managed identity + Key Vault reference. Module not yet written. |
+| 4.6 | Azure Functions app `pipelineiq-functions-dev` (Python 3.11, consumption) | Done | 2026-05-01 | `PipelineIQ-IaC/core/functions/` | Linux consumption (Y1), Python 3.11, system-assigned MSI, App Insights wired to existing Log Analytics. MSI granted Key Vault Secrets User + Azure SQL `db_datareader` / `db_datawriter` / `db_ddladmin`. First function deployed: timer-triggered `generator` (CRON `0 0 6 * * *` UTC). Verified end-to-end: trigger → resolve `MAX(order_date) + 1` via MSI auth → generator run → 362 orders landed for 2026-01-22 (DECISIONS #49). |
 
 Blocker for Tier 7: 4.5–4.6 Done.
 

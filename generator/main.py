@@ -28,9 +28,18 @@ Azure Function: Azure Functions runtime calls main(mytimer) automatically.
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date, datetime, timezone
 from typing import Dict, Optional
+
+# Ensure sibling modules (config, catalogue, customers, …) are importable
+# whether this file is run as a CLI script (`python generator/main.py ...`)
+# or imported by Azure Functions as `generator.main` (where the package dir
+# isn't on sys.path by default).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
 
 import numpy as np
 import pyodbc
@@ -362,12 +371,50 @@ def _log_counts(run_date: date, counts: Dict) -> None:
 
 # ── Azure Function entry point ────────────────────────────────────────────────
 
+# Velora's narrative starts on 2026-01-15. If the orders table is empty when
+# the timer fires (first run after a fresh DB bootstrap), seed from this date.
+_NARRATIVE_START_DATE = date(2026, 1, 15)
+
+
+def next_logical_date(conn: pyodbc.Connection) -> date:
+    """Resolve the next Velora logical date as max(order_date) + 1.
+
+    Falls back to _NARRATIVE_START_DATE if velora_oms.orders is empty.
+    Decoupled from wall-clock time per Session 5's "Option A" decision —
+    Velora's narrative continues smoothly past day 21 → 22 → 23 regardless
+    of when the Function actually runs.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(order_date) FROM velora_oms.orders")
+    row = cur.fetchone()
+    last = row[0] if row else None
+    if last is None:
+        logger.info("velora_oms.orders is empty — starting at narrative start %s", _NARRATIVE_START_DATE)
+        return _NARRATIVE_START_DATE
+    from datetime import timedelta
+    next_date = last + timedelta(days=1)
+    logger.info("Last order_date = %s → next logical date = %s", last, next_date)
+    return next_date
+
+
 def main(mytimer=None) -> None:
-    """Azure Functions timer trigger entry point (6am daily)."""
-    today = date.today()
+    """Azure Functions timer trigger entry point.
+
+    Resolves the next logical Velora date as max(orders.order_date) + 1
+    (Option A — relative continuity, decoupled from wall-clock), then runs
+    the generator for that date. ADF (Tier 6) handles everything downstream
+    (landing extract, Bronze/Silver/Gold notebooks). This Function only
+    simulates the source-system OLTP writes.
+    """
     try:
-        counts = run(run_date=today)
-        logger.info("Azure Function completed: %s", counts)
+        conn = pyodbc.connect(config.get_connection_string())
+        try:
+            run_date = next_logical_date(conn)
+        finally:
+            conn.close()
+
+        counts = run(run_date=run_date)
+        logger.info("Azure Function completed for %s: %s", run_date, counts)
     except Exception as exc:
         logger.exception("Azure Function failed: %s", exc)
         raise
