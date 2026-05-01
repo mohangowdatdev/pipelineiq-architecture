@@ -8,13 +8,19 @@ for every table in the architecture.
 
 ## Azure SQL Database — Velora source tables
 
-All tables carry these audit columns:
+Most transactional tables carry these audit columns:
   created_at    DATETIME2 DEFAULT GETUTCDATE()
   updated_at    DATETIME2 DEFAULT GETUTCDATE()
   source_system NVARCHAR(20) DEFAULT 'VELORA_{SCHEMA}'
 
-ADF watermark column: updated_at (all tables except order_status_log
-and inventory_snapshot which use created_at and snapshot_date).
+Static reference tables (`product_categories`, `stores`, `control_flags`)
+carry a reduced set — they are seeded once by the generator and are **not**
+extracted by ADF. See the per-table specs below and the `## Schema change
+log` at the bottom of this file for the rationale.
+
+ADF watermark column: updated_at (most tables); exceptions — `order_status_log`
+uses `created_at`, `inventory_snapshot` uses `snapshot_date`, `product_pricing`
+and `territory_assignments` use `created_at` (append-only by design).
 
 ### velora_oms.orders
 ```
@@ -59,6 +65,19 @@ created_at      DATETIME2
 source_system   NVARCHAR(20)
 ```
 
+### velora_oms.control_flags
+```
+flag_id         INT           PK IDENTITY(1,1)
+flag_name       NVARCHAR(100)
+flag_value      NVARCHAR(100)
+set_at          DATETIME2     DEFAULT GETUTCDATE()
+```
+
+Operational control table. Read by ADF Web Activity at runtime to toggle
+execution paths (e.g. `force_early_fact_run` for the `dependency_violation`
+failure scenario). **Not extracted by ADF.** Not in Bronze/Silver/Gold.
+Added per DECISIONS #21.
+
 ### velora_crm.customers
 ```
 customer_id     NVARCHAR(36)  PK
@@ -90,12 +109,25 @@ updated_at      DATETIME2
 source_system   NVARCHAR(20)
 ```
 
+### velora_pim.product_categories
+```
+category_id     NVARCHAR(36)  PK
+category_name   NVARCHAR(200)
+sub_category    NVARCHAR(200) NULL
+division        NVARCHAR(50)
+is_active       BIT           DEFAULT 1
+```
+
+Static reference table. 35 rows seeded once by `generator/catalogue.py`.
+No audit columns (by design — never updated post-seed). **Not extracted
+by ADF** — loaded directly into `gold.dim_product_category`.
+
 ### velora_pim.products
 ```
 product_id      NVARCHAR(36)  PK
 sku             NVARCHAR(50)  UNIQUE
 product_name    NVARCHAR(500)
-category_id     NVARCHAR(36)  FK -> product_categories (static ref table)
+category_id     NVARCHAR(36)  FK -> velora_pim.product_categories
 division        NVARCHAR(50)  -- 'CONSUMER_ELECTRONICS' | 'HOME_APPLIANCES' |
                               --  'PERSONAL_CARE' | 'SPORTS_FITNESS' |
                               --  'PREMIUM_ACCESSORIES'
@@ -124,7 +156,7 @@ source_system   NVARCHAR(20)
 ```
 snapshot_id     NVARCHAR(36)  PK
 product_id      NVARCHAR(36)  FK -> velora_pim.products
-store_id        NVARCHAR(20)
+store_id        NVARCHAR(20)  FK -> velora_pim.stores
 snapshot_date   DATE
 opening_stock   INT
 units_sold      INT           DEFAULT 0
@@ -135,6 +167,26 @@ reorder_point   INT
 created_at      DATETIME2
 source_system   NVARCHAR(20)
 ```
+
+### velora_pim.stores
+```
+store_id        NVARCHAR(20)  PK
+store_name      NVARCHAR(200)
+city            NVARCHAR(100)
+state           NVARCHAR(100)
+territory_id    NVARCHAR(36)
+store_tier      NVARCHAR(20)  -- 'FLAGSHIP' | 'STANDARD' | 'EXPRESS'
+is_active       BIT           DEFAULT 1
+opened_date     DATE          NULL
+```
+
+Static store master. 45 rows seeded once by `generator/catalogue.py`.
+No audit columns. **Not extracted by ADF** — loaded directly into
+`gold.dim_store`. Referenced by `velora_oms.orders.store_id` (STORE
+channel only) and `velora_pim.inventory_snapshot.store_id`.
+
+Added to SCHEMA.md and to `seed_to_db` mid-Session 4 after a data-quality
+sweep caught 45 missing rows; see DECISIONS #44 and the change log below.
 
 ### velora_hrm.sales_reps
 ```
@@ -160,6 +212,17 @@ is_current      BIT           DEFAULT 1
 created_at      DATETIME2
 source_system   NVARCHAR(20)
 ```
+
+### velora_hrm.territories (does not exist)
+
+There is **no** `velora_hrm.territories` source table. `territory_id`
+values appear as uncorrelated strings in `velora_pim.stores` and
+`velora_hrm.territory_assignments`. `gold.dim_territory` is built from
+the distinct set of those strings plus a city/state/region enrichment
+lookup in the Gold notebook — not from a source extract.
+
+`generator/catalogue.py::_build_territories()` is dead code. See
+DECISIONS #44 tail.
 
 ---
 
@@ -563,3 +626,58 @@ Index: `CREATE INDEX ON pipelineiq.iac_embeddings
 
 *This file is updated during Phase 2 (Silver columns) and as the
 schema evolves. Always read this before writing data code.*
+
+---
+
+## Schema change log
+
+Append-only record of every schema edit. New rows on top. Never edit
+or remove prior rows — superseded entries get a "superseded by #N" note.
+
+### #3 — 2026-04-22 (Session 4) — `velora_hrm.territories` clarified as non-existent
+
+- **Change:** added explicit "does not exist" note after `territory_assignments`.
+- **Why:** `generator/catalogue.py::_build_territories()` produces a DataFrame
+  that is never written anywhere — `bootstrap_sql.sql` has no `territories`
+  table. Territory IDs live only as strings in `stores` and `territory_assignments`.
+  `gold.dim_territory` is synthesised in the Gold notebook from the distinct set
+  of those strings. SCHEMA.md previously implied a territories table existed
+  (because `dim_territory` has a full spec under Gold) — now explicit.
+- **Generator impact:** `_build_territories()` is dead code. Flagged for cleanup
+  but not load-bearing.
+- **Reference:** DECISIONS #44 (tail).
+
+### #2 — 2026-04-22 (Session 4) — `velora_pim.stores` added to SCHEMA.md
+
+- **Change:** added full source-table spec (previously only the Gold
+  `dim_store` was documented).
+- **Why:** the table was present in `bootstrap_sql.sql` and `bootstrap_sql.sql`
+  created it, but SCHEMA.md never listed it as a source. Consequence: the
+  generator's `seed_to_db` originally **skipped** the stores INSERT because
+  no spec forced the author to remember it (`_build_stores()` built the
+  DataFrame, `build_catalogue()` returned it, but the write step never
+  referenced it). 45 stores sat in memory and never landed. Bug caught by a
+  data-quality sweep at the end of Session 4 task 1 — 770 STORE-channel
+  orders and 1.32M inventory rows pointed at `store_id` values with no row
+  in `velora_pim.stores`. Silver/Gold joins would have been empty.
+- **Generator impact:** `catalogue.py::seed_to_db` now writes `stores` after
+  `product_pricing` and before `sales_reps`. Backfilled 45 rows in-session.
+- **Pipeline impact:** `stores` is **static** — not extracted by ADF, loaded
+  directly into `gold.dim_store` from the source seed. No Bronze/Silver pass.
+- **Reference:** DECISIONS #44.
+
+### #1 — 2026-04-22 (Session 4) — `velora_pim.product_categories` and `velora_oms.control_flags` given full specs
+
+- **Change:** `product_categories` was previously a parenthetical "static ref
+  table" on `products.category_id`; now has a full column spec. `control_flags`
+  was undocumented here entirely (only mentioned in DECISIONS #21).
+- **Why (`product_categories`):** 35 rows seeded by the generator, needed for
+  `gold.dim_product_category`. Any notebook author would have to reverse-engineer
+  the column set from `bootstrap_sql.sql` — cheaper to document here once.
+- **Why (`control_flags`):** operational control table read by ADF Web Activity
+  at runtime. Not a pipeline-extracted entity, but SCHEMA.md is the canonical
+  column-level reference for every table that exists in the source DB, so it
+  belongs here with a clear "not in Bronze/Silver/Gold" note to prevent a future
+  notebook author from accidentally ingesting it.
+- **Generator impact:** none — both tables were already written correctly.
+- **Reference:** DECISIONS #21 (for `control_flags`).

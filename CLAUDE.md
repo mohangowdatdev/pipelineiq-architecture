@@ -195,14 +195,17 @@ managed_by  = "terraform"
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
 | generator/ | **Verified end-to-end (S3)** | Phase 1 complete — seeded 2026-01-15 against live velora_oms |
-| notebooks/bronze/ | Pending | Phase 2 |
-| notebooks/silver/ | Pending | Phase 2 |
-| notebooks/gold/ | Pending | Phase 2 |
+| notebooks/bronze/ | **First entity ingested (S5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). `bronze.default.customers` verified end-to-end. Backfill 9 more Bronze tables in S6 task 1. |
+| notebooks/silver/ | Pending | Phase 2 — start with `silver.orders` |
+| notebooks/gold/ | Pending | Phase 2 — `gold.dim_customer` first |
 | functions/ | Pending | Phase 2 |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
 | IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
 | IaC source_connectors/azure_sql | Stable | Phase 0 — applied |
+| IaC core/databricks_uc | **Stable (S5)** | Adopted system metastore + 3 catalogs + 5 external locations + storage credential + cluster policy + SQL warehouse + secret scope. DECISIONS #46. |
+| scripts/export_velora_to_landing.py | Stable (scaffold) | Phase 2 — substitutes for ADF until Tier 6 lands. DECISIONS #47. |
+| scripts/run_bronze_smoke.py | Stable (scaffold) | Phase 2 — driver for one-off Bronze ingestion. Replaced by ADF + scheduled Job in Tier 6. |
 
 ---
 
@@ -322,11 +325,37 @@ others are conditional — skip only when the condition genuinely does not apply
 | **SCHEMA.md** | Only when the data model changed (new table, new column, type change, constraint change, SCD-type change) | Edit the affected table. Bump any dependent bootstrap SQL (`scripts/bootstrap_sql.sql`, `scripts/bootstrap_postgres.sql`) in the same session. |
 | **`docs/{phase}.md`** | Only at the end of a phase (phase exit criteria met) | Write or finalise the phase's doc. Do not write phase docs speculatively before the phase is done. |
 | **`docs/runbooks/*.md`** | Whenever an operational procedure was established or changed | Concise, reproducible steps. Commands first, prose second. |
+| **`docs/incident_log.md`** | Whenever any blocker, bug, or production-style incident exceeded ~15 min to diagnose or fix | One new entry per incident using the schema at the top of the file. Append only — never edit prior entries. Update the Index table with severity/category/effort/hardest. Fill in Root cause, Fix, and Prevention immediately after the blocker clears — deferring loses the diagnosis detail. |
 
 When the user explicitly says "wrap up the session", "end of session",
 "update the docs", or similar: run the full checklist above, no shortcuts.
 Treat that phrase as a trigger to audit every file in the table and confirm
 each row's status — touched or legitimately skipped.
+
+### Git: commit + push at end of every session (mandatory)
+
+After the docs checklist is satisfied, **commit and push every repo touched
+this session** so the session lands as a clean point in history. This is the
+guardrail the user explicitly relies on for "go back in time" recovery —
+nothing locally-only at end of session.
+
+For each repo with uncommitted work (`PipelineIQ-Architecture`,
+`PipelineIQ-IaC`, `PipelineIQ-Portal`):
+
+1. `git status` — confirm only intended files are staged. Never `git add -A`
+   without reviewing — `terraform.tfvars`, `.env`, state files, `*.tfplan`,
+   key material must stay untracked.
+2. One commit per logical chunk; tail commit of the session is the doc-update
+   commit (PROGRESS / DECISIONS / build_order / etc.). Reasonable to combine
+   docs + last code change if they're tightly coupled.
+3. `git push origin main` (or current branch).
+4. Verify push succeeded — `git log origin/main..HEAD` should print nothing.
+
+If a push is blocked (auth, branch protection, network), surface the failure
+explicitly to the user — do not let the session "end" while changes are still
+local. The user's recovery model assumes every session-end has a remote tip.
+
+Never `git push --force` to main without explicit user instruction.
 
 ### Session log format
 
@@ -361,15 +390,20 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Proper fix: have dry-run keep the generated catalogue DataFrame in memory and
   short-circuit `pd.read_sql`. Low priority — real seed works end-to-end. Build_order
   item 9.1.
-- **Unity Catalog setup deferred** (since 2026-04-21 S3). `core/databricks/` module
-  creates the workspace only. UC metastore + external locations + catalog hierarchy
-  need the `databricks` Terraform provider (requires account-level credentials +
-  workspace URL). Build as a second apply stage — `clients/velora/databricks_uc.tf`
-  or a separate module. Covers `docs/build_order.md` items 5.2–5.7.
 - **Tier 4.6 Azure Functions app not yet written.** Module stub needed at
   `PipelineIQ-IaC/core/functions/` — Python 3.11, consumption plan, managed identity
   with Key Vault reference permissions. Required before any watermark / incident API
   work in Phase 2+.
+- **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
+  + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
+  `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —
+  the scaffold script is a reasonable substitute until Tier 6 lands.
+- **`docs/runbooks/databricks_account_admin_bootstrap.md` step 5 verification path
+  is slightly stale.** The runbook says "click avatar → Manage Account should be
+  visible" but Databricks's newer UI doesn't surface a literal "Manage Account" link.
+  Working verification: open `https://accounts.azuredatabricks.net` directly as the
+  promoted user; if the sidebar shows Workspaces / User management / Cloud Resources,
+  the role is active. Update the runbook on next touch.
 - **Portal Preview + Development env vars** (2026-04-21 S2). Only Production has
   `AZURE_OPENAI_API_KEY` in Vercel — CLI blocked Preview on branch-scoping and
   Development on the `--sensitive` flag. Dashboard overrides both. Not blocking
@@ -398,3 +432,4 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
 | pgvector / AI RCA logic | docs/ai_rca.md |
 | Fixing a PostgreSQL schema issue | scripts/bootstrap_postgres.sql |
 | Fixing an Azure SQL schema issue | scripts/bootstrap_sql.sql |
+| Hit an error that feels familiar | docs/incident_log.md — check Index table before chasing speculative causes |

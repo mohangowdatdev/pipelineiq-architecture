@@ -2,67 +2,66 @@
 
 ## Current phase
 
-**Phase 0 core — Done. Phase 1 — Done (end-to-end verified).**
+**Phase 0 — Done (incl. Tier 5 UC). Phase 1 — Done. Phase 2 — Started: first Bronze table written end-to-end (`bronze.default.customers`, 158 rows, verified via SQL Warehouse).**
 
-30 Azure resources live, schemas initialized on both Postgres + Azure SQL, generator
-successfully seeded `velora_oms` with day 1 (2026-01-15) data: 4,200 products +
-45 stores + 30 reps catalogue, 15 customers, 308 orders (176 D2C / 41 B2B / 91 Store),
-1,177 order lines, 189,000 inventory snapshot rows. Runtime ~5:30. Two generator bugs
-found + fixed during verification (cursor-vs-conn, fast_executemany) — see git log.
+39 Azure resources live (30 from prior + 9 UC: access connector, role assignment,
+storage credential, 5 external locations, 3 catalogs, cluster policy, SQL warehouse,
+secret scope). UC metastore adopted from system (1-per-region limit) — see DECISIONS
+#46. **`landing/` ADLS filesystem holds 1,345,689 rows of Parquet** across 14 by-date
+partitions (orders, inventory_snapshot — 7 days each) plus 8 master-table full
+snapshots (order_lines, order_status_log, customers, customer_addresses, products,
+product_pricing, sales_reps, territory_assignments).
 
-Phase 0 loose ends still open: Tier 5.2–5.7 Unity Catalog, Tier 4.6 Functions app,
-Tier 6 ADF. Can proceed in parallel with Phase 2 notebook work.
+**Session 5 unblocked the multi-session Databricks Account Admin gate** in five minutes.
+User signed into `https://accounts.azuredatabricks.net` as the Sail Global Admin,
+toggled `mohan.gowda` to Account Admin, signed out. Then a clean Terraform apply
+landed all of Tier 5.2–5.8. The two-stage rollout from DECISIONS #45 collapsed into
+a single apply via DECISIONS #46 (adopt the system metastore as a data source rather
+than create a new one — Databricks limits 1 metastore per region per account).
+
+**Phase 2 opened the same session.** `scripts/export_velora_to_landing.py` lands all
+Velora source tables as Parquet (substitutes for ADF until Tier 6 ships); the Bronze
+notebook `notebooks/bronze/ingest_to_bronze.py` is entity-agnostic and ingests any
+landing entity into `bronze.default.{entity}` with 4 audit columns + `_ingestion_date`
+partition. Smoke-tested on `customers` end-to-end (read landing Parquet, write Delta
+table, query via SQL Warehouse — 158 rows, all audit columns present).
 
 ## Next task
 
-**First action next session: pick one of (a) or (b). Auto-mode default: (b).**
+**Session 6 plan (Phase 2 continuation, suggested order):**
 
-### (a) Build time-series before Phase 2 (cheap, 3 min)
+1. **Backfill the remaining 9 Bronze tables.** Run `scripts/run_bronze_smoke.py`
+   for each entity (`orders`, `order_lines`, `order_status_log`, `customer_addresses`,
+   `products`, `product_pricing`, `inventory_snapshot`, `sales_reps`,
+   `territory_assignments`). The notebook is entity-agnostic so no code changes.
+   Cluster reuse should make subsequent runs ~2 min each. Total ~25 min. Pick this
+   up first — you'll want all 10 Bronze tables before Silver dev starts.
+2. **First Silver notebook.** Pattern target: dedup-on-business-key MERGE into
+   `silver.default.{entity}`, add DQ flags + rejection_reason, partition by
+   `_silver_timestamp::date`. Per CLAUDE.md: Silver is where unification +
+   validation live. Start with `silver.orders` since it's the most join-heavy
+   downstream consumer. ~90 min.
+3. **First Gold dimension.** `gold.dim_customer` with SCD-Type-2 logic on
+   `segment` + `city` (per DECISIONS #15). Surrogate key generation +
+   `valid_from` / `valid_to` / `is_current` + business key. ~90 min.
+4. **First Gold fact.** `gold.fact_order_line` joining Silver orders +
+   order_lines + product_pricing + dim_customer + dim_product. Star-schema-ish.
+   ~120 min.
 
-Seed 5 more days so Bronze/Silver/Gold notebooks have interesting data to work on,
-plus one failure injection for later RCA fixture use:
+After steps 1–4, you've proven the medallion architecture end-to-end on one
+narrow slice. Subsequent dimensions/facts (dim_product, dim_sales_rep,
+fact_inventory_daily, fact_daily_channel_revenue) are pattern repetition.
 
-```bash
-cd /Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-Architecture
-for d in 16 17 18 19 20; do .venv/bin/python generator/main.py --date 2026-01-$d; done
-.venv/bin/python generator/main.py --date 2026-01-21 --failure schema_drift
-```
-
-Connection env vars (same as verification run, copy from `## Commands` section below
-or from `scripts/run_bootstrap_sql.py` comment).
-
-### (b) Start Phase 2 — Tier 5.2 Unity Catalog + Bronze notebook
-
-First actual Phase 2 work. Two parts:
-
-**1. UC infrastructure (Terraform):**
-- Add `databricks` provider to `PipelineIQ-IaC/clients/velora/providers.tf`. Needs
-  account-level auth — the workspace URL is `https://adb-<id>.<region>.azuredatabricks.net`.
-- New module `core/databricks_uc/`: metastore assignment, external locations pointing
-  at ADLS `bronze/silver/gold/landing/quarantine` filesystems, catalog hierarchy, secret
-  scope backed by Key Vault.
-- `tf plan + apply`.
-
-**2. Bronze notebook (Databricks):**
-- Parameterised PySpark notebook in `notebooks/bronze/`. Reads `landing/{entity}/` Parquet,
-  appends audit columns (`_source_file`, `_ingestion_timestamp`, `_pipeline_run_id`),
-  writes to `bronze/{entity}` Delta. Append-only, no dedup, no business logic.
-- One notebook per entity (or one parameterised notebook with entity as widget input
-  — prefer the parameterised version per CLAUDE.md entity_registry pattern).
-- Job config uses Jobs Compute cluster (DS3_v2, 1-2 workers, auto-term 30 min).
-
-### Phase 0 loose ends (interleave as convenient)
+### Phase 0 loose ends (interleave when convenient)
 
 1. **Tier 4.6 Azure Functions app module.** Python 3.11 consumption plan, managed
-   identity, Key Vault reference permissions. Will host watermark/control-plane APIs
-   later. Blocker for Phase 4+.
+   identity, Key Vault reference permissions. Blocker for Phase 4+.
 2. **Tier 6 ADF (Bicep).** Linked services (SQL, ADLS, KV, Databricks) + parameterised
-   datasets + copy pipeline `velora_oms.*` → `landing/` with watermark-based incremental.
-   Pre-req for any Bronze notebook trigger from ADF.
-3. **Unity Catalog smoke test** — first `databricks` Terraform provider run on a
-   Sponsorship-sub workspace. Might hit account-admin-assignment friction.
-4. **Move generator to Azure Function** per its existing `function.json` + `host.json`
+   datasets + copy pipeline `velora_oms.*` → `landing/`. Will eventually replace
+   `scripts/export_velora_to_landing.py`.
+3. **Move generator to Azure Function** per its existing `function.json` + `host.json`
    so nightly runs don't need laptop access.
+4. **Fix generator `--dry-run` mode** (item 9.1, low priority).
 
 ### Phase 2 → 8 (rough order)
 
@@ -105,10 +104,10 @@ dependency-ordered and has a status column.
 
 | Phase | Status | Exit criteria | Result |
 |---|---|---|---|
-| Phase 0 | **In progress (core done)** | terraform apply clean, all resources exist, Unity Catalog shows 3 schemas, RBAC verified | 30/~34 Azure resources live. Bootstrap SQL complete on both DBs. Remaining: UC metastore + schemas, Functions app, ADF. |
+| Phase 0 | **Effectively complete** (Functions app + ADF Bicep deferred to interleave) | terraform apply clean, all resources exist, Unity Catalog shows 3 catalogs, RBAC verified | 39 Azure resources live. Bootstrap SQL complete on both DBs. UC metastore (adopted) + 3 catalogs + 5 external locations + SQL warehouse + cluster policy + secret scope all applied. Functions app + ADF still Pending — not blocking Phase 2 (export script + Bronze notebook substitute). |
 | Phase 1 | **COMPLETE (verified end-to-end)** | Generator populates all 10 Azure SQL tables. All 6 failure classes produce correct bad records. | 2026-01-15 seed ran against live velora_oms: catalogue + 308 orders + 1177 lines + 189K inventory rows. 6 failure classes still unverified (default `--failure` not yet exercised against live DB). |
 | Phase 1 (original row — superseded above) | COMPLETE | — | See updated row for post-verification status |
-| Phase 2 | Not started | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | — |
+| Phase 2 | **Started 2026-05-01** | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | First Bronze table live: `bronze.default.customers` (158 rows, full audit columns + `_ingestion_date` partition). Notebook is entity-agnostic (1 of 10 entities ingested as smoke test). 1.34M rows landed in Parquet across `landing/`. SQL Warehouse query verified end-to-end. Remaining: 9 more Bronze ingestions, all Silver, all Gold. |
 | Phase 3 | Not started | Inject each failure class. Structured event in PostgreSQL within 5 minutes. | — |
 | Phase 4 | Not started | 3 different error messages → semantically relevant IaC chunks returned. | — |
 | Phase 5 | Not started | Slack alert within 5 minutes. AI identifies root cause for 4+ of 6 failure types. | — |
@@ -187,6 +186,16 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 
 ## Notes and blockers
 
+0. **BLOCKER (new, 2026-04-23):** Unity Catalog metastore — `mohan.gowda` is a
+   Databricks workspace admin but not a Databricks **Account Admin**. Metastore
+   creation is account-level, so Terraform can't create UC until a Sail AAD Global
+   Administrator logs into `https://accounts.azuredatabricks.net` once and promotes
+   `mohan.gowda` to Account Admin. Workaround in flight: DECISIONS #45 splits
+   `core/databricks_uc/` into Stage 1 (workspace-level, unblocked) and Stage 2
+   (account-level, blocked); Bronze/Silver/Gold use the default `hive_metastore`
+   meanwhile. Stage 2 is a single additional apply + `CREATE TABLE ... USING DELTA
+   LOCATION` cutover once unblocked.
+
 1. **Phase 0 largely complete; Phase 1 still unverified end-to-end.** The generator
    code is written and correct but requires bootstrap_sql.sql to have run against the
    live Azure SQL Database first — blocked on firewall IP (item 3.3b / 4.3b).
@@ -228,12 +237,126 @@ Failure runbook written in docs/runbooks/inject_failure.md.
    Azure Key 1 first/last 8 chars appeared in Session 2 transcript — rotation
    recommended as hygiene.
 
+10. **`landing/orders/date=2026-01-15..19/` has duplicate Parquet files (S5).**
+    Smoke + partial + final export runs each landed independent Parquet files in
+    days 15–19 (2 files per day instead of 1). Bronze `recursiveFileLookup=true`
+    reads all of them, so `bronze.default.orders` shows 4,001 rows vs. 2,400
+    actual. Days 20–21 have one file each (= correct counts). **Not blocking** —
+    Silver dedups on business key (`order_id`) via MERGE, so duplicates will
+    collapse at Silver. Cleanup options for next session: (a) wipe + re-export
+    (need user permission for ADLS recursive delete — hook blocked it once),
+    (b) add a `--clean-target-paths` flag to the export script, (c) dedup before
+    Bronze write inside the notebook. Lowest-effort: rebuild Bronze from a
+    `DROP TABLE bronze.default.orders` + clean re-ingest after wiping
+    `landing/orders/`. Defer until first Silver pass — that's where dedup
+    becomes real anyway.
+
 ---
-*Updated: 2026-04-21 (Session 3). Update this file at the end of every session before closing.*
+*Updated: 2026-05-01 (Session 5 wrap). Update this file at the end of every session before closing.*
 
 ---
 
 ## Session Log
+
+### 2026-05-01 (Session 5 — Tier 5 UC + first Bronze table end-to-end)
+**Objective:** Unblock the Databricks Account Admin gate from Session 4, then ship `core/databricks_uc/` Stage 1 + Stage 2 in one apply, then write the first Bronze notebook and prove a `landing/` → `bronze.{entity}` round-trip end-to-end.
+
+**Built:**
+- **Account Admin promotion (manual, ~5 min, by user).** User signed into `https://accounts.azuredatabricks.net` as `admin@SailAnalyticsAP.onmicrosoft.com`, added `mohan.gowda` to User management, toggled Account Admin role on. Verified by `mohan.gowda` opening the same console URL in a normal browser and seeing the Workspaces / Users / Cloud Resources sidebar — the new "Manage Account" UI in Databricks doesn't surface a literal "Manage Account" link in the workspace, so we verified by direct console access instead. The runbook in `docs/runbooks/databricks_account_admin_bootstrap.md` had this verification path slightly wrong; left a note for future tenants.
+- **`PipelineIQ-IaC/core/databricks_uc/`** (new module, 4 files): `versions.tf` (databricks ~> 1.50, configuration_aliases for `databricks.workspace` + `databricks.accounts`), `variables.tf`, `main.tf`, `outputs.tf`. Resources: `azurerm_databricks_access_connector` (`pipelineiq-dev-dbx-ac`, system-assigned identity), `azurerm_role_assignment.ac_blob_contributor` (Storage Blob Data Contributor on `pipelineiqadlsdev`), `data "databricks_metastore" "this"` (adopting `metastore_azure_centralindia`), `databricks_storage_credential` (`pipelineiq-dev-sc`), `databricks_external_location` × 5 (landing/bronze/silver/gold/quarantine), `databricks_catalog` × 3 (bronze/silver/gold, each rooted at its respective abfss path), `databricks_cluster_policy` (`000E52A43E9F9628`, DS3_v2 fixed, autoscale 1–2 workers), `databricks_sql_endpoint` (`71a1e581f197abf0`, 2X-Small Classic, auto-stop 10 min), `databricks_secret_scope` (`pipelineiq-dev-kv`, KV-backed).
+- **`PipelineIQ-IaC/clients/velora/providers.tf`** — added two databricks provider blocks: default `databricks.workspace` (host = workspace URL, azure-cli auth), and aliased `databricks.accounts` (host = accounts.azuredatabricks.net, account_id from tfvars, azure-cli auth).
+- **`PipelineIQ-IaC/clients/velora/main.tf`** — wired `module "databricks_uc"` with provider passthroughs and the metastore_id literal (DECISIONS #46).
+- **`PipelineIQ-IaC/clients/velora/{backend,variables,outputs}.tf`** — added databricks provider declaration, `databricks_account_id` variable, and 10 new outputs (UC catalogs, external locations, storage credential, cluster policy ID, SQL warehouse ID, secret scope name, etc.). `terraform.tfvars` got `databricks_account_id = "95652d59-6e86-4925-9b65-44482d18b35b"`.
+- **`scripts/export_velora_to_landing.py`** (new) — Azure SQL → ADLS landing/ Parquet exporter. Two-mode manifest (DECISIONS #47): by_date (orders, inventory_snapshot) keyed off business-date columns, full (8 master tables) dumped per pipeline_run. AAD via DefaultAzureCredential. Resilience: `fetchmany(5000)` chunked reads, fresh connection per read, retry-with-reconnect (5 attempts, exponential backoff). Caught one TCP reset on day 19 inventory in the second run; retry succeeded first attempt. Total: 1,345,689 rows landed across 14 by-date partitions + 8 full snapshots.
+- **`requirements.txt`** — added `azure-storage-file-datalake`, `pyarrow`. Installed both into `.venv`.
+- **`notebooks/bronze/ingest_to_bronze.py`** (new) — entity-agnostic Bronze ingestion notebook (DECISIONS #48). Widget inputs: entity_name, pipeline_run_id, landing_account, bronze_catalog, bronze_schema. Reads `landing/{entity}/` with `recursiveFileLookup=true` (handles both date=*/and full/ subdirs uniformly). Appends 4 audit columns + `_ingestion_date` partition column. `CREATE SCHEMA IF NOT EXISTS bronze.default` on first run. Append-only Delta write with `mergeSchema=true`.
+- **`scripts/run_bronze_smoke.py`** (new) — driver that uploads the notebook into the workspace (`/Shared/pipelineiq/bronze/ingest_to_bronze`) via Databricks SDK, submits a one-time job (autoscale 1–2 workers DS3_v2, single-user mode), polls for completion, prints output / error trace. AAD via azure-cli auth. Uses `databricks-sdk` Python package (added to .venv).
+- **`docs/build_order.md`** — Tier 5.2–5.8 all marked Done with paths/IDs. New rows 9.3a (export script) and 9.4a (Bronze smoke) added under Tier 9.
+- **`DECISIONS.md` #46** — UC metastore adopted via data source, not created (1-per-region account limit). #47 — landing export uses by_date + full modes keyed on business-date columns. #48 — Bronze notebook is entity-agnostic by design.
+- **`CLAUDE.md`** — new section "Git: commit + push at end of every session (mandatory)". User explicitly wants per-session remote commits as their time-travel recovery fabric. Memory file `feedback_session_end_git_push.md` mirrors the rule.
+
+**Worked:** The metastore-adoption pivot was the cleanest possible response to a Databricks-imposed limit — single 5-line `databricks_metastore` resource → `data` source flip, plus passing the metastore_id explicitly, killed the Stage 1 / Stage 2 split from #45 entirely. Single-apply UC. The export script's two-mode design landed the right architectural seam between "data with a logical day" and "master data" — and surfaced that the generator's audit columns aren't business-meaningful (which is fine for Phase 2 dev, ADF will do real CDC later). The Bronze notebook went from "first write" to "verified end-to-end via SQL Warehouse" in one session — `bronze.default.customers` reads back 158 rows with all audit columns and a `_ingestion_date` partition. The `recursiveFileLookup=true` trick let one notebook handle both `date=*/` and `full/` Parquet layouts without per-entity branching.
+
+**Broke:**
+- **First UC apply hit the 1-metastore-per-region limit.** Apply error: `cannot create metastore: This account ... has reached the limit for metastores in region centralindia`. The system metastore had been auto-created when `mohan.gowda` first opened the account console. Fixed by switching `databricks_metastore` from `resource` → `data` (DECISIONS #46), removing `databricks_metastore_assignment` (workspace already auto-assigned), passing `metastore_id` literal from `clients/velora/main.tf`. 9 resources to add on second apply, all clean.
+- **Provider type mismatch on first init.** Module declares `configuration_aliases = [databricks.workspace, databricks.accounts]` resolving to `databricks/databricks` (Databricks-published), but the root `clients/velora/` had no `required_providers` for databricks, so Terraform inferred `hashicorp/databricks` (a placeholder source). Fixed by adding the databricks provider block to `clients/velora/backend.tf required_providers`.
+- **Azure SQL was paused on first export run.** Took 54 seconds to wake. pyodbc's 90s timeout caught it on retry. Already covered by DECISIONS #42.
+- **Wrong subscription active on `az`.** First apply attempt was on SSE BI; switched to Sponsorship. Soft slip, no damage.
+- **Firewall blocked first export attempt.** User wasn't on VPN — the Azure SQL firewall rule whitelists only the dedicated VPN IP `69.5.168.130`. User connected VPN; proceed. (Memory `project_vpn_dedicated_ip.md` already covers this; no incident log entry needed.)
+- **Watermark filter returned 0 rows for everything except `inventory_snapshot`.** The generator left `created_at` / `updated_at` at the GETUTCDATE() default (= seed time, not logical run date). Pivoted the script to two modes (DECISIONS #47): by_date entities use business-date columns (`order_date`, `snapshot_date`), full entities dump entire table per run.
+- **TCP reset on day 19 inventory_snapshot fetch.** Same Session 4 pattern. Fixed by `fetchmany(5000)` chunked reads + fresh-connection-per-read + retry-with-reconnect with exponential backoff. One transient hit on the next run, retry succeeded.
+- **Cluster policy enforces autotermination → invalid for job clusters.** First Bronze smoke submit failed: `Automated clusters do not support autotermination`. The policy is meant for interactive (all-purpose) clusters; job clusters self-terminate when the job ends. Fix: smoke-test driver creates a `ClusterSpec` without `policy_id`, just `num_workers=1` + DS3_v2. The policy still enforces sane defaults for any UI-created interactive cluster — exactly its purpose.
+- **`partitionBy()` got a Column expression, not a name.** Bronze notebook initial `df.write.partitionBy(F.col("_ingestion_timestamp").cast("date").alias("_ingestion_date"))` — invalid; `partitionBy` takes string column names. Fix: derived `_ingestion_date` as a separate `withColumn` step, then `partitionBy("_ingestion_date")`. Spark exception was opaque (`NOT_ITERABLE: Column is not iterable`), but the fix was 2 lines.
+- **F-string slice + `!s` conversion is invalid syntax.** `f"{e!s[:120]}"` — Python doesn't allow slicing inside `!s` conversion in f-strings. Fix: `f"{str(e)[:120]}"`. Cost ~30s.
+
+**Uncertainty:**
+- **Subsequent Bronze ingestions for the other 9 entities.** Pattern is identical; just `--entity orders`, `--entity inventory_snapshot`, etc. Cluster reuse on the same compute should make later runs ~2 min vs. 4–6 min for cold-start on customers + orders. Not done in-session — moved to Session 6 as task 1.
+- **Job-cluster vs. all-purpose-cluster trade-off for ADF orchestration.** When ADF lands in Tier 6, the cluster policy will start mattering — ADF's "interactive cluster reuse" pattern uses all-purpose clusters and would bind to the policy. Need to document the dual contract (jobs ignore policy, all-purpose enforces it) in DECISIONS or a runbook before ADF lands.
+- **Whether `bronze.default.{entity}` is the right naming convention.** CLAUDE.md says `bronze.{entity}` (2-part), UC needs 3-part. Picked `bronze.default.{entity}` for the default schema, which is consistent with `USE CATALOG bronze; USE SCHEMA default; SELECT * FROM customers` working as the user-facing 2-part shortcut. If the user prefers a non-`default` schema name (e.g. `velora`), revise the notebook + Silver/Gold patterns.
+- **Whether the metastore adoption + fixed metastore_id literal is brittle long-term.** The literal `a2d5ffb1-1ac9-42ec-babb-80eacf4ba2fb` is hardcoded in `clients/velora/main.tf`. For a second client in the same Sail tenant, same ID; for a second tenant, different ID. Should probably move to tfvars per-client. Low priority — single-client today.
+
+**Next:** Session 6 task 1: backfill 9 more Bronze tables via `scripts/run_bronze_smoke.py --entity {orders,order_lines,...}`. Cluster reuse should keep total time low. Then start the first Silver notebook with `silver.orders` (most join-heavy downstream consumer). Pattern target: dedup-on-business-key MERGE + DQ flags. See `## Next task` for the full Session 6 ordering.
+
+**Summary:** Session 5 closed two multi-session blockers in one shot. The Databricks Account Admin promotion (5 min of UI clicks) unlocked Tier 5.2–5.4, and the metastore-adoption pivot (DECISIONS #46) collapsed the planned Stage 1 / Stage 2 split (DECISIONS #45) into a single clean apply. By the end of session: 39 Azure resources live (+9 from this session — access connector, role assignment, storage credential, 5 external locations, 3 catalogs, cluster policy, SQL warehouse, secret scope), 1.34M rows of Velora source data sitting in `landing/` as Parquet across 14 partitions + 8 master snapshots, and the first Bronze table (`bronze.default.customers`, 158 rows) verified by SQL-Warehouse query with all 4 audit columns + `_ingestion_date` partition. **Phase 2 has officially started.** The Bronze notebook is entity-agnostic (DECISIONS #48), so the remaining 9 ingestions are pure pattern repetition. The export script (DECISIONS #47) adds resilience the generator's lessons taught us — chunked reads, per-read reconnect, exponential backoff — and keeps the dependency-free path to `landing/` open until Tier 6 ADF lands. CLAUDE.md got a new mandatory rule: end-of-session `git push` on every touched repo, mirrored in memory as `feedback_session_end_git_push.md`. Total productive runtime: blocker-resolution + 9 new Azure resources + 3 new scripts + 1 new notebook + 1 new module + 3 new architectural decisions captured + 1 SCHEMA-clean smoke verification, all in one session.
+
+### 2026-04-23 (Session 4 wrap + Session 5 kickoff — task 2 blocked)
+**Objective:** Post-seed docs review (status, row counts, schema adherence, deviations from plan); then begin Session 4 task 2 — write `core/databricks_uc/` Terraform module.
+
+**Built:**
+- **`docs/incident_log.md`** (new) — topic-organised, append-only blocker journal distinct from PROGRESS.md's chronological `Broke` field. Index table with severity + category + effort + subjective `Hardest?` column. 13 incidents backfilled from Sessions 1–4: msodbcsql EULA, Terraform out of brew core, Contributor→Owner RBAC 403, Postgres `azure.extensions` case-sensitivity, firewall IP blocker, Portal 401 (the 3-hour wrong-key debacle), generator cursor-vs-conn + `fast_executemany`, Azure SQL serverless cold start, RNG-seed collision, inventory TCP reset, backfill-v1 15× perf regression, Day-21 `schema_drift` no-op, stores-missing-from-seed_to_db. Per-entry schema: Phase/Session, Category, Severity, Effort, Status, Symptom, Root cause, Fix, **Prevention / first-check**, References. The `first-check` field is the load-bearing one — it's the single diagnostic to run before chasing speculative causes (codifies the lesson from incident #6).
+- **`SCHEMA.md` updates:** closed 3 gaps surfaced in Session 4 — full column specs for `velora_pim.stores`, `velora_pim.product_categories`, `velora_oms.control_flags` (all three existed in `bootstrap_sql.sql` but SCHEMA.md under-specified or omitted them). Added explicit "`velora_hrm.territories` does not exist" note so future notebook authors don't chase the dead `_build_territories()` code. New `## Schema change log` section at the bottom (append-only, entry template matches DECISIONS.md pattern — 3 entries backfilled for today's changes). Audit-columns note updated to exclude the 3 static reference tables. ADF-watermark note expanded to mention `product_pricing` + `territory_assignments` (`created_at`, append-only).
+- **`CLAUDE.md` updates:** new row in the end-of-session checklist for `docs/incident_log.md` (when to update, what to write). New row in the "Where to read" table ("Hit an error that feels familiar → check the Index table first"). Keeps future sessions from re-deriving known fixes.
+- **`DECISIONS.md` #45** — Unity Catalog rollout is two-stage; Bronze ships on `hive_metastore` first. Full rationale in DECISIONS; see below under Broke.
+- **`docs/build_order.md`** — Tier 5 re-classified: 5.2 / 5.3 / 5.4 marked **Blocked** (account-admin dependency), 5.5 / 5.6 / 5.7 downgraded to `Pending (Stage 1)` (workspace-level, unblocked), new row 5.8 added for the Databricks access connector.
+
+**Worked:** The status-review pass up front was load-bearing — confirmed Phase 0 core + Phase 1 are solid, surfaced 3 SCHEMA.md gaps the user would otherwise have hit during Phase 2 Bronze work. Incident log format converged cleanly on first try (index + per-entry schema + prevention field). The Databricks `workspace show` detective work was quick once we learned the URL is at `workspaceUrl` root, not `properties.workspaceUrl` — az returned `null` silently before that, which could have eaten hours.
+
+**Broke:**
+- **Task 2 blocked on Databricks Account Admin.** Opened the workspace UI, confirmed `mohan.gowda` is a workspace admin ("global admin" in workspace-entitlement terminology) but has no "Manage Account" link — workspace admin ≠ Databricks Account Admin. Metastore creation is an **account-level** operation on Databricks, so neither AAD auth nor a workspace PAT can bootstrap UC from Terraform without the account-admin bit set first. Resolution: Sail AAD Global Administrator logs into `https://accounts.azuredatabricks.net` once (activates the account for the Sail tenant), then promotes `mohan.gowda`. Until then: Path C — split `core/databricks_uc/` into Stage 1 (workspace-level, no blocker) and Stage 2 (account-level, blocked), ship Bronze/Silver/Gold against the default `hive_metastore` catalog, migrate to UC catalogs as a one-time `CREATE TABLE ... USING DELTA LOCATION` pass once unblocked. DECISIONS #45.
+- **SQLTools Azure SQL auth:** AAD `ActiveDirectoryInteractive` auth fails with `Cannot open server "SailAnalyticsAP.onmicrosoft.com" requested by the login` when the `User ID` includes a display-name prefix (`"Mohan Gowda - mohan.gowda@..."`). The ADO.NET connection-string parser splits on `@` and treats the tenant domain as a server routing hint. Fix: strip the display-name prefix, use just the UPN, or switch the SQLTools config to the structured `authenticationType: AzureMFA` field instead of raw `connectString`. Local-tooling issue, not pipeline; not added to incident_log.
+- **`az databricks workspace show` silently returned empty on first attempt** — multi-line paste with `\` continuations + trailing space killed the line joining. Harmless, just cost a minute.
+
+**Uncertainty:**
+- **Turnaround on the Global Admin ask.** Depends entirely on the Sail admin's availability. DECISIONS #45 Path C removes it from the critical path — Stage 1 + Bronze notebook can progress without it — so acceptable latency.
+- **Whether the `hive_metastore` → UC migration is really as clean as "~10 min per table".** Optimistic estimate based on the fact that `CREATE TABLE ... USING DELTA LOCATION '<abfss path>'` just re-registers an existing Delta folder under a new catalog without moving data. Needs verification once Stage 2 opens. Risk: table properties, comments, constraints don't carry over — may need a bulk `SHOW CREATE TABLE` + replay. Mitigation: keep Bronze/Silver/Gold table creation DDL idempotent and parameterised on the catalog name from the start, so "migration" becomes a re-run with a different param.
+- **VS Code DB client choice unresolved (local-tooling).** User chose to stick with two extensions (one for MSSQL, one for Postgres) rather than unifying on SQLTools. Not project-blocking.
+
+**Next:** Session 5 plan is spelled out in `## Next task` above. First three concrete actions: (1) send the Databricks Account Admin ask (async), (2) write `core/databricks_uc/` Stage 1 (~60 min), (3) `plan` + `apply`.
+
+**Summary:** A deceptively small session that shipped two pieces of durable infrastructure (`docs/incident_log.md` + the SCHEMA.md schema change log) and surfaced a load-bearing blocker (Databricks Account Admin) before it could derail Phase 2. The blocker is not new — it was flagged as an "Uncertainty" in Session 3's session log — but this session converted it from latent risk into an explicit two-stage plan (DECISIONS #45) with an async unblock path and a catalog-agnostic Bronze fallback. Net result: Phase 2 kickoff is still on the table for Session 5, just via `hive_metastore` instead of UC catalogs. The incident_log is the session's quiet win — future sessions now have a searchable memory of hardest-to-diagnose problems, a dedicated "first-check" field for each, and a CLAUDE.md hook that enforces keeping it current. PROGRESS.md's `Broke` field remains the chronological source of truth; incident_log is the topic-organised distillation for lookup. SCHEMA.md change log follows the same append-only pattern as DECISIONS.md, so the three files now form a consistent documentation spine.
+
+### 2026-04-22 (Session 4 — partial, task 1 done)
+**Objective:** Execute Session 4 task 1 — seed 5 more days (2026-01-16 to 20) plus one failure-injection day (2026-01-21) against `velora_oms`, then hand off to task 2 (Unity Catalog Terraform).
+
+**Built:**
+- **Data:** `velora_oms` now holds 7 full days of Velora activity (2026-01-15 to 21). Totals: 158 customers, 2,400 orders, 8,228 order lines, 3,279 status log entries, 1,323,000 inventory snapshot rows, 45 stores, 30 sales reps, 30 territory assignments, 4,200 products, 4,206 pricing rows (6 price changes from day 19), 35 product categories. Order status distribution (`PENDING 410 / PROCESSING 701 / SHIPPED 1289`) confirms the lifecycle progression machine is working. Referential integrity clean across 5 orphan checks (orders→customers, lines→orders, lines→products, status_log→orders, inventory→products) *and* post-fix stores joins.
+- **Three generator fixes (committed to git):**
+  1. `generator/config.py` — `Connection Timeout=30 → 90` (DECISIONS #42). Handles Azure SQL serverless cold-start wake-ups that exceed pyodbc's default.
+  2. `generator/main.py` — RNG seed now date-derived (`effective_seed = seed + run_date.toordinal()`) (DECISIONS #41). Fixed a latent PK-collision bug where constant `seed=42` across days produced identical customer/address UUIDs; Session 3 only ran one date so the bug never surfaced.
+  3. `generator/catalogue.py::seed_to_db` — added missing `stores` INSERT (DECISIONS #44). Original bulk-load skipped the stores table; 45 stores built in memory but never written. Fixed and backfilled in-session.
+- **New resilient tooling: `scripts/backfill_inventory.py`** — idempotent (DELETE-before-INSERT per `snapshot_date`), autocommit-per-chunk (so a mid-run failure only loses the current chunk), retry-with-reconnect on transient `OperationalError` (5 attempts, exponential backoff 2/4/8/16/32s). Fresh per-run DB connection is reused across chunks (revision after first draft was ~15× too slow due to per-chunk connect). Successfully backfilled day 17 and day 21 inventory (189K rows each) after the generator's single-transaction snapshot writes died on `TCP Provider Error 0x274C / 0x20` during runs.
+- **New docs: `docs/azure_inventory.md`** — the "what is actually deployed in Azure right now" snapshot. Maps the 9 portal-visible resources to the ~30 Terraform-state resources, region split callout, expected-absences list, separate-deployments note (Portal's `pipeline-iq-resource`). PROGRESS.md "Next task" section rewritten around Session 4 task 1–5 plan.
+- **New memory: `project_vpn_dedicated_ip.md`** — user accesses Azure via a VPN with a dedicated IP (`69.5.168.130`). Firewall rule in `terraform.tfvars` is stable, not ephemeral. First hypothesis for a connection timeout should be auto-pause / driver timeout, not IP rotation.
+- **DECISIONS.md:** four new entries — #41 (date-derived RNG seed), #42 (serverless cold-start timeout), #43 (failure injection belongs at landing/ADF, not generator), #44 (stores missing from `seed_to_db`).
+
+**Worked:** Date-derived RNG fix cleanly resolved the multi-day UUID collision with a single-line change; deterministic reproducibility is preserved per-date. `scripts/backfill_inventory.py` ran through 378K rows across two dates without a single retry needing to actually fire — the structural changes (autocommit-per-chunk, chunked writes) were enough that no transient flake surfaced during the backfill window. Data-quality sweep caught the stores bug and the schema_drift no-op immediately after task 1 "finished" — good return on doing a proper verification pass rather than trusting row counts alone.
+
+**Broke:**
+- **First run:** `[HYT00] Login timeout expired` on initial connect. Diagnosed via `az sql db show --query resumedDate` — DB was auto-paused, wake-up took 54s, pyodbc's 30s default tripped first. Fixed via connection-string bump (DECISIONS #42).
+- **Second run:** `PK_customers` violation on day 16, duplicate UUID `00000000-0000-0000-53c8-ffe06310fde6` (tell-tale all-zero upper bytes from `uuid.UUID(int=int(rng.integers(0, 2**31)) + ...)`). Constant `seed=42` across days = identical RNG streams = identical UUIDs. Fixed via date-derived seed (DECISIONS #41). Session 3's single-date run never exercised this path.
+- **Third and fourth runs:** Day 17 and day 21 inventory snapshots died mid-write on `TCP Provider Error 0x274C (WSAETIMEDOUT)` and `Error 0x20 (WSAENETRESET)` after ~3 min of the 6-min single-transaction snapshot. Main batches (customers / orders / status) had already committed — only inventory was missing, cleanly auto-rolled-back by Azure on connection drop (verified via row count = 0 for those dates). VPN + residential ISP + serverless Azure SQL + single-transaction 189K-row write = too many failure modes for one uninterrupted transaction. Resolved by building `scripts/backfill_inventory.py` with per-chunk autocommit + retry-with-reconnect.
+- **Backfill script v1** was 15× too slow — opened a fresh connection per 250-row chunk, drowning in TCP+auth overhead (76 rows/sec, 46 min/day). Killed after 41K rows, refactored to reuse one connection across chunks + reconnect only on failure (222 rows/sec, 14 min/day).
+- **Day 21 failure injection was a no-op.** `schema_drift` adds `promo_code` column to orders DataFrame, but orders.py INSERT lists explicit columns — pandas silently dropped the extra column. Day 21 committed as clean data. Architecturally revealing: the injector's docstring confirms it was designed for Parquet (schema-on-read) sinks, not relational. DECISIONS #43: failure injection moves to landing/ADF layer; generator stays a clean source-system simulator. Day 21 is just another clean day.
+- **`velora_pim.stores` was empty.** Caught during the data-quality sweep after task 1 "finished." `seed_to_db` never wrote stores despite `_build_stores()` producing the DataFrame and `build_catalogue()` returning it. No FK constraints flagged the orphan store_ids. Fixed, 45 stores seeded in-session, joins now clean (0 orphans). DECISIONS #44.
+
+**Uncertainty:**
+- Failure fixture for Phase 3 RCA testing is deferred. `schema_drift`, `referential_integrity`, `null_constraint`, `scd_key_explosion`, `volume_anomaly`, `dependency_violation` — all 6 classes are currently un-exercised. Plan is to re-implement them as a landing-layer / ADF operation (DECISIONS #43) during Phase 3. Acceptable risk: Phase 2 Bronze/Silver/Gold can be built and tested against clean data; failure-path testing comes in Phase 3 anyway.
+- Whether the generator needs a broader refactor to replace pyodbc batched `executemany` with an SQLAlchemy engine (pandas' warning about this was persistent throughout the session). Not blocking; pyodbc + fast_executemany works. Cleanup candidate for later.
+- `_build_territories()` in catalogue.py is dead code — there's no `velora_pim.territories` table in bootstrap_sql. Documented in DECISIONS #44 tail. Low priority cleanup.
+
+**Next:** Session 4 task 2 — write `PipelineIQ-IaC/core/databricks_uc/` Terraform module + wire the `databricks` provider. Contents: metastore assignment, Databricks access connector, 5 external locations (landing/bronze/silver/gold/quarantine), 3 catalogs (`bronze`/`silver`/`gold`), Key-Vault-backed secret scope, Jobs Compute cluster policy, SQL Warehouse (2X-Small, auto-stop 10 min). Apply, verify in workspace. Then task 4 (one-shot Azure SQL → landing Parquet export) + task 5 (first parameterised Bronze notebook).
+
+**Summary:** Session 4 task 1 delivered 7 full days of clean Velora source data in Azure SQL — customers, orders, order lines, status log, stores, inventory snapshots — all referentially coherent and downstream-join-ready. The path to get there surfaced four distinct bugs (connection timeout, RNG determinism, stores missing from seed, failure injection misplaced) that together taught us a non-trivial amount about the generator's maturity: it works cleanly for one day (as Session 3 proved) but multi-day + remote-over-VPN + Azure SQL sink was stress-testing configurations the generator was never designed for. Every fix is now encoded in code + DECISIONS so Session 5 starts from a much firmer base. The `scripts/backfill_inventory.py` tool is a reusable artifact — any future inventory-write casualty (ADF blip, network outage, whatever) can be resumed with it rather than re-deriving resilience logic. Day 21 is a clean day, not a failure fixture — task 1's "5 clean + 1 broken" originally-stated shape downgraded to "7 clean" because failure injection at the generator layer was always the wrong architectural seam; Phase 3 picks it up at the right layer. 30 Azure resources live, 7 full days of Velora data committed, 4 generator decisions encoded, 1 tested backfill tool in scripts/. Ready to proceed to Unity Catalog.
 
 ### 2026-04-21 (Session 3)
 **Objective:** Resume Phase 0 — apply the pending `tfplan` from Session 1 (Tier 2: Key Vault + LA + ADLS), then write and apply Tier 3/4/7 modules (Postgres + Databricks + Azure SQL + OpenAI), land all Phase 0 Azure infrastructure.

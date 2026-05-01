@@ -131,12 +131,13 @@ secrets referenced via Key Vault).
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
 | 5.1 | Databricks workspace `pipelineiq-dbx-dev` (Premium) | Done | 2026-04-21 | `PipelineIQ-IaC/core/databricks/main.tf` | Premium SKU, managed RG `pipelineiq-dbx-dev-managed-rg`. Workspace module deliberately minimal — UC setup deferred to 5.2. |
-| 5.2 | Unity Catalog metastore attached | Pending | — | `databricks_metastore_assignment` | One per region. Needs the `databricks` provider (account-level credential) — next session |
-| 5.3 | External location: ADLS containers `landing`, `bronze`, `silver`, `gold`, `quarantine` | Pending | — | `databricks_external_location` | Access via managed identity |
-| 5.4 | Unity Catalog schemas: `bronze`, `silver`, `gold` | Pending | — | Notebook or `databricks_schema` | |
-| 5.5 | Jobs Compute cluster policy | Pending | — | Terraform | DS3_v2, auto-terminate 30m |
-| 5.6 | SQL Warehouse `pipelineiq-sqlwarehouse-dev` (2X-Small, auto-stop 10m) | Pending | — | `databricks_sql_endpoint` | Classic tier |
-| 5.7 | Secret scope backed by Key Vault | Pending | — | `databricks_secret_scope` | AAD-backed |
+| 5.2 | Unity Catalog metastore attached | Done | 2026-05-01 | `core/databricks_uc/main.tf` (data source) | **Adopted system metastore** `metastore_azure_centralindia` (id `a2d5ffb1-1ac9-42ec-babb-80eacf4ba2fb`) — Databricks limits 1 metastore per region per account, and one was auto-created when `mohan.gowda` first opened the account console. Workspace was already auto-assigned. DECISIONS #46. |
+| 5.3 | External location: ADLS containers `landing`, `bronze`, `silver`, `gold`, `quarantine` | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_external_location.this` | All 5 created. Backed by `pipelineiq-dev-sc` storage credential (managed identity from access connector). |
+| 5.4 | Unity Catalog catalogs: `bronze`, `silver`, `gold` | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_catalog.this` | Storage_root per catalog — each rooted at `abfss://{name}@pipelineiqadlsdev.dfs.core.windows.net/`. `default` schema auto-created on first table write (verified via `bronze.default.customers`). |
+| 5.5 | Jobs Compute cluster policy | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_cluster_policy.jobs` | Policy ID `000E52A43E9F9628`. DS3_v2 fixed, max 2 workers range. Note: policy enforces autotermination — only valid for all-purpose clusters. Job clusters auto-terminate when job ends, so smoke-test runs don't reference the policy_id. |
+| 5.6 | SQL Warehouse `pipelineiq-dev-sqlwh` (2X-Small, auto-stop 10m) | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_sql_endpoint.this` | ID `71a1e581f197abf0`. Classic tier. Verified by `bronze.default.customers` SELECT statement returning 158 rows. |
+| 5.7 | Secret scope backed by Key Vault | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_secret_scope.kv` | Name `pipelineiq-dev-kv`. AAD-backed pointer to Key Vault `pipelineiq-kv-dev`. |
+| 5.8 | Databricks access connector (managed identity for ADLS) | Done | 2026-05-01 | `core/databricks_uc/main.tf` `azurerm_databricks_access_connector.this` | `pipelineiq-dev-dbx-ac`. System-assigned identity. Granted Storage Blob Data Contributor on `pipelineiqadlsdev` via `azurerm_role_assignment.ac_blob_contributor`. |
 
 Blocker for Tier 6: 5.1–5.7 Done.
 
@@ -202,7 +203,9 @@ actually works end-to-end.
 |---|---|---|---|---|---|
 | 9.1 | Generator dry-run against provisioned Azure SQL | Skipped | 2026-04-21 | — | Dry-run mode has a known bug: skips catalogue INSERT then tries to `pd.read_sql` products, gets empty DF, fails in orders module. Skipped in favour of 9.2 since catalogue seed is idempotent (UUID5 deterministic). Fix in a later session. |
 | 9.2 | Generator seed run (first batch) | Done | 2026-04-21 | `AZURE_SQL_PASSWORD=$(az keyvault secret show ...) .venv/bin/python generator/main.py --date 2026-01-15` | Ran in ~5:30 against live velora_oms. Catalogue (4,200 products / 45 stores / 30 reps) + day 1 data (15 customers, 308 orders [176 D2C / 41 B2B / 91 Store], 1,177 order lines) + inventory snapshot (189K rows). 2 generator bugs found + fixed mid-verification (cursor-vs-conn, fast_executemany — see DECISIONS #40 + commit `7149cb4`). |
-| 9.3 | ADF copy activity → landing verified | Pending | — | ADF debug run | Parquet files land in ADLS. Blocked on Tier 6 ADF Bicep. |
+| 9.3a | One-shot Azure SQL → landing Parquet export | Done | 2026-05-01 | `.venv/bin/python scripts/export_velora_to_landing.py --start 2026-01-15 --end 2026-01-21` | Substitutes for ADF until Tier 6 ships. 1,345,689 rows landed across 14 by-date partitions (orders, inventory_snapshot) + 8 master-table full snapshots. |
+| 9.3 | ADF copy activity → landing verified | Pending | — | ADF debug run | Parquet files land in ADLS. Blocked on Tier 6 ADF Bicep. (Substituted by 9.3a for Phase 2 dev.) |
+| 9.4a | First Bronze notebook smoke (`customers`) | Done | 2026-05-01 | `.venv/bin/python scripts/run_bronze_smoke.py --entity customers` | 158 rows landed in `bronze.default.customers` with all 4 audit columns + `_ingestion_date` partition. Notebook at `notebooks/bronze/ingest_to_bronze.py`. Ran on a Databricks job cluster (autoscale 1–2 workers, DS3_v2, 14.3.x-scala2.12). |
 | 9.4 | Bronze → Silver → Gold full run | Pending | — | Databricks Job | End-to-end Phase 2 exit. Blocked on Tier 5.2 UC + Bronze notebook. |
 | 9.5 | Inject each of 6 failure classes → verify incident row in PostgreSQL | Pending | — | `python generator/main.py --failure <class>` per class | Phase 3 exit. Requires Phase 3 infra (ADF diagnostic settings → Log Analytics → FastAPI poller → incident_store). |
 
