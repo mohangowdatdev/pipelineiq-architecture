@@ -84,7 +84,13 @@ def run(
     Faker.seed(effective_seed)
     fake = Faker(["en_IN"])
 
-    conn = pyodbc.connect(config.get_connection_string())
+    # `timeout=90` sets the ODBC Login Timeout attribute via pyodbc's API.
+    # The connection string's `Connection Timeout=90` keyword is not reliably
+    # honored by ODBC Driver 18 under AAD MSI auth — the default 15s Login
+    # Timeout still fires on cold-start when Azure SQL serverless is paused.
+    # Caused all S5/S6 scheduled 06:00 UTC fires to fail at ~15s with HYT00
+    # `Login timeout expired` — see DECISIONS #42 + S6 incident_log.
+    conn = pyodbc.connect(config.get_connection_string(), timeout=90)
     conn.autocommit = False
 
     try:
