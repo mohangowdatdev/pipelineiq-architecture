@@ -88,6 +88,25 @@ def run(
     conn.autocommit = False
 
     try:
+        # ── 0. Idempotency guard ─────────────────────────────────────────────
+        # Skip if this run_date already has data in the source. Prevents PK
+        # collisions on re-fires (manual + Function on same date) and makes
+        # the daily timer naturally idempotent. To genuinely re-seed a date,
+        # wipe its rows from velora_oms first.
+        guard_cur = conn.cursor()
+        guard_cur.execute(
+            "SELECT COUNT(*) FROM velora_oms.orders WHERE order_date = ?",
+            run_date,
+        )
+        existing = guard_cur.fetchone()[0]
+        if existing > 0:
+            logger.warning(
+                "Date %s already has %d orders in velora_oms — skipping (no-op). "
+                "To re-seed, wipe this date from velora_oms first.",
+                run_date, existing,
+            )
+            return {"_skipped": True, "existing_orders": existing}
+
         # ── 1. Seed catalogue on first run ────────────────────────────────────
         if not cat_module.is_catalogue_seeded(conn):
             logger.info("Catalogue not seeded — generating and seeding now")
@@ -371,48 +390,35 @@ def _log_counts(run_date: date, counts: Dict) -> None:
 
 # ── Azure Function entry point ────────────────────────────────────────────────
 
-# Velora's narrative starts on 2026-01-15. If the orders table is empty when
-# the timer fires (first run after a fresh DB bootstrap), seed from this date.
-_NARRATIVE_START_DATE = date(2026, 1, 15)
 
+def yesterday_utc() -> date:
+    """The date one day before today, in UTC.
 
-def next_logical_date(conn: pyodbc.Connection) -> date:
-    """Resolve the next Velora logical date as max(order_date) + 1.
-
-    Falls back to _NARRATIVE_START_DATE if velora_oms.orders is empty.
-    Decoupled from wall-clock time per Session 5's "Option A" decision —
-    Velora's narrative continues smoothly past day 21 → 22 → 23 regardless
-    of when the Function actually runs.
+    Reflects the canonical "nightly batch" pattern: the Function fires at
+    06:00 UTC daily and writes a complete day of OLTP activity for the day
+    that just ended. A 06:00 UTC fire on May 7 writes order_date = May 6 —
+    Velora's full May 6 OLTP activity, ready for ADF to extract into
+    landing/. The idempotency guard in run() makes this safe against
+    accidental re-fires (manual + scheduled overlap, retries, etc.).
     """
-    cur = conn.cursor()
-    cur.execute("SELECT MAX(order_date) FROM velora_oms.orders")
-    row = cur.fetchone()
-    last = row[0] if row else None
-    if last is None:
-        logger.info("velora_oms.orders is empty — starting at narrative start %s", _NARRATIVE_START_DATE)
-        return _NARRATIVE_START_DATE
     from datetime import timedelta
-    next_date = last + timedelta(days=1)
-    logger.info("Last order_date = %s → next logical date = %s", last, next_date)
-    return next_date
+    today_utc = datetime.now(timezone.utc).date()
+    return today_utc - timedelta(days=1)
 
 
 def main(mytimer=None) -> None:
     """Azure Functions timer trigger entry point.
 
-    Resolves the next logical Velora date as max(orders.order_date) + 1
-    (Option A — relative continuity, decoupled from wall-clock), then runs
-    the generator for that date. ADF (Tier 6) handles everything downstream
-    (landing extract, Bronze/Silver/Gold notebooks). This Function only
-    simulates the source-system OLTP writes.
+    Writes yesterday's full-day OLTP activity (today_utc - 1). The
+    idempotency guard in run() skips cleanly if that date is already
+    populated, so this is safe to fire at any cadence. ADF (Tier 6)
+    handles everything downstream (landing extract, Bronze/Silver/Gold
+    notebooks). This Function only simulates the source-system OLTP
+    writes.
     """
     try:
-        conn = pyodbc.connect(config.get_connection_string())
-        try:
-            run_date = next_logical_date(conn)
-        finally:
-            conn.close()
-
+        run_date = yesterday_utc()
+        logger.info("Azure Function fire — writing for %s", run_date)
         counts = run(run_date=run_date)
         logger.info("Azure Function completed for %s: %s", run_date, counts)
     except Exception as exc:

@@ -41,6 +41,7 @@ non-obvious or took disproportionate time relative to the fix.
 
 | # | Date | Title | Severity | Category | Effort | Hardest? |
 |---|------|-------|----------|----------|--------|----------|
+| 17 | 2026-05-06 | Daily Function timer fired exactly once on Y1 Linux Consumption | major | infra | ~90 min (diag + Flex migration + re-grant + redeploy) | **yes** |
 | 16 | 2026-05-01 | Cluster-policy autotermination invalid for job clusters | minor | infra | ~5 min | no |
 | 15 | 2026-05-01 | `partitionBy()` rejects Column expressions, requires names | minor | code | ~3 min | no |
 | 14 | 2026-05-01 | UC metastore creation hit "1 per region per account" limit | major | infra | ~15 min | **yes** |
@@ -61,6 +62,18 @@ non-obvious or took disproportionate time relative to the fix.
 ---
 
 ## Entries
+
+### #17 — 2026-05-06 — Daily Function timer fired exactly once on Y1 Linux Consumption
+- **Phase / Session:** Phase 0 carry-over surfaced in S6
+- **Category:** infra
+- **Severity:** major
+- **Effort:** ~90 min total — ~20 min diagnosis, ~30 min Flex IaC + apply + re-grant + redeploy, ~10 min verification, ~30 min real-date generator refactor + backfill (interleaved)
+- **Status:** resolved 2026-05-06 (modulo the actual reliability proof at next 06:00 UTC scheduled fire)
+- **Symptom:** S5 deployed `pipelineiq-functions-dev` with cron `0 0 6 * * *`. Inspection of `velora_oms` 5 days later showed only one Function-produced day (day 22, `created_at = 2026-05-01 11:19:57`); subsequent scheduled fires (May 2 06:00, May 3 06:00, ..., May 6 06:00) all silent. App Insights had **zero telemetry of any kind** for 10 days — no requests, no traces, no exceptions. Function App reported `state: Running`, function `enabled: true`, schedule unchanged. `az monitor activity-log` only showed manual management operations. Manual invoke via `admin/functions/generator` worked instantly (HTTP 202, day 23/24 landed in DB) — proving the function code itself was fine.
+- **Root cause:** **Linux Consumption (Y1) + non-HTTP triggers + scale-to-zero is a documented unreliable path.** When the Function App has no HTTP traffic, the platform scales the host instance to zero. On Linux Consumption specifically, the ScaleController is supposed to wake the host for timer triggers but frequently misses them. Windows Consumption handles this reliably; Linux does not. The 2026-05-01 11:19 fire was actually a `runOnStartup`-style invocation triggered by the deploy itself, not the cron schedule (11:19 UTC ≠ 06:00 UTC).
+- **Fix:** Migrated Function App from Y1 (Linux Consumption) → FC1 (Flex Consumption). DECISIONS #50. `core/functions/main.tf` swapped `azurerm_linux_function_app` for `azurerm_function_app_flex_consumption`, plan SKU Y1 → FC1, added private blob container `app-package-pipelineiq-functions-dev` for the Flex deployment package. Required `terraform apply -replace=module.functions.azurerm_service_plan.this` (Azure rejects in-place SKU change `Dynamic → FlexConsumption`). After destroy/recreate, MSI principal_id changed (`ad0af497-...` → `ccdac37d-...`), needed `DROP USER` on velora_oms then `scripts/grant_function_msi_sql.py` to re-grant. Redeployed via existing `scripts/deploy_function.sh` (171s remote build).
+- **Prevention / first-check:** **For any Linux Function App with non-HTTP triggers (timer, queue, blob, event grid), use Flex Consumption (FC1), not Linux Consumption (Y1).** Pricing is effectively the same under the 100K GB-s/month free grant. If you find yourself diagnosing "timer didn't fire" on Linux Consumption, don't bother debugging the cron expression — it's almost certainly the platform scale-to-zero issue. Telemetry signals: zero rows in App Insights `requests`/`traces` for the period, but `admin/host/status` returns `state: Running`. Combined with `az functionapp function show` confirming `isDisabled: false` and the schedule field correct, you've ruled out config; it's the plan tier.
+- **References:** DECISIONS #50, DECISIONS #51, PROGRESS S6 (2026-05-06), `PipelineIQ-IaC/core/functions/{main.tf,outputs.tf}` commit `fe45547` (local-only pending GitHub auth fix).
 
 ### #16 — 2026-05-01 — Cluster-policy autotermination invalid for job clusters
 - **Phase / Session:** Phase 2 kickoff, Session 5

@@ -194,11 +194,11 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | **Verified end-to-end (S3)** | Phase 1 complete — seeded 2026-01-15 against live velora_oms |
+| generator/ | **Real-dated + guarded (S6)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. Source DB seeded for 9 real-dated days Apr 27 → May 5, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. |
 | notebooks/bronze/ | **First entity ingested (S5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). `bronze.default.customers` verified end-to-end. Backfill 9 more Bronze tables in S6 task 1. |
 | notebooks/silver/ | Pending | Phase 2 — start with `silver.orders` |
 | notebooks/gold/ | Pending | Phase 2 — `gold.dim_customer` first |
-| functions/ | **Stable (S5 add.)** | Daily generator timer trigger live (`pipelineiq-functions-dev`); `core/functions/` IaC stable. DECISIONS #49. ADF replacements for Bronze chain still pending in Tier 6. |
+| functions/ | **Stable on FC1 Flex (S6)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50): Y1 + Linux + non-HTTP triggers was the documented sad path — silent timer drops. Cron `0 0 6 * * *` unchanged. Real-world reliability proof = next 06:00 UTC fire. ADF replacements for Bronze chain still pending in Tier 6. |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
 | IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
@@ -238,7 +238,40 @@ cd fastapi && uvicorn main:app --reload --port 8000
 
 # Databricks notebook test (via CLI)
 databricks jobs run-now --job-id {job_id}
+
+# Refresh source-system firewall to current public IP
+# (run when velora_oms / Azure SQL connections fail with firewall errors,
+#  or when the user says "update ip firewall at source")
+bash scripts/update_sql_firewall_ip.sh
 ```
+
+---
+
+## Source-system access (firewall auto-recover)
+
+The velora source DB (`pipelineiq-sql-velora-dev` / `velora_oms`) is fronted by an
+Azure SQL firewall. Two rules grant access:
+
+- `allow-vpn-ip` → `69.5.168.130` (the dedicated Sail VPN IP — stable; covered by
+  memory `project_vpn_dedicated_ip.md`).
+- `MG-Office-Laptop-Dynamic` → user's current laptop IP (refreshed on demand by
+  `scripts/update_sql_firewall_ip.sh`).
+
+**Auto-trigger the script when:**
+
+1. **Any source-system access fails with a firewall-class error** —
+   `Cannot open server '...' requested by the login. Client with IP address '...'
+   is not allowed to access the server`, or `[HYT00] Login timeout expired` from
+   pyodbc / sqlcmd / `az sql db query` against `velora_oms` *when the user is not
+   on VPN*. Run the script first, retry the operation, and only escalate if the
+   retry still fails.
+2. **The user says "update ip firewall at source"** (or close paraphrase like
+   "refresh the source firewall", "fix source DB firewall"). Run the script
+   without further confirmation — it's idempotent and only touches the
+   `MG-Office-Laptop-Dynamic` rule.
+
+The script never touches the VPN rule, so VPN-based access keeps working
+regardless. It's safe to run at the start of any session.
 
 ---
 
@@ -390,9 +423,39 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Proper fix: have dry-run keep the generated catalogue DataFrame in memory and
   short-circuit `pd.read_sql`. Low priority — real seed works end-to-end. Build_order
   item 9.1.
-- ~~Tier 4.6 Azure Functions app~~ **Done (S5 addendum, 2026-05-01).** Function App
-  `pipelineiq-functions-dev` live; daily generator timer trigger verified. See
-  DECISIONS #49 + `core/functions/` IaC module.
+- ~~Tier 4.6 Azure Functions app~~ **Done (S5 addendum, 2026-05-01; migrated to FC1
+  Flex Consumption in S6, 2026-05-06).** Function App `pipelineiq-functions-dev`
+  live on FC1. See DECISIONS #50 + #51 + `core/functions/` IaC module.
+- **PipelineIQ-IaC commit `fe45547` (Flex migration) is local-only — push blocked.**
+  GitHub credential helper resolves to user `mohangowdatdev` instead of
+  `mohangowdat-sail`. `git push origin main` returns 403. Re-auth via
+  `gh auth login` or update `~/.gitconfig` / credential helper to use the
+  `mohangowdat-sail` GitHub identity, then `git push`. Until then the IaC repo
+  has unpushed work — violates the "session-end has a remote tip" guarantee.
+- **Verify daily Function fired at 2026-05-07 06:00 UTC.** First test of the
+  Y1→FC1 migration's reliability claim. Run the verification query in
+  PROGRESS.md S6 session log under "Next" — the May 6 row should exist with
+  `created_at` between 06:00–06:10 UTC and a row count in the 270–500 range.
+  If missing or off-window, Flex isn't firing reliably either and we revisit.
+- **App Insights telemetry not flowing on Flex Consumption.** The Function
+  executes (proven via `velora_oms` side-effects) but `requests` / `traces` /
+  `exceptions` tables in App Insights stay empty. Was also broken on Y1.
+  Likely a Flex-specific instrumentation tweak (Python OpenTelemetry mode,
+  worker extension, or auto-instrumentation app setting). Investigate when
+  observability is needed for Phase 4+ — not blocking Phase 2.
+- **Bronze stale data — Jan-2026 ordinal-dated.** `bronze.default.customers`
+  (158 rows) + `bronze.default.orders` (4,001 rows) hold the old ordinal-dated
+  data from S5. `landing/` still has matching Jan parquet. Source DB has been
+  wiped + re-populated with real-dated days (Apr 27 → May 5) but Bronze hasn't
+  been touched. Step 1 of S7 should: (a) wipe `landing/` for all 10 entities,
+  (b) `DROP TABLE bronze.default.{customers, orders}`, (c) re-export real-dated
+  source via `scripts/export_velora_to_landing.py`, (d) ingest all 10 entities
+  via `scripts/run_bronze_smoke.py --entity X`.
+- **Rotate `AzureWebJobsStorage` account key on `pipelineiqfunctionsdev`.**
+  Key was printed in S6 transcript when listing app settings (~`vz1Z2iSghWL6...`).
+  Storage Account → Keys and Endpoint → Regenerate key1; Terraform will pick
+  up the new key on next apply. Same exposure class as the Portal Key 1
+  rotation item below.
 - **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
   + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
   `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —

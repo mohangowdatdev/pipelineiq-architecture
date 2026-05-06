@@ -44,10 +44,16 @@ Currency: 1 USD = Rs. 95
 Single synthetic dataset only. Velora Retail Group.
 No public datasets. NYC Taxi and Chicago Taxi are dropped.
 
-**Generator:** Python (Faker + NumPy) as Azure Function.
-Runs at 6am daily. Writes to Azure SQL Database.
-Has failure_injector flag for all 6 failure classes.
-Uses seed=42 for deterministic reproducible output.
+**Generator:** Python (Faker + NumPy) as Azure Function on **FC1 Flex Consumption**
+(see DECISIONS #50 — Y1 Linux Consumption was unreliable for timer triggers).
+Runs at 06:00 UTC daily and writes "yesterday's batch" — `today_utc - 1` —
+to Azure SQL (DECISIONS #51, supersedes #49's narrative-ordinal model).
+Has an idempotency guard at the top of `run()` that no-ops cleanly when
+the target date already has data, so manual backfills + scheduled fires
+coexist without PK collisions. Manual backfill convention: stops at
+`today - 1` (leave today's date for the Function). Has failure_injector
+flag for all 6 failure classes. Uses seed=42 + date-derived offset
+(DECISIONS #41) for deterministic per-date output.
 
 **Generator modules:**
 - config.py — volume params, failure mode toggle, date rules

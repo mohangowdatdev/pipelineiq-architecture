@@ -2,52 +2,49 @@
 
 ## Current phase
 
-**Phase 0 — Done (incl. Tier 5 UC). Phase 1 — Done. Phase 2 — Started: first Bronze table written end-to-end (`bronze.default.customers`, 158 rows, verified via SQL Warehouse).**
+**Phase 0 — Done. Phase 1 — Re-done on real wall-clock dates (S6). Phase 2 — Bronze backfill not yet redone post-S6 source reset.**
 
-39 Azure resources live (30 from prior + 9 UC: access connector, role assignment,
-storage credential, 5 external locations, 3 catalogs, cluster policy, SQL warehouse,
-secret scope). UC metastore adopted from system (1-per-region limit) — see DECISIONS
-#46. **`landing/` ADLS filesystem holds 1,345,689 rows of Parquet** across 14 by-date
-partitions (orders, inventory_snapshot — 7 days each) plus 8 master-table full
-snapshots (order_lines, order_status_log, customers, customer_addresses, products,
-product_pricing, sales_reps, territory_assignments).
+39 Azure resources live (Function App migrated Y1→FC1 Flex Consumption in S6 —
+same hostname, new MSI, see DECISIONS #50). UC metastore + 3 catalogs + 5
+external locations + cluster policy + SQL warehouse + secret scope all stable.
 
-**Session 5 unblocked the multi-session Databricks Account Admin gate** in five minutes.
-User signed into `https://accounts.azuredatabricks.net` as the Sail Global Admin,
-toggled `mohan.gowda` to Account Admin, signed out. Then a clean Terraform apply
-landed all of Tier 5.2–5.8. The two-stage rollout from DECISIONS #45 collapsed into
-a single apply via DECISIONS #46 (adopt the system metastore as a data source rather
-than create a new one — Databricks limits 1 metastore per region per account).
+**Source DB reset to real dates in S6** (DECISIONS #51). `velora_oms` now holds
+9 days from 2026-04-27 → 2026-05-05: 3,235 orders / 11,014 lines / 5,930 status
+logs / 232 customers / 1,701,900 inventory rows. Generator runs on `today_utc - 1`
+with an idempotency guard. Catalogue (4,200 products, 30 sales reps, 30 territory
+assignments) preserved across the reset since UUID5 makes catalogue rewrites a no-op.
 
-**Phase 2 opened the same session.** `scripts/export_velora_to_landing.py` lands all
-Velora source tables as Parquet (substitutes for ADF until Tier 6 ships); the Bronze
-notebook `notebooks/bronze/ingest_to_bronze.py` is entity-agnostic and ingests any
-landing entity into `bronze.default.{entity}` with 4 audit columns + `_ingestion_date`
-partition. Smoke-tested on `customers` end-to-end (read landing Parquet, write Delta
-table, query via SQL Warehouse — 158 rows, all audit columns present).
+**Bronze + landing/ NOT YET CLEANED.** `bronze.default.customers` (158 rows) and
+`bronze.default.orders` (4,001 rows) still hold ordinal Jan-2026 data from S5.
+`landing/` still has the matching Jan-dated parquet. S7 Step 1 = wipe landing,
+drop both Bronze tables, re-export real-dated source, ingest all 10 entities.
 
 ## Next task
 
-**Session 6 plan (Phase 2 continuation, suggested order):**
+**Session 7 plan:**
 
-1. **Backfill the remaining 8 Bronze tables.** Already ingested in S5:
-   `customers` (158 rows) and `orders` (4,001 rows incl. duplicates from
-   partial export runs — see Notes #10). Still to do:
-   `order_lines`, `order_status_log`, `customer_addresses`, `products`,
-   `product_pricing`, `inventory_snapshot`, `sales_reps`,
-   `territory_assignments`. Run `scripts/run_bronze_smoke.py --entity X`
-   per entity. The notebook is entity-agnostic — no code changes. Cluster
-   reuse makes subsequent runs ~2 min each. Total ~20 min. **Note:**
-   before backfilling, consider wiping `landing/orders/date=2026-01-15..19/`
-   duplicate Parquet files first (or `DROP TABLE bronze.default.orders` and
-   re-ingest cleanly) — see Notes #10. Cleanest is just to clean orders
-   then go.
+0. **Verify last night's Function fire** (first task of S7). Run the SQL below
+   against velora_oms; the 2026-05-06 row should exist with `first_insert_utc`
+   between 06:00–06:10 UTC on 2026-05-07 and 270–500 orders. If missing or
+   off-window, Flex isn't firing reliably and we revisit DECISIONS #50.
 
-   **Also note** the daily Function will have run by then (DECISIONS #49) —
-   `velora_oms` will now hold day 22, day 23, etc. depending on when you
-   resume. Re-run `scripts/export_velora_to_landing.py` first to land the
-   new days as Parquet, then ingest Bronze. Or do that as a single step
-   per entity inside the Bronze backfill.
+   ```sql
+   SELECT order_date,
+          COUNT(*)                AS orders_count,
+          MIN(created_at)         AS first_insert_utc,
+          MAX(created_at)         AS last_insert_utc
+   FROM velora_oms.orders
+   GROUP BY order_date
+   ORDER BY order_date;
+   ```
+
+1. **Bronze cleanup + clean backfill.** Wipe `landing/` for all 10 entity dirs
+   (needs explicit user permission — hook blocks bulk ADLS deletes). Drop
+   `bronze.default.customers` + `bronze.default.orders`. Re-run
+   `scripts/export_velora_to_landing.py --start 2026-04-27 --end 2026-05-05`
+   (note: the script currently only takes `--date` or `--start/--end`; add
+   `--start/--end` if missing). Then loop
+   `scripts/run_bronze_smoke.py --entity X` over all 10 entities. ~45 min.
 2. **First Silver notebook.** Pattern target: dedup-on-business-key MERGE into
    `silver.default.{entity}`, add DQ flags + rejection_reason, partition by
    `_silver_timestamp::date`. Per CLAUDE.md: Silver is where unification +
@@ -66,14 +63,18 @@ fact_inventory_daily, fact_daily_channel_revenue) are pattern repetition.
 
 ### Phase 0 loose ends (interleave when convenient)
 
-1. **Tier 4.6 Azure Functions app module.** Python 3.11 consumption plan, managed
-   identity, Key Vault reference permissions. Blocker for Phase 4+.
+1. ~~Tier 4.6 Azure Functions app module~~ **Done (S5 add. → migrated to FC1
+   Flex in S6, DECISIONS #50).** Cron `0 0 6 * * *` UTC; first reliability
+   proof is the May 7 06:00 UTC fire.
 2. **Tier 6 ADF (Bicep).** Linked services (SQL, ADLS, KV, Databricks) + parameterised
    datasets + copy pipeline `velora_oms.*` → `landing/`. Will eventually replace
    `scripts/export_velora_to_landing.py`.
-3. **Move generator to Azure Function** per its existing `function.json` + `host.json`
-   so nightly runs don't need laptop access.
+3. ~~Move generator to Azure Function~~ **Done.**
 4. **Fix generator `--dry-run` mode** (item 9.1, low priority).
+5. **App Insights telemetry on Flex.** Function executes (proven via DB
+   side-effects) but `requests` / `traces` / `exceptions` tables stay empty.
+   Likely a Flex instrumentation tweak. Investigate when Phase 4+ needs
+   structured RCA traces.
 
 ### Phase 2 → 8 (rough order)
 
@@ -269,6 +270,44 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-06 (Session 6 — Function migration to Flex + real-date source reset)
+**Objective:** Get back to Bronze backfill, but first investigate why the daily Function had only fired once since S5; then migrate it to a reliable plan; then switch the generator to wall-clock real dates so the demo timeline stops being confusing ordinal-Jan-2026 days.
+
+**Built:**
+- `scripts/update_sql_firewall_ip.sh` — upserts `MG-Office-Laptop-Dynamic` rule on the velora SQL server to current public IP. Discovers RG dynamically; switches to Sponsorship subscription; idempotent. Lets us hit `velora_oms` from laptop without VPN. Auto-trigger phrase `"update ip firewall at source"` documented in CLAUDE.md.
+- `CLAUDE.md` — new section "Source-system access (firewall auto-recover)" documenting the auto-trigger conditions for the firewall script. New row in Standard commands.
+- `PipelineIQ-IaC/core/functions/main.tf` + `outputs.tf` — migrated Function App from `azurerm_linux_function_app` (Y1) to `azurerm_function_app_flex_consumption` (FC1). New private blob container `app-package-{name}` for the Flex deployment package. Service plan SKU Y1 → FC1 (in-place change rejected by Azure with `Cannot update ServerFarm SKU from 'Dynamic' to 'FlexConsumption'` — used `terraform apply -replace=module.functions.azurerm_service_plan.this`).
+- `PipelineIQ-IaC/clients/velora/main.tf` — folded `AZURE_SQL_AUTH_MODE=msi` into TF app_settings as drift remediation (was set out-of-band on Y1 via `az functionapp config appsettings set`).
+- `generator/main.py` — replaced `next_logical_date()` with `yesterday_utc()` (DECISIONS #51). Added 5-line idempotency guard at the top of `run()` that no-ops if `velora_oms.orders` already has rows for `run_date`.
+- Source DB: full data wipe + 9-day backfill (Apr 27 → May 5, 2026). 3,235 orders / 11,014 lines / 5,930 status logs / 232 customers / 1.7M inventory rows.
+
+**Worked:**
+- The investigation pulled together cleanly: data inspection (`MIN/MAX created_at` per `order_date`) showed day 22 was the only Function-produced day, all the rest were S3/S4 manual seeds. App Insights had zero telemetry of any kind for 10 days. App Service Plan was Y1 Dynamic (Linux Consumption). That's the documented sad path for non-HTTP triggers — diagnosis took ~20 min.
+- Flex Consumption migration was clean: terraform plan + apply (after the in-place-SKU-change rejection workaround) + DROP USER + re-grant via `scripts/grant_function_msi_sql.py` + `scripts/deploy_function.sh` + manual invoke produced day 23 + day 24 → proved the function code works on Flex.
+- Idempotency guard worked first try: re-seed of May 3 logged "already has 274 orders — skipping" with row count unchanged. Manual invoke after redeploy hit `today_utc - 1 = 2026-05-05`, which was already populated → guard skipped, source DB unchanged. Both code paths verified end-to-end without writing a separate test.
+- The user's pushback on Option D (ADF triggering the generator) caught a real architectural smell — collapsing source-vs-pipeline separation. Withdrew it, settled on Flex Consumption as the right answer.
+
+**Broke:**
+- First terraform plan with the Flex resource didn't validate — `azurerm_function_app_flex_consumption` requires `service_plan_id` (with FC1 SKU) despite Flex having no traditional "plan" concept. Added `azurerm_service_plan` back with `sku_name = "FC1"` and the required arg disappeared.
+- First terraform apply hit `Cannot update ServerFarm SKU from 'Dynamic' to 'FlexConsumption'` — Azure refuses in-place SKU change between Consumption families. Re-planned with `-replace=module.functions.azurerm_service_plan.this` and applied cleanly.
+- After the destroy/recreate, Function MSI principal_id changed (`ad0af497-...` → `ccdac37d-5dc5-49b1-8751-3cd19880a2ba`). The OLD `pipelineiq-functions-dev` user still existed in `velora_oms` but its SID pointed at the deleted MSI. `CREATE USER ... FROM EXTERNAL PROVIDER` is name-conflict on the existing user. Fix: `DROP USER` first, then re-run `grant_function_msi_sql.py`. Took ~3 min to spot.
+- First backfill attempt set `AZURE_SQL_AUTH_MODE=aad_token` which isn't a recognized mode — config falls through to password auth with empty password → script silently exited 0 with zero data written. Spotted via post-run row count = 0; fixed by pulling password from Key Vault and setting `AZURE_SQL_USERNAME` + `AZURE_SQL_PASSWORD`.
+- Hook blocked recursive ADLS deletes (`landing/{entity}/`) — correctly. The "first step" prompt didn't authorize destructive ops on shared storage. Surfaced to user with three options; deferred Bronze cleanup to S7.
+- Hook blocked `cat /private/tmp/claude-501/.../tasks/*.output` (cross-task data access). Worked around by re-querying source DB directly for state.
+- Initial summary leaked `AzureWebJobsStorage` account key when listing app settings without `--query`. Flagged for rotation.
+
+**Uncertainty:**
+- Tomorrow's 06:00 UTC fire is the actual reliability proof for Flex Consumption. Until then, the migration is "verified to execute" but not "verified to fire on schedule." Verification SQL is in `## Next task`.
+- App Insights has zero telemetry post-Flex-migration. Function execution is provable via DB side-effects, but observability is broken. Likely a Flex-specific instrumentation tweak. Not blocking until Phase 4+ needs structured RCA traces.
+- `PipelineIQ-IaC` commit `fe45547` (Flex migration) is local-only. Push returned 403 — credential helper resolves to wrong GitHub user. Architecture-side commit pending too. Surfaced to user explicitly.
+- The IaC plan-output had `tfplan` file gitignored but currently sitting in `clients/velora/`; verify it's excluded before committing.
+
+**Next:**
+1. Tomorrow morning post-06:10 UTC: run the verification SQL in PROGRESS.md `## Next task` and confirm the May 6 row exists with `created_at` 06:00–06:10 UTC + 270–500 orders.
+2. Then S7 Step 1: Bronze cleanup + clean backfill — wipe `landing/` (all 10 entity dirs), drop `bronze.default.{customers, orders}`, re-export real-dated source via `scripts/export_velora_to_landing.py --start 2026-04-27 --end 2026-05-05`, ingest all 10 entities via `scripts/run_bronze_smoke.py --entity X`. ~45 min.
+
+**Summary:** Started toward the Bronze backfill (Step 1 of S6), pivoted on noticing the daily Function had only fired once since S5 — diagnosed Linux Consumption + timer fragility, migrated to Flex Consumption (`Y1 → FC1`) with one IaC change. Re-granted SQL access for the new MSI, redeployed, verified by manual invoke (day 23 + day 24 produced). Then took the chance to fix the demo-narrative issue with ordinal Jan-2026 dates: switched generator to wall-clock `today_utc - 1` with an idempotency guard, wiped source, backfilled 9 real days (Apr 27 → May 5). Net: source DB is on real dates with a reliable plan tier, and the next 06:00 UTC fire is the test of whether Flex actually fires on schedule. Bronze cleanup deferred to S7 Step 1 because the recursive-delete-on-shared-storage operation needs explicit user authorization that the "first step" prompt didn't cover.
 
 ### 2026-05-01 (Session 5 — Tier 5 UC + first Bronze table end-to-end)
 **Objective:** Unblock the Databricks Account Admin gate from Session 4, then ship `core/databricks_uc/` Stage 1 + Stage 2 in one apply, then write the first Bronze notebook and prove a `landing/` → `bronze.{entity}` round-trip end-to-end.
