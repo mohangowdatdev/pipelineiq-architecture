@@ -194,16 +194,16 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | **Real-dated + guarded (S6)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. Source DB seeded for 9 real-dated days Apr 27 → May 5, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. |
-| notebooks/bronze/ | **First entity ingested (S5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). `bronze.default.customers` verified end-to-end. Backfill 9 more Bronze tables in S6 task 1. |
-| notebooks/silver/ | Pending | Phase 2 — start with `silver.orders` |
-| notebooks/gold/ | Pending | Phase 2 — `gold.dim_customer` first |
+| generator/ | **Real-dated + guarded (S6)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. Source DB has 10 real-dated days Apr 27 → May 6, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. |
+| notebooks/bronze/ | **All 10 entities hydrated (S7)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). All 10 `bronze.default.*` tables hydrated (~1.9M rows). |
+| notebooks/silver/ | **Pattern-setters live (S8). 2/10 tables done.** | `silver.orders` (3,619 rows) + `silver.customers` (248 rows). Conventions documented in SCHEMA.md. SCD-change tracking computed at Silver (per DECISIONS #52). Remaining 8 tables follow the same shape. |
+| notebooks/gold/ | **First SCD-2 dim live (S8). 1/12 dims+facts done.** | `gold.dim_customer` (248 rows, idempotent). Surrogate key + valid_from + as-of-join conventions in SCHEMA.md (DECISIONS #52, #53, #56). Remaining 11 follow the same shape. |
 | functions/ | **Stable on FC1 Flex (S6)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50): Y1 + Linux + non-HTTP triggers was the documented sad path — silent timer drops. Cron `0 0 6 * * *` unchanged. Real-world reliability proof = next 06:00 UTC fire. ADF replacements for Bronze chain still pending in Tier 6. |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
 | IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
 | IaC source_connectors/azure_sql | Stable | Phase 0 — applied |
-| IaC core/databricks_uc | **Stable (S5)** | Adopted system metastore + 3 catalogs + 5 external locations + storage credential + cluster policy + SQL warehouse + secret scope. DECISIONS #46. |
+| IaC core/databricks_uc | **Stable (S8)** | Adopted system metastore + **4 catalogs** (`bronze/silver/gold/quarantine`) + 5 external locations + storage credential + cluster policy + SQL warehouse + secret scope. DECISIONS #46. `quarantine` catalog added in S8 (variable default updated 3→4). |
 | scripts/export_velora_to_landing.py | Stable (scaffold) | Phase 2 — substitutes for ADF until Tier 6 lands. DECISIONS #47. |
 | scripts/run_bronze_smoke.py | Stable (scaffold) | Phase 2 — driver for one-off Bronze ingestion. Replaced by ADF + scheduled Job in Tier 6. |
 
@@ -432,14 +432,18 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Likely a Flex-specific instrumentation tweak (Python OpenTelemetry mode,
   worker extension, or auto-instrumentation app setting). Investigate when
   observability is needed for Phase 4+ — not blocking Phase 2.
-- **Bronze stale data — Jan-2026 ordinal-dated.** `bronze.default.customers`
-  (158 rows) + `bronze.default.orders` (4,001 rows) hold the old ordinal-dated
-  data from S5. `landing/` still has matching Jan parquet. Source DB has been
-  wiped + re-populated with real-dated days (Apr 27 → May 5) but Bronze hasn't
-  been touched. Step 1 of S7 should: (a) wipe `landing/` for all 10 entities,
-  (b) `DROP TABLE bronze.default.{customers, orders}`, (c) re-export real-dated
-  source via `scripts/export_velora_to_landing.py`, (d) ingest all 10 entities
-  via `scripts/run_bronze_smoke.py --entity X`.
+- **Verify tomorrow's first 06:00-IST autonomous fire** (2026-05-08 00:30 UTC).
+  S7 changed the cron from 06:00 UTC → 06:00 IST (00:30 UTC); today's data
+  was a manual fire because the change happened mid-day. Tomorrow's fire is
+  the actual reliability proof. Check via:
+  ```sql
+  SELECT order_date, COUNT(*) AS orders_count, MIN(created_at) AS first_insert_utc
+  FROM velora_oms.orders GROUP BY order_date ORDER BY order_date;
+  ```
+  Expect a 2026-05-07 row with `first_insert_utc` between 00:30–00:40 UTC and
+  270–500 orders. After verifying, **re-run the silver/gold layer**
+  (`run_silver_smoke.py --entity orders|customers` + `run_gold_smoke.py
+  --entity dim_customer`) to incorporate May-7 data.
 - **Rotate `AzureWebJobsStorage` account key on `pipelineiqfunctionsdev`.**
   Key was printed in S6 transcript when listing app settings (~`vz1Z2iSghWL6...`).
   Storage Account → Keys and Endpoint → Regenerate key1; Terraform will pick

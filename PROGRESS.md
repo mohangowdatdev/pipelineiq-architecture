@@ -2,66 +2,68 @@
 
 ## Current phase
 
-**Phase 0 — Done. Phase 1 — Re-done on real wall-clock dates (S6). Phase 2 — Bronze layer COMPLETE for all 10 entities (S7). Silver + Gold next.**
+**Phase 0 — Done. Phase 1 — Done. Phase 2 — Bronze 100% (S7). First medallion
+vertical slice through Silver + Gold COMPLETE (S8). SCHEMA.md refit into a
+tight industry-grade blueprint with no design ambiguity (S8). Remaining:
+8 Silver tables + 11 Gold dims/facts + ADF Bicep.**
 
-39 Azure resources live (Function App on FC1 Flex Consumption, see DECISIONS #50).
-UC metastore + 3 catalogs + 5 external locations + cluster policy + SQL warehouse
-+ secret scope all stable. Function cron now `0 30 0 * * *` UTC = **06:00 IST
-daily** so data lands before the user's workday (S7).
+40 Azure resources live (4th UC catalog `quarantine` added in S8). Function
+App on FC1 Flex Consumption fires daily at 06:00 IST = 00:30 UTC.
 
 **Source DB:** 10 days of real-dated activity, **2026-04-27 → 2026-05-06**, in
-`velora_oms`. Today's row (May 6) was produced by a manual invoke on 2026-05-07
-because the cron was changed mid-flight; tomorrow onward fires autonomously at
-06:00 IST.
+`velora_oms`. Tomorrow morning (2026-05-08 00:30 UTC) is the first autonomous
+fire on the IST schedule.
 
-**Landing + Bronze:** Cleanly rebuilt on real dates in S7. `landing/` holds
-1.92M rows across 28 Parquet files (10 day-partitions × 2 by_date entities + 8
-master snapshots). All 10 `bronze.default.*` tables hydrated end-to-end with
-matching row counts (1,891,125 inventory + 3,619 orders + 12,300 lines + 6,897
-status logs + smaller masters).
+**Bronze:** All 10 `bronze.default.*` tables hydrated (S7). 1,891,125 inventory
++ 3,619 orders + 12,300 lines + 6,897 status logs + smaller masters.
 
-**Repo migration (S7):** All 3 repos (`pipelineiq-architecture`,
-`pipelineiq-iac`, `pipelineiq-portal`) transferred from `mohangowdat-sail` →
-**`mohangowdatdev`** (personal portfolio is the canonical home from now on).
-Local remotes updated. Per-repo `user.email` flipped to
-`mohangowdat.dev@gmail.com` so future contributions colour the personal graph.
-Vercel manual deploy fired post-transfer (https://pipelineiq-portal.vercel.app
-serving the new build); Vercel push→auto-deploy reconnect is the only Vercel
-loose end.
+**Silver:** 2 of 10 tables hydrated (S8) — `silver.default.orders` (3,619 rows,
+100% DQ pass) and `silver.default.customers` (248 rows, 100% DQ pass with SCD
+change tracking computed). Pattern-setters for the remaining 8.
+
+**Gold:** 1 of 12 dims/facts hydrated (S8) — `gold.default.dim_customer`
+(248 rows, SCD Type 2 idempotent, `valid_from` = earliest activity date).
+Verified end-to-end: as-of join from `silver.orders` matches 3,619 / 3,619
+silver orders to a `dim_customer` row.
+
+**Quarantine:** Catalog created (S8). All notebooks wire the routing path; no
+rows quarantined yet because the generator produces clean OLTP. Will be
+exercised in Phase 3 failure injection.
+
+**SCHEMA.md status (S8):** refit complete. All 10 Silver tables + all 12 Gold
+dims/facts have explicit specs with derivation rules. Conventions for both
+layers documented at the top of each section. Every remaining notebook codes
+straight against the spec.
 
 ## Next task
 
-**Session 8 plan (Phase 2 medallion build-out):**
+**Session 9 plan — `gold.fact_order_line` and its prereqs:**
 
-1. **First Silver notebook — `silver.orders`.** Most join-heavy downstream
-   consumer, so it's the right pattern-setter. Target: read all 10 entities
-   from `bronze.default.*` (already populated S7), dedup-on-business-key MERGE
-   into `silver.default.orders`, add DQ flag columns + `rejection_reason`,
-   partition by `_silver_timestamp::date`, route bad rows to `quarantine/`
-   with `pipeline_run_id`. Per CLAUDE.md medallion contract: Silver is where
-   unification + validation live. ~90 min.
-2. **First Gold dimension — `gold.dim_customer`.** SCD Type 2 on `segment` +
-   `city` (per DECISIONS #15). Surrogate key generation, `valid_from` /
-   `valid_to` / `is_current`, business key preservation. ~90 min.
-3. **First Gold fact — `gold.fact_order_line`.** Joins Silver orders +
-   order_lines + product_pricing + dim_customer + dim_product. One row per
-   SKU per order. Star-schema joins via surrogate keys. ~120 min.
+1. **`silver.order_lines`** (~45 min) — straightforward, mirrors `silver.orders`
+   pattern. DQ rules: NULL_LINE_ID, NULL_ORDER_ID, NULL_PRODUCT_ID,
+   UNKNOWN_ORDER_ID (FK to `silver.orders`), UNKNOWN_PRODUCT_ID (FK to
+   `silver.products`), INVALID_QUANTITY (≤ 0), INVALID_UNIT_PRICE (≤ 0).
+2. **`silver.products`** (~45 min) — mutable dim attrs only. List_price is
+   NOT in this table (lives in `silver.product_pricing`). DQ rules:
+   NULL_PRODUCT_ID, NULL_SKU, INVALID_DIVISION, NULL_CATEGORY_ID.
+3. **`silver.product_pricing`** (~45 min) — append-only price-change log.
+   DQ rules: NULL_PRICING_ID, NULL_PRODUCT_ID, UNKNOWN_PRODUCT_ID,
+   INVALID_LIST_PRICE (≤ 0), INVALID_PRICING_TYPE, NULL_EFFECTIVE_FROM.
+4. **`gold.dim_product`** (~90 min) — SCD Type 2 on `list_price`. Joins
+   `silver.products` + `silver.product_pricing` at build time. `valid_from`
+   tracks `product_pricing.effective_from`. Surrogate key =
+   `xxhash64(product_id, valid_from)`.
+5. **`gold.fact_order_line`** (~120 min) — the big one. PK = pass-through
+   `line_id`. As-of joins to `dim_customer` and `dim_product` on `order_date`.
+   `tax_amount = round(line_total_inr * 0.18, 2)`, `net_revenue_inr =
+   line_total_inr`. Per-channel `territory_id` derivation (STORE → store, B2B
+   → as-of dim_sales_rep, D2C → `D2C_NATIONAL` sentinel).
 
-After 1–3 the medallion is proven end-to-end on one narrow slice. Subsequent
-dimensions/facts (dim_product, dim_sales_rep, fact_inventory_daily,
-fact_daily_channel_revenue) are pattern repetition.
+After (5) the first fact is proven end-to-end. Remaining medallion work is
+pattern repetition: 5 more Silver tables + 8 more Gold dims/facts.
 
-**Vercel auto-deploy reconnect (loose end from S7).** Open
-https://vercel.com/mohan-gowda-ts-projects/pipelineiq-portal/settings/git →
-click GitHub → pick `mohangowdatdev/pipelineiq-portal`. Then a no-op commit +
-push to `main` will auto-deploy. Until then, manual `vercel --prod` from
-`PipelineIQ-Portal/` keeps the site fresh. Site URL:
-**https://pipelineiq-portal.vercel.app**.
-
-**Verify tomorrow's first 06:00-IST autonomous fire** (2026-05-08 00:30 UTC).
-Run the SQL below — May-7 row should exist with `first_insert_utc` between
-00:30–00:40 UTC and 270–500 orders. If missing or off-window, Flex isn't
-firing reliably on the new schedule.
+**Verify tomorrow's first 06:00-IST autonomous fire** (2026-05-08 00:30 UTC,
+loose end from S7).
 
 ```sql
 SELECT order_date, COUNT(*) AS orders_count,
@@ -70,6 +72,12 @@ SELECT order_date, COUNT(*) AS orders_count,
 FROM velora_oms.orders
 GROUP BY order_date ORDER BY order_date;
 ```
+
+May-7 row should exist with `first_insert_utc` between 00:30–00:40 UTC and
+270–500 orders. If missing or off-window, Flex isn't firing reliably and we
+need to investigate. After verifying, **re-run the silver/gold layer**
+(`run_silver_smoke.py --entity orders|customers` + `run_gold_smoke.py
+--entity dim_customer`) to incorporate the new May-7 data.
 
 ### Phase 0 loose ends (interleave when convenient)
 
@@ -130,7 +138,7 @@ dependency-ordered and has a status column.
 | Phase 0 | **Effectively complete** (Functions app + ADF Bicep deferred to interleave) | terraform apply clean, all resources exist, Unity Catalog shows 3 catalogs, RBAC verified | 39 Azure resources live. Bootstrap SQL complete on both DBs. UC metastore (adopted) + 3 catalogs + 5 external locations + SQL warehouse + cluster policy + secret scope all applied. Functions app + ADF still Pending — not blocking Phase 2 (export script + Bronze notebook substitute). |
 | Phase 1 | **COMPLETE (verified end-to-end)** | Generator populates all 10 Azure SQL tables. All 6 failure classes produce correct bad records. | 2026-01-15 seed ran against live velora_oms: catalogue + 308 orders + 1177 lines + 189K inventory rows. 6 failure classes still unverified (default `--failure` not yet exercised against live DB). |
 | Phase 1 (original row — superseded above) | COMPLETE | — | See updated row for post-verification status |
-| Phase 2 | **Bronze layer complete (S7)** | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | All 10 Bronze tables hydrated end-to-end on real-dated source (Apr 27 → May 6, 2026). 1,891,125 inventory + 3,619 orders + 12,300 lines + 6,897 status logs + smaller masters. Notebook entity-agnostic (DECISIONS #48). Single multi-task Job with shared 2-worker cluster ran the 10 ingestions in parallel in ~7 min wall time. Remaining: all Silver, all Gold. |
+| Phase 2 | **First medallion vertical slice complete (S8). Bronze 100%, Silver 2/10, Gold 1/12.** | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | Bronze: all 10 tables hydrated end-to-end on real-dated source (Apr 27 → May 6, 2026). Silver: `silver.orders` (3,619 rows, 100% DQ pass) + `silver.customers` (248 rows, 100% DQ pass + SCD change tracking). Gold: `gold.dim_customer` (248 rows, SCD Type 2 idempotent, as-of joins verified 3,619/3,619 match). SCHEMA.md refit (S8) gives every remaining Silver/Gold notebook explicit specs to code against. Remaining: 8 Silver tables + 11 Gold dims/facts + ADF Bicep replacement for the export script. |
 | Phase 3 | Not started | Inject each failure class. Structured event in PostgreSQL within 5 minutes. | — |
 | Phase 4 | Not started | 3 different error messages → semantically relevant IaC chunks returned. | — |
 | Phase 5 | Not started | Slack alert within 5 minutes. AI identifies root cause for 4+ of 6 failure types. | — |
@@ -280,6 +288,53 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-07 (Session 8 — first Silver+Gold slice, schema blueprint refit)
+**Objective:** Land the first vertical slice through the medallion (Silver orders, Silver customers, Gold dim_customer with SCD-2), close the Vercel auto-deploy loose end from S7, then refit SCHEMA.md as a tight industry-grade blueprint with no "follow the same pattern" placeholders or unspec'd derivation rules.
+
+**Built:**
+- **Vercel auto-deploy** reconnected to `mohangowdatdev/pipelineiq-portal` (user moved Vercel auth from GitHub `mohangowdat-sail` to Google login + reinstalled GitHub App on `mohangowdatdev`). Verified via empty commit `eb7e0b8` → 19s build → HTTP 200 with `age: 0`.
+- **`quarantine` UC catalog** added — `core/databricks_uc/variables.tf` `catalogs` default updated from `["bronze","silver","gold"]` to `["bronze","silver","gold","quarantine"]`. `terraform apply` created the missing catalog (the external location had existed since S5 but the catalog hadn't). Closes a latent IaC variable mismatch (`containers` listed all 5, `catalogs` only 3).
+- **`silver.orders` notebook** at `notebooks/silver/build_silver_orders.py`. 3,619 rows in `silver.default.orders`, 100% DQ pass. 9 DQ rules, dedup-on-business-key MERGE, partition by `_silver_date`, quarantine routing wired (no rows quarantined — generator produces clean OLTP).
+- **`silver.customers` notebook** at `notebooks/silver/build_silver_customers.py`. 248 rows, 100% DQ pass. Establishes SCD-change-tracking-at-Silver pattern: `_prev_segment`/`_prev_city`/`_scd_changed` computed by left-joining incoming batch against current Silver state.
+- **`gold.dim_customer` notebook** at `notebooks/gold/build_gold_dim_customer.py`. SCD Type 2 on `segment`+`city`, SCD Type 1 overwrite for other attrs. Surrogate key = `xxhash64(customer_id, valid_from)`. Close-old (UPDATE) + insert-new (APPEND) is two ops because MERGE alone can't express "match on NK but insert a new row". 248 dim rows, idempotent (second run produced zero new rows / closures).
+- **`scripts/run_silver_smoke.py`** + **`scripts/run_gold_smoke.py`** + **`scripts/verify_silver_orders.py`** — reusable smoke/verify harnesses mirroring `run_bronze_smoke.py`.
+- **SCHEMA.md refit** (the big one):
+  - New "Conventions for all Silver tables" section (audit columns, DQ flags, dedup, MERGE, partition, quarantine routing, SCD-tracking pattern).
+  - All 10 Silver tables now have explicit column lists and DQ-rule sets — placeholder gone.
+  - New "Conventions for all Gold tables" section (xxhash64 surrogate keys, `valid_from` = earliest known activity date, fact→dim as-of join SQL pattern, static-dim bypass-Silver convention).
+  - `gold.dim_product`: `list_price` source clarified — comes from `silver.product_pricing` (separate table, not `silver.products`). `valid_from` tracks `product_pricing.effective_from`.
+  - `gold.dim_sales_rep`: `territory_id` source from `silver.territory_assignments`.
+  - `gold.dim_territory`: `D2C_NATIONAL` sentinel row documented.
+  - `gold.fact_order_line`: PK = pass-through `line_id`, full derivation table for 6 measures (`tax_amount = round(line_total_inr * 0.18, 2)` India GST; `net_revenue_inr = line_total_inr` post-discount pre-tax). Per-channel `territory_id` rule.
+  - `gold.fact_inventory_daily`: `days_of_stock_remaining` formula (closing_stock / 7-day rolling avg).
+  - `gold.fact_daily_channel_revenue`: per-measure aggregation rules.
+  - Static dims gained `_pipeline_run_id` + `_gold_timestamp`.
+  - Quarantine moved to its own catalog convention; all 10 tables listed.
+  - Schema change log entry #5 captures the full refit.
+- **`dim_customer` rebuilt** with corrected `valid_from` rule (= `MIN(silver.orders.order_date)` per customer; falls back to `current_date()` for customers with no orders). Verified: as-of join from `silver.orders` to `gold.dim_customer` matches 3,619 / 3,619 rows. The previous `valid_from = current_date()` build would have failed every fact_order_line as-of join in S9.
+
+**Worked:**
+- Vercel CLI `vercel git connect` failed with same error twice even after the user installed the GitHub App on `mohangowdatdev` — pivoting to dashboard reconnect surfaced the real cause (Vercel user OAuth-bound to old GitHub identity); user resolved by switching Vercel auth to Google login.
+- The IaC `containers` vs `catalogs` mismatch was a 1-line fix; the targeted `terraform apply -target=module.databricks_uc.databricks_catalog.this` was clean.
+- The vertical slice held — Bronze entity-agnostic + Silver entity-specific (per-entity DQ rules) + Gold dim with SCD-2 close-old/insert-new is a coherent shape that scales to the rest of the medallion.
+- xxhash64 surrogate key worked as designed — second dim_customer run produced zero new rows because the (customer_id, valid_from) tuples were identical.
+- Schema-refit-then-reconcile caught the `valid_from` bug *before* it bit during S9 fact_order_line build. Doing the schema overhaul before more code was the right ordering.
+
+**Broke:**
+- First Silver run failed at `CREATE SCHEMA quarantine.default` — UC `quarantine` catalog didn't exist yet (DECISIONS-#46 era IaC only created bronze/silver/gold). Fixed via the IaC variable update + apply, then the next run was clean.
+- Initial `silver.orders` notebook had a mangled `partitionBy` expression (`F.to_date(...).cast("date").__class__ and "_silver_timestamp"` — copy-paste damage). Fixed by adding an explicit `_silver_date` derived column and partitioning on that.
+- Hit an Auto-Mode permission denial when first attempting the IaC apply — `core/` is a "do not touch zone" without explicit instruction. Surfaced 3 options to user (terraform apply / sub-schema in silver / stop), they confirmed Option A.
+- Schema change log #5 initially claimed "code impact: none" — wrong. The new `valid_from` rule meant the S8 `dim_customer` build (with `valid_from = current_date()`) would have failed every fact_order_line as-of join. Corrected the log entry, fixed the code, dropped + rebuilt the table.
+
+**Uncertainty:**
+- **App Insights telemetry on Flex Consumption** still empty (carried from S6/S7). Not blocking S9.
+- **Tomorrow's autonomous 06:00 IST fire** (2026-05-08 00:30 UTC) is still the cron-reliability proof from S7's deploy — until that lands, the schedule isn't fully verified.
+- **Quarantine path** is wired but untested (no rejected rows so far). Will be exercised when Phase 3 failure injection lands.
+
+**Next:** Session 9 = `silver.order_lines`, `silver.products`, `silver.product_pricing` (the prereqs), then `gold.dim_product` (SCD-2 on list_price), then `gold.fact_order_line` (the first fact). All have explicit specs in SCHEMA.md now.
+
+**Summary:** S8 landed the first vertical slice through the medallion (silver.orders, silver.customers, gold.dim_customer with full SCD-2) and refit SCHEMA.md into an industry-grade blueprint with no design ambiguity left. Vertical-slice verified end-to-end on real data: 3,619 orders + 248 customers + 248 dim rows, all idempotent, with 100% as-of join coverage from facts to dim. Vercel auto-deploy is reconnected so portal pushes deploy on push again. SCHEMA.md is now a tight contract — every remaining Silver/Gold notebook reads columns + DQ rules + derivation formulas straight from it. The schema-first then code-second discipline caught a real bug (valid_from = current_date breaks as-of joins) before it bit S9. Repos pushed clean: 4 commits to architecture (`bee0c09`, `a81b61c`, `ef3dfab`, plus the upcoming docs commit) + 1 to IaC (`5babe8e`).
 
 ### 2026-05-07 (Session 7 — Bronze backfill on real dates + repo migration to portfolio)
 **Objective:** Verify last night's Function fire, do the deferred Bronze cleanup + clean backfill, and (mid-session pivot) migrate the 3 PipelineIQ repos from `mohangowdat-sail` to `mohangowdatdev` since the personal account is the canonical home for this pet project.
