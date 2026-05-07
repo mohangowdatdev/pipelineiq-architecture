@@ -2,64 +2,74 @@
 
 ## Current phase
 
-**Phase 0 — Done. Phase 1 — Re-done on real wall-clock dates (S6). Phase 2 — Bronze backfill not yet redone post-S6 source reset.**
+**Phase 0 — Done. Phase 1 — Re-done on real wall-clock dates (S6). Phase 2 — Bronze layer COMPLETE for all 10 entities (S7). Silver + Gold next.**
 
-39 Azure resources live (Function App migrated Y1→FC1 Flex Consumption in S6 —
-same hostname, new MSI, see DECISIONS #50). UC metastore + 3 catalogs + 5
-external locations + cluster policy + SQL warehouse + secret scope all stable.
+39 Azure resources live (Function App on FC1 Flex Consumption, see DECISIONS #50).
+UC metastore + 3 catalogs + 5 external locations + cluster policy + SQL warehouse
++ secret scope all stable. Function cron now `0 30 0 * * *` UTC = **06:00 IST
+daily** so data lands before the user's workday (S7).
 
-**Source DB reset to real dates in S6** (DECISIONS #51). `velora_oms` now holds
-9 days from 2026-04-27 → 2026-05-05: 3,235 orders / 11,014 lines / 5,930 status
-logs / 232 customers / 1,701,900 inventory rows. Generator runs on `today_utc - 1`
-with an idempotency guard. Catalogue (4,200 products, 30 sales reps, 30 territory
-assignments) preserved across the reset since UUID5 makes catalogue rewrites a no-op.
+**Source DB:** 10 days of real-dated activity, **2026-04-27 → 2026-05-06**, in
+`velora_oms`. Today's row (May 6) was produced by a manual invoke on 2026-05-07
+because the cron was changed mid-flight; tomorrow onward fires autonomously at
+06:00 IST.
 
-**Bronze + landing/ NOT YET CLEANED.** `bronze.default.customers` (158 rows) and
-`bronze.default.orders` (4,001 rows) still hold ordinal Jan-2026 data from S5.
-`landing/` still has the matching Jan-dated parquet. S7 Step 1 = wipe landing,
-drop both Bronze tables, re-export real-dated source, ingest all 10 entities.
+**Landing + Bronze:** Cleanly rebuilt on real dates in S7. `landing/` holds
+1.92M rows across 28 Parquet files (10 day-partitions × 2 by_date entities + 8
+master snapshots). All 10 `bronze.default.*` tables hydrated end-to-end with
+matching row counts (1,891,125 inventory + 3,619 orders + 12,300 lines + 6,897
+status logs + smaller masters).
+
+**Repo migration (S7):** All 3 repos (`pipelineiq-architecture`,
+`pipelineiq-iac`, `pipelineiq-portal`) transferred from `mohangowdat-sail` →
+**`mohangowdatdev`** (personal portfolio is the canonical home from now on).
+Local remotes updated. Per-repo `user.email` flipped to
+`mohangowdat.dev@gmail.com` so future contributions colour the personal graph.
+Vercel manual deploy fired post-transfer (https://pipelineiq-portal.vercel.app
+serving the new build); Vercel push→auto-deploy reconnect is the only Vercel
+loose end.
 
 ## Next task
 
-**Session 7 plan:**
+**Session 8 plan (Phase 2 medallion build-out):**
 
-0. **Verify last night's Function fire** (first task of S7). Run the SQL below
-   against velora_oms; the 2026-05-06 row should exist with `first_insert_utc`
-   between 06:00–06:10 UTC on 2026-05-07 and 270–500 orders. If missing or
-   off-window, Flex isn't firing reliably and we revisit DECISIONS #50.
+1. **First Silver notebook — `silver.orders`.** Most join-heavy downstream
+   consumer, so it's the right pattern-setter. Target: read all 10 entities
+   from `bronze.default.*` (already populated S7), dedup-on-business-key MERGE
+   into `silver.default.orders`, add DQ flag columns + `rejection_reason`,
+   partition by `_silver_timestamp::date`, route bad rows to `quarantine/`
+   with `pipeline_run_id`. Per CLAUDE.md medallion contract: Silver is where
+   unification + validation live. ~90 min.
+2. **First Gold dimension — `gold.dim_customer`.** SCD Type 2 on `segment` +
+   `city` (per DECISIONS #15). Surrogate key generation, `valid_from` /
+   `valid_to` / `is_current`, business key preservation. ~90 min.
+3. **First Gold fact — `gold.fact_order_line`.** Joins Silver orders +
+   order_lines + product_pricing + dim_customer + dim_product. One row per
+   SKU per order. Star-schema joins via surrogate keys. ~120 min.
 
-   ```sql
-   SELECT order_date,
-          COUNT(*)                AS orders_count,
-          MIN(created_at)         AS first_insert_utc,
-          MAX(created_at)         AS last_insert_utc
-   FROM velora_oms.orders
-   GROUP BY order_date
-   ORDER BY order_date;
-   ```
+After 1–3 the medallion is proven end-to-end on one narrow slice. Subsequent
+dimensions/facts (dim_product, dim_sales_rep, fact_inventory_daily,
+fact_daily_channel_revenue) are pattern repetition.
 
-1. **Bronze cleanup + clean backfill.** Wipe `landing/` for all 10 entity dirs
-   (needs explicit user permission — hook blocks bulk ADLS deletes). Drop
-   `bronze.default.customers` + `bronze.default.orders`. Re-run
-   `scripts/export_velora_to_landing.py --start 2026-04-27 --end 2026-05-05`
-   (note: the script currently only takes `--date` or `--start/--end`; add
-   `--start/--end` if missing). Then loop
-   `scripts/run_bronze_smoke.py --entity X` over all 10 entities. ~45 min.
-2. **First Silver notebook.** Pattern target: dedup-on-business-key MERGE into
-   `silver.default.{entity}`, add DQ flags + rejection_reason, partition by
-   `_silver_timestamp::date`. Per CLAUDE.md: Silver is where unification +
-   validation live. Start with `silver.orders` since it's the most join-heavy
-   downstream consumer. ~90 min.
-3. **First Gold dimension.** `gold.dim_customer` with SCD-Type-2 logic on
-   `segment` + `city` (per DECISIONS #15). Surrogate key generation +
-   `valid_from` / `valid_to` / `is_current` + business key. ~90 min.
-4. **First Gold fact.** `gold.fact_order_line` joining Silver orders +
-   order_lines + product_pricing + dim_customer + dim_product. Star-schema-ish.
-   ~120 min.
+**Vercel auto-deploy reconnect (loose end from S7).** Open
+https://vercel.com/mohan-gowda-ts-projects/pipelineiq-portal/settings/git →
+click GitHub → pick `mohangowdatdev/pipelineiq-portal`. Then a no-op commit +
+push to `main` will auto-deploy. Until then, manual `vercel --prod` from
+`PipelineIQ-Portal/` keeps the site fresh. Site URL:
+**https://pipelineiq-portal.vercel.app**.
 
-After steps 1–4, you've proven the medallion architecture end-to-end on one
-narrow slice. Subsequent dimensions/facts (dim_product, dim_sales_rep,
-fact_inventory_daily, fact_daily_channel_revenue) are pattern repetition.
+**Verify tomorrow's first 06:00-IST autonomous fire** (2026-05-08 00:30 UTC).
+Run the SQL below — May-7 row should exist with `first_insert_utc` between
+00:30–00:40 UTC and 270–500 orders. If missing or off-window, Flex isn't
+firing reliably on the new schedule.
+
+```sql
+SELECT order_date, COUNT(*) AS orders_count,
+       MIN(created_at) AS first_insert_utc,
+       MAX(created_at) AS last_insert_utc
+FROM velora_oms.orders
+GROUP BY order_date ORDER BY order_date;
+```
 
 ### Phase 0 loose ends (interleave when convenient)
 
@@ -120,7 +130,7 @@ dependency-ordered and has a status column.
 | Phase 0 | **Effectively complete** (Functions app + ADF Bicep deferred to interleave) | terraform apply clean, all resources exist, Unity Catalog shows 3 catalogs, RBAC verified | 39 Azure resources live. Bootstrap SQL complete on both DBs. UC metastore (adopted) + 3 catalogs + 5 external locations + SQL warehouse + cluster policy + secret scope all applied. Functions app + ADF still Pending — not blocking Phase 2 (export script + Bronze notebook substitute). |
 | Phase 1 | **COMPLETE (verified end-to-end)** | Generator populates all 10 Azure SQL tables. All 6 failure classes produce correct bad records. | 2026-01-15 seed ran against live velora_oms: catalogue + 308 orders + 1177 lines + 189K inventory rows. 6 failure classes still unverified (default `--failure` not yet exercised against live DB). |
 | Phase 1 (original row — superseded above) | COMPLETE | — | See updated row for post-verification status |
-| Phase 2 | **Started 2026-05-01** | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | First Bronze table live: `bronze.default.customers` (158 rows, full audit columns + `_ingestion_date` partition). Notebook is entity-agnostic (1 of 10 entities ingested as smoke test). 1.34M rows landed in Parquet across `landing/`. SQL Warehouse query verified end-to-end. Remaining: 9 more Bronze ingestions, all Silver, all Gold. |
+| Phase 2 | **Bronze layer complete (S7)** | Full pipeline run completes. Good records in Gold. Bad records in quarantine with correct rejection reasons. SQL Warehouse queryable from VS Code. | All 10 Bronze tables hydrated end-to-end on real-dated source (Apr 27 → May 6, 2026). 1,891,125 inventory + 3,619 orders + 12,300 lines + 6,897 status logs + smaller masters. Notebook entity-agnostic (DECISIONS #48). Single multi-task Job with shared 2-worker cluster ran the 10 ingestions in parallel in ~7 min wall time. Remaining: all Silver, all Gold. |
 | Phase 3 | Not started | Inject each failure class. Structured event in PostgreSQL within 5 minutes. | — |
 | Phase 4 | Not started | 3 different error messages → semantically relevant IaC chunks returned. | — |
 | Phase 5 | Not started | Slack alert within 5 minutes. AI identifies root cause for 4+ of 6 failure types. | — |
@@ -270,6 +280,41 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-07 (Session 7 — Bronze backfill on real dates + repo migration to portfolio)
+**Objective:** Verify last night's Function fire, do the deferred Bronze cleanup + clean backfill, and (mid-session pivot) migrate the 3 PipelineIQ repos from `mohangowdat-sail` to `mohangowdatdev` since the personal account is the canonical home for this pet project.
+
+**Built:**
+- `generator/function.json` — cron `0 0 6 * * *` (06:00 UTC = 11:30 IST) → `0 30 0 * * *` (00:30 UTC = **06:00 IST**). Redeployed via `scripts/deploy_function.sh`. New schedule verified live via `az functionapp function show`. Manual-invoked once today to land 2026-05-06 (since the cron change happened mid-day).
+- `landing/` rebuilt clean — wiped 54 stale ordinal-Jan-2026 files across 10 entity dirs, then re-exported 10 days (2026-04-27 → 2026-05-06) via `scripts/export_velora_to_landing.py --start ... --end ...`. 1,922,920 rows total: 20 by_date partitions (orders + inventory_snapshot, one per day) + 8 master-table full snapshots.
+- `bronze.default.*` rebuilt clean — dropped stale `customers` + `orders` tables, then ran a single multi-task Databricks Job with 10 tasks sharing one 2-worker DS3_v2 cluster. All 10 entities ingested in parallel; ~7 min wall time. Final Bronze totals match source 1:1: customers 248, customer_addresses 248, orders 3,619, order_lines 12,300, order_status_log 6,897, products 4,205, product_pricing 4,218, inventory_snapshot 1,891,125, sales_reps 30, territory_assignments 30.
+- **Repo migration:** transferred `pipelineiq-architecture`, `pipelineiq-iac`, `pipelineiq-portal` from `mohangowdat-sail` → `mohangowdatdev` via `gh api -X POST repos/.../transfer -f new_owner=mohangowdatdev`. All 3 accepted by `mohangowdatdev` via Gmail link-clicks. Local `git remote set-url` updated on all 3. Per-repo `user.email` flipped to `mohangowdat.dev@gmail.com` so future contribution graphs colour the personal profile.
+- **Vercel:** disconnected old `mohangowdat-sail/pipelineiq-portal` Git binding, fired a manual production deploy (`vercel --prod`) — `pipelineiq-portal-m05tbg28i...vercel.app` now serving the production alias. Reconnect to `mohangowdatdev/pipelineiq-portal` is the only loose end (Vercel team OAuth-bound to `mohangowdat-sail`, needs UI re-link).
+- `CLAUDE.md` — cleared two resolved Pending items (IaC fe45547 push, May-7 06:00 UTC fire verification). Added carry-over noting `mohangowdatdev` is the canonical home. Removed in commit `0ef65a4`.
+- `docs/build_order.md` — new row 9.4b for the Bronze backfill (all 10 entities). 9.4 note updated.
+
+**Worked:**
+- Verification SQL via AAD-token pyodbc cleanly confirmed today's manual fire produced 384 orders for May 6 — the secret-free auth path scaled fine.
+- The shared-cluster multi-task Job design dropped expected wall time from "30-50 min if I loop the smoke driver 10×" to ~7 min. Cluster start cost paid once. `SubmitTask` doesn't support `job_cluster_key` (one-time runs limitation), but `Job.create` + `run_now` + `Job.delete` pattern works cleanly and leaves no orphaned Job in the workspace.
+- All 10 entity Bronze counts matched source 1:1 — confirms the entity-agnostic notebook (DECISIONS #48) holds up across `by_date` and `full` landing layouts uniformly via `recursiveFileLookup=true`.
+- Repo transfer via REST API was clean — same-person user-to-user transfers do not auto-accept (require email-link click) but otherwise work atomically; pre-transfer URLs return HTTP 301 redirects so any pinned link / clone keeps working indefinitely.
+
+**Broke:**
+- Initial verification SQL attempt used password auth via Key Vault → hook denied (would have leaked secret into transcript). Pivoted to `DefaultAzureCredential` AAD token path (same pattern as `scripts/run_bootstrap_sql.py`) — secret-free, one Python invocation.
+- Invented a `gh repo transfer` subcommand that doesn't exist in `gh` v2.90.0. Hook caught the unverified-command + ownership-change combo and blocked it. Correct API form (`gh api -X POST repos/{owner}/{repo}/transfer`) was the documented approach all along; should have verified with `gh repo --help` before suggesting.
+- `az functionapp show --query defaultHostName` returned `null` on Flex Consumption — went via `az resource show -n ... --resource-type Microsoft.Web/sites --query "properties.defaultHostName"` instead. Worth knowing for future Flex tooling.
+- First multi-task design used `SubmitTask` (one-time run) with `job_cluster_key` — that combination is invalid (one-time runs require `new_cluster` per task). Switched to `jobs.create` + `run_now` + `delete` pattern; clean.
+- Bronze drop via SQL warehouse first returned `StatementState.PENDING` and the script tried to read `result.data_array` immediately → `AttributeError`. Rewrote to poll `get_statement(statement_id)` until terminal state. ~3 min lost.
+- Vercel `git connect` failed with HTTP 400 even after installing the Vercel GitHub App on `mohangowdatdev`. Root cause: the Vercel team `mohan-gowda-ts-projects` is OAuth-connected to GitHub via `mohangowdat-sail`, which doesn't have read access to `mohangowdatdev/*` repos even with the App installed there. Surfaced as a UI step (Vercel project Settings → Git → Connect with GitHub picker) for the user to complete; not blocking — manual `vercel --prod` keeps the site live.
+
+**Uncertainty:**
+- **Tomorrow morning's first autonomous 06:00 IST fire** (2026-05-08 00:30 UTC) is the actual reliability proof for the new cron. Until that lands, today's manual invoke only proves the function executes — not that the timer fires on schedule.
+- Vercel UI reconnect step pending — user will do it next session. Once done, a no-op commit + push to `main` should auto-deploy.
+- App Insights telemetry on Flex Consumption still empty (carried over from S6). Not blocking until Phase 4+ observability work.
+
+**Next:** Session 8 = first Silver notebook (`silver.default.orders`). Then `gold.dim_customer` (SCD-2). Then `gold.fact_order_line`. See `## Next task` for the full plan. Plus the Vercel auto-deploy reconnect (UI step on the user's side).
+
+**Summary:** S7 closed S6's deferred Bronze cleanup and added the personal-portfolio repo migration that wasn't on the original plan. Net result: Phase 2 Bronze layer is COMPLETE for all 10 entities on real-dated source data, and PipelineIQ now lives at `mohangowdatdev` (personal portfolio = canonical home). Site stays live at https://pipelineiq-portal.vercel.app via manual deploy; Vercel push→auto-deploy reconnect is the only loose end. Function cron moved to 06:00 IST so tomorrow's nightly batch lands before standup. Ready to start the medallion build-out in S8 — Silver `orders`, then Gold `dim_customer`, then Gold `fact_order_line`. No DECISIONS or SCHEMA changes today (architectural choices were all session-tactical — multi-task job pattern, repo-migration mechanics).
 
 ### 2026-05-06 (Session 6 — Function migration to Flex + real-date source reset)
 **Objective:** Get back to Bronze backfill, but first investigate why the daily Function had only fired once since S5; then migrate it to a reliable plan; then switch the generator to wall-clock real dates so the demo timeline stops being confusing ordinal-Jan-2026 days.
