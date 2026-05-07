@@ -426,17 +426,6 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
 - ~~Tier 4.6 Azure Functions app~~ **Done (S5 addendum, 2026-05-01; migrated to FC1
   Flex Consumption in S6, 2026-05-06).** Function App `pipelineiq-functions-dev`
   live on FC1. See DECISIONS #50 + #51 + `core/functions/` IaC module.
-- **PipelineIQ-IaC commit `fe45547` (Flex migration) is local-only — push blocked.**
-  GitHub credential helper resolves to user `mohangowdatdev` instead of
-  `mohangowdat-sail`. `git push origin main` returns 403. Re-auth via
-  `gh auth login` or update `~/.gitconfig` / credential helper to use the
-  `mohangowdat-sail` GitHub identity, then `git push`. Until then the IaC repo
-  has unpushed work — violates the "session-end has a remote tip" guarantee.
-- **Verify daily Function fired at 2026-05-07 06:00 UTC.** First test of the
-  Y1→FC1 migration's reliability claim. Run the verification query in
-  PROGRESS.md S6 session log under "Next" — the May 6 row should exist with
-  `created_at` between 06:00–06:10 UTC and a row count in the 270–500 range.
-  If missing or off-window, Flex isn't firing reliably either and we revisit.
 - **App Insights telemetry not flowing on Flex Consumption.** The Function
   executes (proven via `velora_oms` side-effects) but `requests` / `traces` /
   `exceptions` tables in App Insights stay empty. Was also broken on Y1.
@@ -471,6 +460,18 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Development on the `--sensitive` flag. Dashboard overrides both. Not blocking
   the live site; finish via dashboard if/when PR previews or `vercel dev` are
   needed.
+- **Repos belong on `mohangowdatdev` (personal portfolio); `mohangowdat-sail` is
+  the future company-handoff destination, not the canonical home.** PipelineIQ
+  is the user's personal pet project — `mohangowdatdev` is the primary GitHub
+  account it should live under. Currently the 3 repos
+  (`pipelineiq-architecture`, `pipelineiq-iac`, `pipelineiq-portal`) sit on
+  `mohangowdat-sail`; that's a temporary state. Migration plan: transfer all 3
+  repos to `mohangowdatdev` (both identities already authenticated locally),
+  update local `git remote set-url`. Push to `mohangowdat-sail` only happens
+  later as a one-time handoff with company-side customisations layered in. Not
+  a DECISIONS-log item per user instruction — just a carry-over. Trigger is
+  user's call, not "wait for architecture stable" — the user can flip it
+  anytime.
 - **Rotate Key 1 on `pipeline-iq-resource`** (2026-04-21 S2). First/last 8 chars
   (`G2F8oS21...ACOGwlg6`, 16 of 84) appeared in S2 transcript during debug. Azure
   Portal → resource → Keys and Endpoint → Regenerate Key 1 → update the Vercel
