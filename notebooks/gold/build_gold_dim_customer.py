@@ -48,10 +48,12 @@ gold_catalog = dbutils.widgets.get("gold_catalog").strip()
 schema_name = dbutils.widgets.get("schema_name").strip()
 
 silver_customers_tbl = f"{silver_catalog}.{schema_name}.customers"
+silver_orders_tbl = f"{silver_catalog}.{schema_name}.orders"
 dim_customer_tbl = f"{gold_catalog}.{schema_name}.dim_customer"
 
 print(f"pipeline_run_id      = {pipeline_run_id}")
 print(f"silver_customers_tbl = {silver_customers_tbl}")
+print(f"silver_orders_tbl    = {silver_orders_tbl}")
 print(f"dim_customer_tbl     = {dim_customer_tbl}")
 
 # COMMAND ----------
@@ -225,20 +227,45 @@ if dim_exists:
 # MAGIC %md
 # MAGIC ## 6. Build new dim rows for NEW + SCD2_CHANGE
 # MAGIC
-# MAGIC `channel_type` mirrors `account_type` for now (a D2C customer's channel
-# MAGIC is D2C; a B2B customer's channel is B2B). Customers can place STORE
+# MAGIC **`valid_from` rule (per SCHEMA.md):**
+# MAGIC - For `NEW` rows: earliest known activity date for that customer =
+# MAGIC   `MIN(silver.orders.order_date)`. If no orders yet, fall back to
+# MAGIC   `current_date()`. This makes as-of joins from `fact_order_line` work
+# MAGIC   correctly on historical orders placed before the dim was first
+# MAGIC   written.
+# MAGIC - For `SCD2_CHANGE` rows: `current_date()` — the change was detected
+# MAGIC   today, so the new version's first valid day is today. (The closed
+# MAGIC   prior version's `valid_to` is set to `current_date() - 1` in step 4.)
+# MAGIC
+# MAGIC `channel_type` mirrors `account_type` (a D2C customer's channel is
+# MAGIC D2C; a B2B customer's channel is B2B). Customers can place STORE
 # MAGIC orders too, but that's a fact-level concern — the *customer* doesn't
 # MAGIC have a STORE channel attribute.
 # MAGIC
 # MAGIC `surrogate_key = xxhash64(customer_id, valid_from)` is deterministic
-# MAGIC and stateless. Re-runs produce identical keys; collisions are
-# MAGIC astronomically unlikely.
+# MAGIC and stateless. Re-runs produce identical keys.
 
 # COMMAND ----------
 
+# Earliest order date per customer — used as `valid_from` for NEW rows.
+df_first_activity = (
+    spark.table(silver_orders_tbl)
+        .filter(F.col("dq_passed") == True)
+        .groupBy("customer_id")
+        .agg(F.min("order_date").alias("_first_activity_date"))
+)
+
 df_to_insert = (
-    df_actioned.filter(F.col("_action").isin("NEW", "SCD2_CHANGE"))
-        .withColumn("valid_from", F.current_date())
+    df_actioned.filter(F.col("_action").isin("NEW", "SCD2_CHANGE")).alias("a")
+        .join(df_first_activity.alias("fa"),
+              on="customer_id", how="left")
+        .withColumn(
+            "valid_from",
+            F.when(
+                F.col("_action") == "NEW",
+                F.coalesce(F.col("_first_activity_date"), F.current_date()),
+            ).otherwise(F.current_date()),
+        )
         .withColumn("valid_to", F.lit(None).cast("date"))
         .withColumn("is_current", F.lit(True))
         .withColumn(

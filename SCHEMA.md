@@ -396,99 +396,335 @@ DECISIONS #44 tail.
 
 All Bronze tables mirror their source exactly plus these audit columns:
 ```
-_source_file        STRING    -- ADLS path of the source Parquet file
+_source_file         STRING    -- ADLS path of the source Parquet file
 _ingestion_timestamp TIMESTAMP -- when ADF wrote the file to landing
-_pipeline_run_id    STRING    -- ADF pipeline run ID (GUID)
-_bronze_timestamp   TIMESTAMP -- when Databricks wrote this row to bronze
+_pipeline_run_id     STRING    -- ADF pipeline run ID (GUID)
+_bronze_timestamp    TIMESTAMP -- when Databricks wrote this row to bronze
+_ingestion_date      DATE      -- partition column = to_date(_ingestion_timestamp)
 ```
 
-Bronze tables (10): bronze.orders, bronze.order_lines,
-bronze.order_status_log, bronze.customers, bronze.customer_addresses,
-bronze.products, bronze.product_pricing, bronze.inventory_snapshot,
-bronze.sales_reps, bronze.territory_assignments
+Bronze tables (10), all under the `bronze` catalog, `default` schema:
+`bronze.default.{orders, order_lines, order_status_log, customers,
+customer_addresses, products, product_pricing, inventory_snapshot,
+sales_reps, territory_assignments}`.
 
-Partition: all Bronze tables partition by _ingestion_timestamp::DATE
+Partition: all Bronze tables partition by `_ingestion_date` (a derived
+DATE, not the raw TIMESTAMP — partitioning on a TIMESTAMP creates
+high-cardinality partitions).
+
+Bronze is **append-only and entity-agnostic** — one notebook
+(`notebooks/bronze/ingest_to_bronze.py`) handles all 10 entities,
+parameterised by `entity_name`. No business logic, no dedup, no DQ.
+Schema drift is intentionally tolerated via `mergeSchema = true`.
 
 ---
 
 ## Silver layer — conformed Delta tables
 
-### silver.orders
+### Conventions for all Silver tables
+
+Every Silver table follows the same shape. Per-entity specs below only
+list the **business columns** explicitly — the conventions in this
+section apply uniformly.
+
+**Audit columns (on every row):**
 ```
-order_id        STRING    PK (business key for MERGE)
-customer_id     STRING
-channel_type    STRING    -- 'D2C' | 'B2B' | 'STORE' (unified)
-order_date      DATE
-status          STRING
-store_id        STRING    NULL
-rep_id          STRING    NULL
-total_amount    DECIMAL(12,2)
-currency        STRING
--- DQ flags
-dq_passed       BOOLEAN
-dq_rejection_reason STRING NULL
--- Audit
-_source_file    STRING
-_pipeline_run_id STRING
-_ingestion_timestamp TIMESTAMP
-_silver_timestamp TIMESTAMP
+_source_file         STRING     ADLS path of the source Parquet (from Bronze)
+_pipeline_run_id     STRING     ADF run ID (random UUID for manual runs)
+_ingestion_timestamp TIMESTAMP  when Bronze landed the row
+_silver_timestamp    TIMESTAMP  when Silver wrote the row
+_silver_date         DATE       partition column, = to_date(_silver_timestamp)
 ```
 
-### silver.order_lines
+**DQ flags (on every row):**
 ```
-line_id         STRING    PK
+dq_passed             BOOLEAN
+dq_rejection_reason   STRING NULL    `;`-separated rejection codes when dq_passed=false
+```
+
+**Operational rules:**
+- **Dedup** by business key (PK), keeping the latest `_bronze_timestamp` row.
+- **MERGE on business key** — Silver writes are idempotent; re-running on
+  the same Bronze state is a no-op.
+- **Partition** by `_silver_date`.
+- **Bad rows route to `quarantine.default.{entity}`** with the full
+  rejection-reason string and the original record JSON-serialised in
+  `raw_record`.
+
+**SCD-change tracking (only on tables whose Gold dim has SCD-2 attrs):**
+- `_prev_<attr>` columns capture the about-to-be-overwritten value.
+- `_scd_changed` BOOLEAN marks any row whose tracked attrs changed.
+- These columns drive Gold's SCD-2 close-old/insert-new logic; the
+  comparison logic lives in Silver, the SCD state machine lives in Gold.
+
+### silver.orders
+
+Source: `velora_oms.orders` (append-only event table at source).
+
+```
+order_id        STRING        PK (business key for MERGE)
+customer_id     STRING
+channel_type    STRING        -- 'D2C' | 'B2B' | 'STORE'
+order_date      DATE
+status          STRING
+store_id        STRING NULL   -- only for STORE channel
+rep_id          STRING NULL   -- only for B2B channel
+total_amount    DECIMAL(12,2)
+currency        STRING
+```
+
+DQ rules: `NULL_ORDER_ID`, `NULL_CUSTOMER_ID`, `UNKNOWN_CUSTOMER_ID`
+(FK to `silver.customers`), `INVALID_CHANNEL_TYPE`, `NULL_ORDER_DATE`,
+`NULL_STATUS`, `INVALID_TOTAL_AMOUNT` (≤ 0), `STORE_MISSING_STORE_ID`,
+`B2B_MISSING_REP_ID`.
+
+### silver.order_lines
+
+Source: `velora_oms.order_lines` (append-only).
+
+```
+line_id         STRING        PK
 order_id        STRING
 product_id      STRING
 quantity        INT
 unit_price      DECIMAL(10,2)
 discount_amt    DECIMAL(10,2)
-line_total      DECIMAL(12,2)
-dq_passed       BOOLEAN
-dq_rejection_reason STRING NULL
-_source_file    STRING
-_pipeline_run_id STRING
-_silver_timestamp TIMESTAMP
+line_total      DECIMAL(12,2) -- = quantity * unit_price - discount_amt (source-computed)
 ```
+
+DQ rules: `NULL_LINE_ID`, `NULL_ORDER_ID`, `NULL_PRODUCT_ID`,
+`UNKNOWN_ORDER_ID` (FK to `silver.orders`), `UNKNOWN_PRODUCT_ID` (FK to
+`silver.products`), `INVALID_QUANTITY` (≤ 0), `INVALID_UNIT_PRICE` (≤ 0).
+
+### silver.order_status_log
+
+Source: `velora_oms.order_status_log` (append-only event log).
+
+```
+log_id          STRING        PK
+order_id        STRING
+from_status     STRING NULL   -- NULL on the first transition
+to_status       STRING
+changed_at      TIMESTAMP
+changed_by      STRING        -- 'SYSTEM' | 'AGENT' | user_id
+```
+
+DQ rules: `NULL_LOG_ID`, `NULL_ORDER_ID`, `NULL_TO_STATUS`,
+`UNKNOWN_ORDER_ID` (FK), `INVALID_STATUS` (`from_status`/`to_status` not
+in known set).
 
 ### silver.customers
+
+Source: `velora_crm.customers` (mutable dim — UPDATEd in place at source).
+
 ```
-customer_id     STRING    PK
+customer_id     STRING        PK
 full_name       STRING
 email           STRING
-segment         STRING
+segment         STRING        -- 'INDIVIDUAL' | 'BUSINESS' | 'VIP'
 city            STRING
 state           STRING
-account_type    STRING
+account_type    STRING        -- 'D2C' | 'B2B'
 is_active       BOOLEAN
--- SCD change tracking (set before writing to Gold)
-_prev_segment   STRING    NULL
-_prev_city      STRING    NULL
+-- SCD change tracking (drives gold.dim_customer SCD-2)
+_prev_segment   STRING NULL
+_prev_city      STRING NULL
 _scd_changed    BOOLEAN
-_source_file    STRING
-_pipeline_run_id STRING
-_silver_timestamp TIMESTAMP
 ```
 
-(Remaining Silver tables follow the same pattern — business key,
-business columns, DQ flags, SCD change tracking where applicable,
-and audit columns. Full column lists for all Silver tables are
-generated during Phase 2 and appended here.)
+DQ rules: `NULL_CUSTOMER_ID`, `INVALID_EMAIL` (NULL or no `@`),
+`INVALID_SEGMENT`, `INVALID_ACCOUNT_TYPE`, `NULL_FULL_NAME`.
+
+`phone` from source is **dropped at Silver** — not used by any Gold
+entity; carrying it through adds nullable noise.
+
+### silver.customer_addresses
+
+Source: `velora_crm.customer_addresses` (mutable — `is_primary` flips,
+new addresses added).
+
+```
+address_id      STRING        PK
+customer_id     STRING
+address_line    STRING
+city            STRING
+state           STRING
+pincode         STRING
+is_primary      BOOLEAN
+address_type    STRING        -- 'HOME' | 'WORK' | 'BILLING' | 'SHIPPING'
+```
+
+DQ rules: `NULL_ADDRESS_ID`, `NULL_CUSTOMER_ID`, `UNKNOWN_CUSTOMER_ID`
+(FK), `INVALID_ADDRESS_TYPE`, `NULL_PINCODE`.
+
+No SCD tracking — Gold doesn't carry historical address versions.
+
+### silver.products
+
+Source: `velora_pim.products` — mutable dim **attributes only**.
+`list_price` lives in `silver.product_pricing` (separate table — the
+source preserves price history as an event log, and Silver mirrors that).
+
+```
+product_id      STRING        PK
+sku             STRING
+product_name    STRING
+category_id     STRING
+division        STRING        -- 5 known divisions
+brand           STRING
+is_active       BOOLEAN
+launched_date   DATE
+```
+
+DQ rules: `NULL_PRODUCT_ID`, `NULL_SKU`, `INVALID_DIVISION` (not in
+5 known), `NULL_CATEGORY_ID`.
+
+No SCD tracking on this table — `list_price` is the only SCD-2 attr in
+`gold.dim_product`, and it's sourced from `silver.product_pricing`.
+
+### silver.product_pricing
+
+Source: `velora_pim.product_pricing` (append-only price-change log).
+
+```
+pricing_id      STRING        PK
+product_id      STRING
+list_price      DECIMAL(10,2)
+cost_price      DECIMAL(10,2)
+effective_from  DATE
+effective_to    DATE NULL     -- NULL = currently active
+pricing_type    STRING        -- 'STANDARD' | 'PROMOTIONAL' | 'CLEARANCE'
+```
+
+DQ rules: `NULL_PRICING_ID`, `NULL_PRODUCT_ID`, `UNKNOWN_PRODUCT_ID`
+(FK to `silver.products`), `INVALID_LIST_PRICE` (≤ 0),
+`INVALID_PRICING_TYPE`, `NULL_EFFECTIVE_FROM`.
+
+Used by `gold.dim_product` for SCD-2 list-price tracking and by
+`gold.fact_order_line` for `unit_price_at_sale` cross-checks.
+
+### silver.inventory_snapshot
+
+Source: `velora_pim.inventory_snapshot` (daily full snapshot — 189K
+rows/day).
+
+```
+snapshot_id     STRING        PK
+product_id      STRING
+store_id        STRING
+snapshot_date   DATE
+opening_stock   INT
+units_sold      INT
+units_returned  INT
+closing_stock   INT
+stockout_flag   BOOLEAN
+reorder_point   INT
+```
+
+Dedup is on the composite **(`product_id`, `store_id`, `snapshot_date`)**
+— the `snapshot_id` PK already enforces uniqueness, but a re-extracted
+date should not produce two Silver rows for the same (product, store, date).
+
+DQ rules: `NULL_SNAPSHOT_ID`, `NULL_PRODUCT_ID`, `NULL_STORE_ID`,
+`NULL_SNAPSHOT_DATE`, `UNKNOWN_PRODUCT_ID` (FK), `UNKNOWN_STORE_ID` (FK
+to source seed `velora_pim.stores`), `NEGATIVE_STOCK` (any of opening /
+closing < 0).
+
+### silver.sales_reps
+
+Source: `velora_hrm.sales_reps` — mutable dim **attributes only**.
+`territory_id` lives in `silver.territory_assignments` (the source
+preserves territory history as an event log).
+
+```
+rep_id          STRING        PK
+full_name       STRING
+email           STRING
+phone           STRING NULL
+hire_date       DATE
+is_active       BOOLEAN
+```
+
+DQ rules: `NULL_REP_ID`, `INVALID_EMAIL`, `NULL_FULL_NAME`,
+`NULL_HIRE_DATE`.
+
+No SCD tracking on this table — `territory_id` is the only SCD-2 attr
+in `gold.dim_sales_rep`, and it's sourced from
+`silver.territory_assignments`.
+
+### silver.territory_assignments
+
+Source: `velora_hrm.territory_assignments` (append-only assignment log).
+
+```
+assignment_id   STRING        PK
+rep_id          STRING
+territory_id    STRING
+assigned_from   DATE
+assigned_to     DATE NULL     -- NULL = currently assigned
+is_current      BOOLEAN
+```
+
+DQ rules: `NULL_ASSIGNMENT_ID`, `NULL_REP_ID`, `NULL_TERRITORY_ID`,
+`UNKNOWN_REP_ID` (FK to `silver.sales_reps`), `NULL_ASSIGNED_FROM`.
+
+Used by `gold.dim_sales_rep` for SCD-2 territory tracking.
 
 ---
 
 ## Gold layer — star schema Delta tables
 
+### Conventions for all Gold tables
+
+- **Surrogate key** on every dim with SCD-2: `xxhash64(<NK>, valid_from)`
+  — deterministic, stateless, no sequence required. Re-runs produce
+  identical keys.
+- **Audit columns** on every Gold row: `_pipeline_run_id` STRING,
+  `_gold_timestamp` TIMESTAMP. Facts also carry `_ingestion_timestamp`
+  (pulled through from Silver) for end-to-end lineage.
+- **`valid_from` for first-time SCD-2 dim rows** = earliest known
+  activity date for that natural key (e.g. `MIN(orders.order_date)` for
+  a customer; `MIN(product_pricing.effective_from)` for a product). If
+  no activity exists yet, fall back to the source `created_at::date`.
+  This makes as-of joins work correctly for historical orders placed
+  *before* the dim row was first written.
+- **`valid_to` on close-out** = `current_date() - 1` (the previous
+  version's last valid day is yesterday; the new version's first valid
+  day is today).
+- **Fact → dim joins use as-of pattern** for SCD-2 dims:
+  ```sql
+  JOIN dim ON fact.<NK> = dim.<NK>
+   AND fact.<event_date> BETWEEN dim.valid_from
+                              AND COALESCE(dim.valid_to, '9999-12-31')
+  ```
+  Always join to all rows of the dim (not just `is_current = true`) so
+  historical facts attribute to the correct historical dim version.
+- **Static dims** (`dim_product_category`, `dim_sales_channel`,
+  `dim_order_status`, `dim_date`, `dim_store`, `dim_territory`) bypass
+  Silver and load directly from source seed or a hardcoded list in the
+  Gold notebook. They have no `valid_from`/`valid_to`/`is_current`
+  columns.
+
 ### gold.dim_customer
+
+SCD Type 2 on `segment`, `city`. SCD Type 1 (overwrite in place) on
+`full_name`, `email`, `state`, `account_type`, `is_active`,
+`channel_type`.
+
+`channel_type` is **derived from `account_type`** (D2C → D2C, B2B → B2B).
+A D2C customer can place STORE orders, but the *customer* doesn't have a
+STORE channel attribute — that's a fact-level concern.
+
 ```
-surrogate_key       BIGINT    PK (auto-generated hash or sequence)
-customer_id         STRING    NK (natural key)
+surrogate_key       BIGINT    PK (xxhash64(customer_id, valid_from))
+customer_id         STRING    NK
 full_name           STRING
 email               STRING
-segment             STRING
-city                STRING
+segment             STRING    -- SCD-2
+city                STRING    -- SCD-2
 state               STRING
 account_type        STRING    -- 'D2C' | 'B2B'
-channel_type        STRING
+channel_type        STRING    -- derived = account_type
 is_active           BOOLEAN
 valid_from          DATE
 valid_to            DATE      NULL = currently active
@@ -498,8 +734,23 @@ _gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_product
+
+SCD Type 2 on `list_price`. SCD Type 1 on all other attrs.
+
+**Source path:** Gold joins `silver.products` (mutable dim attrs) +
+`silver.product_pricing` (price history) at build time. Each new pricing
+row in `silver.product_pricing` (where `effective_to IS NULL`) that
+differs from the dim's current `list_price` triggers a SCD-2 split:
+  - `valid_from` on the new dim row = `product_pricing.effective_from`
+  - `valid_to` on the closed dim row = `product_pricing.effective_from - 1`
+
+This makes the SCD-2 timeline *match the source's price-effective-date
+timeline*, not Gold's processing date — important because as-of joins
+on `fact_order_line.order_date` rely on the dim timeline matching real
+business activity.
+
 ```
-surrogate_key       BIGINT    PK
+surrogate_key       BIGINT    PK (xxhash64(product_id, valid_from))
 product_id          STRING    NK
 sku                 STRING
 product_name        STRING
@@ -507,9 +758,10 @@ division            STRING
 brand               STRING
 category_id         STRING
 is_active           BOOLEAN
-list_price          DECIMAL(10,2)  -- SCD Type 2 tracked
+list_price          DECIMAL(10,2)  -- SCD-2 tracked, sourced from silver.product_pricing
 cost_price          DECIMAL(10,2)
-valid_from          DATE
+pricing_type        STRING         -- carries through from silver.product_pricing
+valid_from          DATE      -- = silver.product_pricing.effective_from
 valid_to            DATE      NULL = currently active
 is_current          BOOLEAN
 _pipeline_run_id    STRING
@@ -517,31 +769,57 @@ _gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_product_category
+
+SCD Type 0 (static). Loaded directly from source seed
+`velora_pim.product_categories` — bypasses Silver per the static-dim
+convention.
+
 ```
 category_id         STRING    PK
 category_name       STRING
 sub_category        STRING    NULL
 division            STRING
 is_active           BOOLEAN
+_pipeline_run_id    STRING
+_gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_sales_channel
+
+SCD Type 0 (static). 3 hardcoded rows in the Gold notebook — no source
+table.
+
 ```
-channel_id          STRING    PK
-channel_name        STRING
-channel_type        STRING    -- 'D2C' | 'B2B' | 'STORE'
+channel_id          STRING    PK    -- 'D2C' | 'B2B' | 'STORE' (matches channel_type)
+channel_name        STRING          -- 'Direct to Consumer' | 'Business to Business' | 'Physical Store'
+channel_type        STRING          -- redundant with channel_id; kept for query ergonomics
 description         STRING
+_pipeline_run_id    STRING
+_gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_sales_rep
+
+SCD Type 2 on `territory_id`. SCD Type 1 on all other attrs.
+
+**Source path:** Gold joins `silver.sales_reps` (mutable dim attrs) +
+`silver.territory_assignments` (assignment history) at build time. Each
+new assignment row that supersedes the dim's current `territory_id`
+triggers a SCD-2 split:
+  - `valid_from` on the new dim row = `territory_assignments.assigned_from`
+  - `valid_to` on the closed dim row = `territory_assignments.assigned_from - 1`
+
+Same principle as `dim_product` — the SCD timeline matches source
+assignment dates, not Gold processing dates.
+
 ```
-surrogate_key       BIGINT    PK
+surrogate_key       BIGINT    PK (xxhash64(rep_id, valid_from))
 rep_id              STRING    NK
 full_name           STRING
 email               STRING
-territory_id        STRING    -- SCD Type 2 tracked
+territory_id        STRING    -- SCD-2 tracked, sourced from silver.territory_assignments
 is_active           BOOLEAN
-valid_from          DATE
+valid_from          DATE      -- = silver.territory_assignments.assigned_from
 valid_to            DATE      NULL = currently active
 is_current          BOOLEAN
 _pipeline_run_id    STRING
@@ -549,27 +827,57 @@ _gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_territory
+
+SCD Type 1. Synthesized in the Gold notebook from the **distinct set of
+`territory_id` values** in `silver.stores` (static seed) +
+`silver.territory_assignments`, plus a city/state/region enrichment
+lookup hardcoded in the notebook.
+
+**One sentinel row added explicitly: `D2C_NATIONAL`.** D2C orders have
+no store and no rep, so no natural territory; the sentinel keeps
+`fact_order_line.territory_id` NOT NULL and lets every territory
+aggregation sum cleanly without filtering.
+
 ```
-territory_id        STRING    PK
+territory_id        STRING    PK     -- includes 'D2C_NATIONAL' sentinel
 territory_name      STRING
-city                STRING
-state               STRING
-region              STRING
+city                STRING NULL      -- NULL for D2C_NATIONAL
+state               STRING NULL
+region              STRING           -- 'NATIONAL' for D2C_NATIONAL
 is_active           BOOLEAN
 _pipeline_run_id    STRING
+_gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_order_status
+
+SCD Type 0 (static). 6 hardcoded rows in the Gold notebook covering the
+known status set.
+
 ```
-status_id           STRING    PK
+status_id           STRING    PK    -- matches velora_oms.orders.status values
 status_name         STRING
-status_category     STRING    -- 'ACTIVE' | 'CLOSED' | 'EXCEPTION'
+status_category     STRING          -- 'ACTIVE' | 'CLOSED' | 'EXCEPTION'
 sort_order          INT
+_pipeline_run_id    STRING
+_gold_timestamp     TIMESTAMP
 ```
 
+Hardcoded values:
+- `PENDING`     / Pending           / ACTIVE    / 1
+- `PROCESSING`  / Processing        / ACTIVE    / 2
+- `SHIPPED`     / Shipped           / ACTIVE    / 3
+- `DELIVERED`   / Delivered         / CLOSED    / 4
+- `CANCELLED`   / Cancelled         / EXCEPTION / 5
+- `RETURNED`    / Returned          / EXCEPTION / 6
+
 ### gold.dim_date
+
+SCD Type 0 (static). Generated once for `2020-01-01` → `2030-12-31` by a
+Python helper in the Gold notebook. Not extracted from any source.
+
 ```
-date_id             INT       PK (YYYYMMDD format)
+date_id             INT       PK (YYYYMMDD format, e.g. 20260115)
 full_date           DATE
 day_of_week         STRING
 day_number          INT
@@ -578,14 +886,21 @@ month_number        INT
 month_name          STRING
 quarter             INT
 year                INT
-fiscal_year         INT       -- Indian fiscal (Apr-Mar)
+fiscal_year         INT       -- Indian fiscal (Apr-Mar): FY26 = 2026-04-01..2027-03-31
 fiscal_quarter      INT
 is_weekend          BOOLEAN
 is_public_holiday   BOOLEAN
 holiday_name        STRING    NULL
+_pipeline_run_id    STRING
+_gold_timestamp     TIMESTAMP
 ```
 
 ### gold.dim_store
+
+SCD Type 1 (static — store master rarely changes). Loaded directly from
+source seed `velora_pim.stores` — bypasses Silver per the static-dim
+convention.
+
 ```
 store_id            STRING    PK
 store_name          STRING
@@ -596,61 +911,129 @@ store_tier          STRING    -- 'FLAGSHIP' | 'STANDARD' | 'EXPRESS'
 is_active           BOOLEAN
 opened_date         DATE      NULL
 _pipeline_run_id    STRING
+_gold_timestamp     TIMESTAMP
 ```
 
 ### gold.fact_order_line
+
+Grain: one row per SKU per order. PK is **pass-through `line_id`** from
+source — already a UUID and globally unique, no synthesis needed.
+
+**FK lookup pattern — as-of join on `order_date`** for SCD-2 dims:
+```sql
+JOIN dim_customer dc ON sol.customer_id = dc.customer_id
+                    AND so.order_date BETWEEN dc.valid_from
+                                          AND COALESCE(dc.valid_to, '9999-12-31')
+JOIN dim_product  dp ON sol.product_id  = dp.product_id
+                    AND so.order_date BETWEEN dp.valid_from
+                                          AND COALESCE(dp.valid_to, '9999-12-31')
+-- dim_sales_rep same pattern (when rep_id is NOT NULL)
 ```
-order_line_id           STRING    PK (surrogate)
-order_id                STRING    NK
-line_id                 STRING    NK
+
+This guarantees historical correctness: an order placed before a
+customer's segment changed attributes to the *old* segment, not the
+current one.
+
+**Derivation rules per measure (build at Gold from Silver):**
+
+| Measure | Formula | Source |
+|---|---|---|
+| `quantity_ordered` | pass-through | `silver.order_lines.quantity` |
+| `unit_price_at_sale` | pass-through | `silver.order_lines.unit_price` (price-at-sale is captured at OLTP — no need to look up dim_product) |
+| `discount_amount` | pass-through | `silver.order_lines.discount_amt` |
+| `line_total_inr` | pass-through | `silver.order_lines.line_total` (source-computed: `quantity * unit_price - discount_amt`; post-discount, pre-tax) |
+| `tax_amount` | `round(line_total_inr * 0.18, 2)` | derived (India GST 18% on post-discount net) |
+| `net_revenue_inr` | `line_total_inr` | pre-tax net revenue — standard analytics measure (gross of discount → minus discount = net pre-tax → `line_total` already represents this) |
+
+**`territory_id` derivation:**
+
+| Channel | territory_id source |
+|---|---|
+| STORE | `silver.stores.territory_id` where `store_id` matches |
+| B2B | `dim_sales_rep.territory_id` (as-of join on `order_date`) |
+| D2C | sentinel `'D2C_NATIONAL'` (FK to the `dim_territory` sentinel row) |
+
+**`status_id`** — the order's *current* status at fact-build time
+(from `silver.orders.status`). The full transition history lives in
+`silver.order_status_log`; a separate fact (e.g.
+`fact_order_status_transitions`) could be added later if status-flow
+analytics are needed.
+
+```
+line_id                 STRING    PK (pass-through from source)
+order_id                STRING    NK (for join debugging / lineage)
 -- Foreign keys
-order_date_id           INT       FK -> dim_date
-customer_surrogate_key  BIGINT    FK -> dim_customer
-product_surrogate_key   BIGINT    FK -> dim_product
-channel_id              STRING    FK -> dim_sales_channel
-rep_surrogate_key       BIGINT    FK -> dim_sales_rep (NULL for D2C/Store)
-store_id                STRING    FK -> dim_store (NULL for D2C/B2B)
-territory_id            STRING    FK -> dim_territory
-status_id               STRING    FK -> dim_order_status
+order_date_id           INT       FK -> dim_date         (= cast(order_date as YYYYMMDD INT))
+customer_surrogate_key  BIGINT    FK -> dim_customer     (as-of join on order_date)
+product_surrogate_key   BIGINT    FK -> dim_product      (as-of join on order_date)
+channel_id              STRING    FK -> dim_sales_channel (= channel_type)
+rep_surrogate_key       BIGINT    FK -> dim_sales_rep    NULL for D2C/STORE; as-of join for B2B
+store_id                STRING    FK -> dim_store        NULL for D2C/B2B
+territory_id            STRING    FK -> dim_territory    (per derivation above)
+status_id               STRING    FK -> dim_order_status (= silver.orders.status)
 -- Measures
 quantity_ordered        INT
-unit_price_at_sale      DECIMAL(10,2)  -- from dim_product at time of sale
+unit_price_at_sale      DECIMAL(10,2)
 discount_amount         DECIMAL(10,2)
 line_total_inr          DECIMAL(12,2)
 tax_amount              DECIMAL(10,2)
 net_revenue_inr         DECIMAL(12,2)
 -- Audit
 _pipeline_run_id        STRING
-_ingestion_timestamp    TIMESTAMP
+_ingestion_timestamp    TIMESTAMP   -- pulled through from silver.order_lines
 _gold_timestamp         TIMESTAMP
 ```
 
 ### gold.fact_daily_channel_revenue
+
+Grain: `(date_id, channel_id, category_id, territory_id)`. Pre-aggregated
+for BI dashboards.
+
+**Source:** `gold.fact_order_line` joined to `gold.dim_product` (for
+`category_id`), grouped by the four grain columns. A Gold→Gold read is
+allowed for strict aggregations like this — keeps the fact-line as the
+single source of truth for measure definitions.
+
 ```
--- Grain: channel + product_category + date
+-- Grain: channel + product_category + date + territory
 summary_date_id         INT       FK -> dim_date
 channel_id              STRING    FK -> dim_sales_channel
 category_id             STRING    FK -> dim_product_category
 territory_id            STRING    FK -> dim_territory
--- Measures
-total_orders            INT
-total_lines             INT
-total_units_sold        INT
-gross_revenue_inr       DECIMAL(14,2)
-total_discount_inr      DECIMAL(14,2)
-net_revenue_inr         DECIMAL(14,2)
-avg_order_value_inr     DECIMAL(10,2)
-return_rate_pct         DECIMAL(5,2)
+-- Measures (all aggregated from fact_order_line over the grain)
+total_orders            INT          -- COUNT(DISTINCT order_id)
+total_lines             INT          -- COUNT(*)
+total_units_sold        INT          -- SUM(quantity_ordered)
+gross_revenue_inr       DECIMAL(14,2)  -- SUM(quantity_ordered * unit_price_at_sale)
+total_discount_inr      DECIMAL(14,2)  -- SUM(discount_amount)
+net_revenue_inr         DECIMAL(14,2)  -- SUM(net_revenue_inr) i.e. SUM(line_total_inr)
+total_tax_inr           DECIMAL(14,2)  -- SUM(tax_amount)
+avg_order_value_inr     DECIMAL(10,2)  -- net_revenue_inr / total_orders
+return_rate_pct         DECIMAL(5,2)   -- 100.0 * COUNT(*) WHERE status='RETURNED' / total_lines
 -- Audit
 _pipeline_run_id        STRING
 _gold_timestamp         TIMESTAMP
 ```
 
 ### gold.fact_inventory_daily
+
+Grain: `(product_id, store_id, snapshot_date)` — directly from
+`silver.inventory_snapshot` (already that grain at source).
+
+**`product_surrogate_key` lookup** uses an as-of join on `snapshot_date`
+against `dim_product` — the inventory line attributes to whichever
+product version was current on that snapshot date.
+
+**`days_of_stock_remaining` derivation:** computed in the Gold notebook
+as `closing_stock / NULLIF(avg_daily_units_sold_7d, 0)`, where
+`avg_daily_units_sold_7d` is the trailing 7-day mean of `units_sold` for
+that `(product_id, store_id)` pair. NULL when the average is zero or
+when there's not yet 7 days of history. Cast to INT.
+
 ```
 -- Grain: product + store + date
 snapshot_date_id        INT       FK -> dim_date
-product_surrogate_key   BIGINT    FK -> dim_product
+product_surrogate_key   BIGINT    FK -> dim_product (as-of join on snapshot_date)
 store_id                STRING    FK -> dim_store
 -- Measures
 opening_stock           INT
@@ -659,9 +1042,10 @@ units_returned          INT
 closing_stock           INT
 stockout_flag           BOOLEAN
 reorder_point           INT
-days_of_stock_remaining INT       NULL (closing_stock / avg_daily_sales)
+days_of_stock_remaining INT       NULL
 -- Audit
 _pipeline_run_id        STRING
+_ingestion_timestamp    TIMESTAMP    -- pulled through from silver.inventory_snapshot
 _gold_timestamp         TIMESTAMP
 ```
 
@@ -669,25 +1053,39 @@ _gold_timestamp         TIMESTAMP
 
 ## Quarantine tables
 
-### quarantine.orders
+Quarantine lives in its **own UC catalog**: `quarantine.default.{entity}`,
+one table per Silver entity. The catalog name mirrors the medallion
+contract — quarantine is a peer of bronze/silver/gold, not a sub-tree of
+silver. External location is `abfss://quarantine@pipelineiqadlsdev/...`.
+
+Every quarantine table follows the same shape — only `source_table`
+varies. Tables are created lazily on the first DQ failure for a given
+entity (Silver notebooks no-op the write when there are zero rejects).
+
 ```
-quarantine_id       STRING    PK (auto-generated UUID)
-rejection_reason    STRING    -- e.g. 'UNKNOWN_CUSTOMER_ID', 'NULL_REQUIRED_FIELD'
+quarantine_id       STRING    PK (auto-generated UUID via uuid())
+rejection_reason    STRING    -- `;`-separated list of rejection codes
 pipeline_run_id     STRING
 rejected_at         TIMESTAMP
-raw_record          STRING    -- JSON-serialised original record
-source_table        STRING    -- 'velora_oms.orders'
+raw_record          STRING    -- JSON-serialised original record (key columns + audit)
+source_table        STRING    -- e.g. 'velora_oms.orders', 'velora_crm.customers'
 ```
 
-### quarantine.order_lines
-```
-quarantine_id       STRING    PK
-rejection_reason    STRING
-pipeline_run_id     STRING
-rejected_at         TIMESTAMP
-raw_record          STRING
-source_table        STRING    -- 'velora_oms.order_lines'
-```
+**Existing quarantine tables** (one per Silver entity, lazily created):
+- `quarantine.default.orders`
+- `quarantine.default.order_lines`
+- `quarantine.default.order_status_log`
+- `quarantine.default.customers`
+- `quarantine.default.customer_addresses`
+- `quarantine.default.products`
+- `quarantine.default.product_pricing`
+- `quarantine.default.inventory_snapshot`
+- `quarantine.default.sales_reps`
+- `quarantine.default.territory_assignments`
+
+Quarantine is **append-only** — the same row may be re-quarantined on
+subsequent runs (different `quarantine_id`, same `rejection_reason`).
+De-dup is a reporting concern, not a write-time concern.
 
 ---
 
@@ -799,6 +1197,81 @@ schema evolves. Always read this before writing data code.*
 
 Append-only record of every schema edit. New rows on top. Never edit
 or remove prior rows — superseded entries get a "superseded by #N" note.
+
+### #5 — 2026-05-07 (Session 8) — Silver + Gold full spec-out, derivation rules locked
+
+- **Change:** end-to-end refinement of the medallion blueprint to remove
+  ambiguity before Phase 2 build-out continues. Specifically:
+  - **Silver:** all 10 Silver tables now have explicit column lists and
+    DQ-rule sets. The `(Remaining Silver tables follow the same pattern…)`
+    placeholder is gone. Conventions section added at top of Silver
+    documenting audit columns, DQ flags, dedup, MERGE, partition,
+    quarantine routing, and SCD-change-tracking pattern.
+  - **Gold:** Conventions section added documenting surrogate-key rule
+    (`xxhash64(NK, valid_from)`), `valid_from` rule (earliest known
+    activity date — required for as-of joins to work on historical
+    facts), `valid_to` rule, fact→dim as-of join pattern, and static-dim
+    bypass-Silver convention.
+  - **`gold.dim_product`:** SCD-2 `list_price` source clarified — comes
+    from `silver.product_pricing` (separate table), not
+    `silver.products`. `valid_from` on dim row tracks
+    `product_pricing.effective_from`, so the SCD timeline matches source
+    pricing dates (not Gold processing dates) — critical for as-of
+    joins on historical orders. Added `pricing_type` column.
+  - **`gold.dim_sales_rep`:** same pattern — SCD-2 `territory_id`
+    sourced from `silver.territory_assignments` (event log), not
+    `silver.sales_reps`.
+  - **`gold.dim_territory`:** synthesis path documented; sentinel row
+    `D2C_NATIONAL` added to keep `fact_order_line.territory_id` NOT
+    NULL for D2C orders.
+  - **`gold.fact_order_line`:** PK is **pass-through `line_id`** (source
+    UUID is already unique, no synthesis needed). Explicit derivation
+    table for all 6 measures: `tax_amount = round(line_total_inr *
+    0.18, 2)` (India GST 18%), `net_revenue_inr = line_total_inr`
+    (post-discount, pre-tax). `territory_id` derivation per channel
+    (STORE → store, B2B → as-of dim_sales_rep, D2C → `D2C_NATIONAL`).
+    SCD-2 fact→dim joins use as-of pattern on `order_date`.
+  - **`gold.fact_inventory_daily`:** `days_of_stock_remaining` formula
+    spec'd (closing_stock / 7-day rolling avg of units_sold).
+  - **`gold.fact_daily_channel_revenue`:** sourced from
+    `gold.fact_order_line` + `dim_product` join, grouped by grain.
+    Per-measure aggregation rules documented. Added `total_tax_inr`.
+  - **Static dims** (`dim_product_category`, `dim_sales_channel`,
+    `dim_order_status`, `dim_date`, `dim_store`) gained explicit
+    `_pipeline_run_id` + `_gold_timestamp` audit columns; their
+    bypass-Silver semantics noted.
+  - **Bronze:** `_ingestion_date` partition column made explicit in
+    column list (was prose-only).
+  - **Quarantine:** moved to its own UC catalog (`quarantine.default.*`)
+    per medallion-peer principle. All 10 entities listed; convention
+    that tables are lazily created on first DQ failure documented.
+- **Why:** Phase 2's first vertical slice (silver.orders, silver.customers,
+  gold.dim_customer) was built in S8 and exposed gaps in the spec —
+  several "follow the same pattern" placeholders, missing derivation
+  formulas, ambiguous source-of-truth for SCD-2 attrs (e.g.
+  `dim_product.list_price` was specced as if it lived on
+  `silver.products`, but the source has it on a separate event log).
+  Continuing into `fact_order_line` without a tightened blueprint
+  guaranteed bespoke decisions per notebook + drift between code and
+  spec. This pass refits the schema as a single coherent contract that
+  all remaining notebooks code against.
+- **Code impact:** `silver.orders` and `silver.customers` align with
+  the refined spec — no rework. **`gold.dim_customer` needs one fix +
+  rebuild:** the S8 build hardcoded `valid_from = current_date()` (no
+  rule existed yet); the new spec mandates earliest known activity date.
+  As shipped, every `fact_order_line` as-of join would miss
+  `dim_customer` because all 3,619 existing orders are dated before
+  the dim's `valid_from = 2026-05-07`. Fix is a 5-line change in
+  `notebooks/gold/build_gold_dim_customer.py` to look up
+  `MIN(silver.orders.order_date)` per customer; then drop + re-run the
+  notebook (idempotent surrogate keys make the rebuild cheap). Going
+  forward, every Silver/Gold notebook picks columns + DQ rules +
+  derivation formulas straight from this file with no design ambiguity.
+- **Reference:** PROGRESS.md S8 session log (to be appended);
+  DECISIONS.md will gain new rows for the high-impact design calls
+  (4-question consult: silver.products+pricing two-table model,
+  fact→dim as-of join, valid_from = earliest activity, fact PK
+  pass-through; plus tax/territory derivations).
 
 ### #4 — 2026-05-01 (Session 5) — `## Data lifecycle, frequency, volume` section added at top of SCHEMA.md
 
