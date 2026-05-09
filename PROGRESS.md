@@ -3,10 +3,11 @@
 ## Current phase
 
 **Phase 0 — Done. Phase 1 — Done. Phase 2 — Bronze 100%. Silver 7/10. Gold
-9/12 (3 SCD-2 dims + 5 static dims + 1 synthesized dim). Daily-fire
-orchestration on Logic App + 30-min function timeout (S9). Chunks 1 + 2
-of the medallion ladder complete (S9.5 + S10). Remaining: 3 Silver +
-3 facts + ADF Bicep.**
+11/12 (3 SCD-2 dims + 5 static + 1 synthesized + 2 facts). Daily-fire
+orchestration on Logic App + 30-min function timeout (S9). Chunks 1 + 2 + 3
+of the medallion ladder complete (S9.5 + S10). Revenue analytics queryable
+end-to-end via the SQL warehouse. Remaining: 3 trailing-edge Silver +
+`fact_inventory_daily` (chunk 4) + ADF Bicep.**
 
 43 Azure resources live. Function App on FC1 Flex Consumption + Logic App
 `pipelineiq-scheduler-dev` for the daily fire (DECISIONS #59).
@@ -31,7 +32,7 @@ per DECISIONS #60.
 - All 100% DQ pass.
 - Remaining 3 (chunk 4): `inventory_snapshot`, `order_status_log`, `customer_addresses`.
 
-**Gold (9/12 done):**
+**Gold (11/12 done):**
 - `dim_customer` (248, SCD-2) — S8
 - `dim_date` (4,018, FY26 = 365d) — S9.5
 - `dim_sales_channel` (3) — S9.5
@@ -41,9 +42,9 @@ per DECISIONS #60.
 - `dim_product` (4,218 = 4,205 current + 13 historical price-change versions, SCD-2 on list_price) — S10
 - `dim_sales_rep` (30, SCD-2 on territory_id, all currently active) — S10
 - `dim_territory` (9 = 8 real territories + `D2C_NATIONAL` sentinel) — S10
-- All 8 dims feeding `fact_order_line` are now live.
-- Remaining 3: `fact_order_line` + `fact_daily_channel_revenue` (chunk 3) +
-  `fact_inventory_daily` (chunk 4, paired with `silver.inventory_snapshot`).
+- `fact_order_line` (12,300 = silver.order_lines 1:1; as-of joins to 3 SCD-2 dims; per-channel territory derivation; GST 18% tax) — S10
+- `fact_daily_channel_revenue` (3,562 rows at (date_id, channel_id, category_id, territory_id) grain; rollup reconciles fact↔rollup exactly) — S10
+- Remaining 1: `fact_inventory_daily` (chunk 4, paired with `silver.inventory_snapshot`).
 
 **Quarantine:** All Silver notebooks wire the routing path; no rows
 quarantined yet because the generator produces clean OLTP. Will be exercised
@@ -60,15 +61,17 @@ to reflect the bronze-routed reality (DECISIONS #60).
 
 ## Next task
 
-**Session 11 = chunk 3 of the medallion ladder (the keystone fact +
-its rollup).** Full chunk plan in CLAUDE.md → "## Medallion chunk plan
-(S10 → S13)".
+**Session 11 = chunk 4 of the medallion ladder (inventory branch +
+trailing-edge silvers).** This is the final chunk — when it lands the
+medallion is fully complete and the `## Medallion chunk plan` section
+can be deleted from CLAUDE.md. Full plan in CLAUDE.md → "## Medallion
+chunk plan (S10 → S13)" → "Chunk 4".
 
 **Pre-work to do at the start of S11 (in this order):**
 
-1. **Verify the Logic-App-driven autonomous fire(s) since S10 landed.** S10
-   ran on 2026-05-09 evening before the 2026-05-10 00:30 UTC fire. By S11,
-   one or more fires should have landed. Sanity-check:
+1. **Verify the Logic-App-driven autonomous fire(s) since S10 landed.**
+   S10 ran on 2026-05-09 evening before the 2026-05-10 00:30 UTC fire.
+   By S11, at least one fire should have landed:
    ```sql
    SELECT order_date, COUNT(*) AS orders_count,
           MIN(created_at) AS first_insert_utc
@@ -80,34 +83,56 @@ its rollup).** Full chunk plan in CLAUDE.md → "## Medallion chunk plan
    270–550 orders. Also verify `velora_oms.order_status_log` and
    `velora_pim.inventory_snapshot` for the same dates.
 
-2. **Catch up bronze + silver + gold for any new dates.** Re-export
-   landing for the new days, ingest bronze, then re-run silver + gold:
+2. **Catch up bronze + silver + gold for any new dates** (idempotent
+   MERGE everywhere — safe to re-run). Re-export landing, re-ingest
+   bronze, re-run silver + gold:
    ```
    .venv/bin/python scripts/export_velora_to_landing.py --start 2026-05-07 --end <latest>
-   # bronze ingest for each entity that grew (use run_bronze_smoke.py per entity)
+   # bronze ingest for each entity that grew
    .venv/bin/python scripts/run_silver_smoke.py --entity {orders,customers,order_lines,products,product_pricing,sales_reps,territory_assignments}
-   .venv/bin/python scripts/run_gold_smoke.py --entity {dim_customer,dim_product,dim_sales_rep,dim_territory,static_dims}
+   .venv/bin/python scripts/run_gold_smoke.py --entity {dim_customer,dim_product,dim_sales_rep,dim_territory,static_dims,fact_order_line,fact_daily_channel_revenue}
    ```
-   Everything is idempotent MERGE so re-runs only insert genuinely new
-   rows / supersede genuinely changed rows.
 
-3. **Then start chunk 3 — `gold.fact_order_line`.** This is the keystone.
-   Specs in SCHEMA.md `gold.fact_order_line`:
-   - As-of joins on `order_date` against all 4 SCD-2 dims (`dim_customer`,
-     `dim_product`, `dim_sales_rep`, `dim_territory` — though dim_territory
-     is SCD-1) — DECISIONS #56 has the SQL pattern.
-   - Per-channel `territory_id` derivation: STORE → store's territory,
-     B2B → rep's territory at order_date, D2C → `'D2C_NATIONAL'` (DECISIONS #55).
-   - Measures per DECISIONS #54: `tax_amount = round(line_total_inr * 0.18, 2)`,
-     `net_revenue_inr = line_total_inr` (post-discount, pre-tax).
-   - `line_id` pass-through PK (DECISIONS #58) — no synthesised surrogate.
-   - Closest existing notebook to copy: `notebooks/gold/build_gold_dim_product.py`
-     for window/join shape. Fact build is mostly join-and-project — no SCD logic.
+3. **Then start chunk 4.** Four notebooks (one is the only remaining
+   meaningful Gold work; the other three Silvers are trailing-edge with
+   no current Gold consumer):
 
-4. **Then `gold.fact_daily_channel_revenue`** — Gold→Gold rollup off
-   `fact_order_line`, grain `(date_id, channel_id, category_id, territory_id)`.
-   Pure aggregation; no new join logic. After this, chunk 3 is done and
-   revenue analytics is queryable end-to-end.
+   a. **`notebooks/silver/build_silver_inventory_snapshot.py`** —
+      1.89M rows, partition discipline matters. Dedup on
+      `(product_id, store_id, snapshot_date)`. DQ rules:
+      `NULL_SNAPSHOT_ID`, `NULL_PRODUCT_ID`, `NULL_STORE_ID`,
+      `NULL_SNAPSHOT_DATE`, `NEGATIVE_STOCK`. Partition by
+      `_silver_date` plus consider partitioning by `snapshot_date` for
+      the fact's downstream as-of join. Most join-heavy Silver build
+      to date.
+
+   b. **`notebooks/gold/build_gold_fact_inventory_daily.py`** — grain
+      `(snapshot_date_id, product_surrogate_key, store_id)`. As-of
+      join `dim_product` on `snapshot_date` (use the same
+      `asof_attach()` helper from `fact_order_line` — it's
+      copy-paste-able). 7-day trailing-avg `days_of_stock_remaining`
+      formula per SCHEMA.md.
+
+   c. **`notebooks/silver/build_silver_order_status_log.py`** — no
+      current Gold consumer. Trailing-edge cleanup. Dedup on
+      `log_id`. DQ rules: `NULL_LOG_ID`, `NULL_ORDER_ID`,
+      `NULL_FROM_STATUS`, `NULL_TO_STATUS`, `NULL_CHANGED_AT`,
+      `INVALID_STATUS_TRANSITION` (from→to must match a known graph).
+
+   d. **`notebooks/silver/build_silver_customer_addresses.py`** — no
+      current Gold consumer. Trailing-edge. Dedup on `address_id`. DQ
+      rules: `NULL_ADDRESS_ID`, `NULL_CUSTOMER_ID`,
+      `UNKNOWN_CUSTOMER_ID` (FK to `silver.customers`),
+      `NULL_ADDRESS_LINE`, `NULL_PINCODE`, `INVALID_PINCODE` (6-digit
+      Indian PIN format).
+
+4. **Verify + delete the chunk plan section.** After chunk 4's
+   `verify_gold_chunk4.py` is green, delete the `## Medallion chunk
+   plan (S10 → S13)` section from CLAUDE.md — its job is done.
+
+After chunk 4: Phase 2 medallion fully complete. Next phase work is
+ADF Bicep replacement for the manual landing-export script (Tier 6),
+then Phase 3 failure-injection.
 
 ### Phase 0 loose ends (interleave when convenient)
 
@@ -318,6 +343,133 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-09 (Session 10 — medallion chunks 2 + 3: SCD-2 dims + keystone facts)
+**Objective (extended):** After chunk 2 landed mid-session, the user asked to
+push straight through chunk 3 (the keystone fact) in the same session.
+End state: all 8 dims feeding `fact_order_line` are live, the fact itself
++ its rollup are queryable, revenue analytics are end-to-end. See the
+chunk-2 + chunk-3 entries below for the full detail; this header just
+notes that S10 carried the medallion ladder from "9/12 dims+facts" to
+"11/12" (only `fact_inventory_daily` left, paired with chunk 4's silver
+`inventory_snapshot`).
+
+### 2026-05-09 (Session 10 — chunk 3: keystone fact + rollup)
+**Objective:** Build `gold.fact_order_line` (the revenue fact, biggest
+notebook in the project so far) + `gold.fact_daily_channel_revenue`
+(Gold→Gold rollup), so the warehouse goes from "all dims live but no
+queryable revenue" to "queryable end-to-end". Done in the same session
+as chunk 2 — same calendar day, same momentum.
+
+**Built:**
+- **`notebooks/gold/build_gold_fact_order_line.py`** — 14.8KB, the
+  most intricate notebook so far. Architectural pieces:
+  - **`asof_attach()` helper** — reusable as-of join with floor-at-earliest
+    fallback (DECISIONS #56 expanded). Implementation: rank dim versions per
+    fact NK by `(in_range_first, valid_from_desc_within_range,
+    valid_from_asc_outside_range)` then pick rank=1. Handles cases where
+    source SCD timeline starts later than some fact dates (e.g. a product's
+    earliest pricing.effective_from is after some order_dates) — fact still
+    gets a sensible dim attribution rather than dropping out. Used 3× for
+    dim_customer / dim_product / dim_sales_rep.
+  - **Per-channel territory derivation** (DECISIONS #55) — single
+    `F.when()` chain: STORE → store's territory_id (from dim_store join),
+    B2B → rep's territory_id (carried through from dim_sales_rep as-of),
+    D2C → `'D2C_NATIONAL'` sentinel.
+  - **B2B-only sales-rep attach** — split lines into B2B (rep_id NOT NULL,
+    do as-of) vs non-B2B (rep_id IS NULL, set rep_surrogate_key=NULL),
+    then `unionByName`. Avoids inflating partition counts and keeps the
+    NULL-for-non-B2B contract clean.
+  - **Idempotent MERGE on `line_id`** (DECISIONS #58 — pass-through PK,
+    no synthesised surrogate).
+  - **`order_date_id`** computed as `year*10000 + month*100 + dayofmonth`,
+    cast to INT, FK to `dim_date.date_id` (SCHEMA convention).
+- **`notebooks/gold/build_gold_fact_daily_channel_revenue.py`** — pure
+  Gold→Gold rollup. Joins fact_order_line to dim_product just to get
+  `category_id` (the fact carries `product_surrogate_key`, not category).
+  GROUP BY 4-key grain, MERGE on the same. Uses `<=>` (null-safe equals)
+  in the MERGE ON clause for `category_id` + `territory_id` since either
+  could in principle be NULL on edge cases.
+- **`scripts/verify_gold_chunk3.py`** — ~28 SQL invariants:
+  total/distinct row counts, as-of-join coverage (no NULL surrogate
+  keys), channel-conditional invariants (D2C must have territory_id =
+  'D2C_NATIONAL' / no store_id / no rep; STORE must have store_id /
+  no rep; B2B must have rep / no store), 7 FK-validity checks against
+  every linked dim, measure formulas (`tax = round(line_total * 0.18, 2)`,
+  `net_revenue = line_total`), rollup↔fact reconciliation on units +
+  net_revenue.
+
+**Final counts (chunk 3 deliverables):**
+
+| Table | Rows | Notes |
+|---|---|---|
+| `gold.fact_order_line` | 12,300 | 1:1 match with silver.order_lines clean rows; 100% as-of-join coverage |
+| `gold.fact_daily_channel_revenue` | 3,562 | grain (date_id, channel_id, category_id, territory_id) |
+
+**Channel breakdown of fact_order_line revenue:**
+- D2C: 6,654 lines / Rs.50.9 cr net revenue
+- STORE: 2,835 lines / Rs.22.0 cr
+- B2B: 2,811 lines / Rs.141.8 cr (large basket sizes — wholesale orders)
+- Total: Rs.214.7 cr net revenue across the 12-day source window
+
+**Worked:**
+- The `asof_attach()` helper paid off three times in one notebook. Same
+  ranking logic for dim_customer / dim_product / dim_sales_rep with
+  different NK + extra-cols passthrough. Reusable in future as-of joins
+  (`fact_inventory_daily` against `dim_product` on `snapshot_date` will
+  use it directly).
+- **Floor-at-earliest fallback never actually fired** in this run (every
+  fact line found an in-range dim version) — but the defensive code is
+  cheap and makes the join robust to source-timeline edge cases that
+  could surface as more data lands.
+- **MERGE on grain with `<=>`** in the rollup avoided a class of NULL-
+  comparison gotchas. Vanilla `=` on NULL = NULL (not true), so a NULL
+  category_id row would re-insert every run instead of upserting.
+- **Reconciliation passed first try** for units + net_revenue:
+  fact_order_line totals = rollup totals to the rupee.
+
+**Broke:**
+- **`tax_amount` formula drift on 69/12,300 rows.** The notebook initially
+  used `F.round(F.col("line_total") * F.lit(0.18), 2)` — `F.lit(0.18)`
+  parses as Python float → IEEE Double, so the multiplication is Double
+  arithmetic, and `F.round` on a Double introduces ~0.5% rounding drift
+  vs SCHEMA.md's spec `round(line_total_inr * 0.18, 2)` (which Spark SQL
+  evaluates in exact decimal arithmetic). Caught by
+  `verify_gold_chunk3.py`'s tax-formula invariant check. Fix: switched
+  to `F.expr("round(line_total * 0.18, 2)")` so `0.18` parses as a
+  decimal literal. One-line edit, re-smoked fact_order_line + rollup,
+  re-verified: 0 violations. **Lesson:** for any DECIMAL-typed measure,
+  prefer `F.expr(...)` over `F.col * F.lit(<float>)` so the Spark SQL
+  parser keeps everything in decimal land.
+
+**Uncertainty:**
+- **Silver state still anchored at 2026-05-06** (S9.5 backfill
+  bookmark). Tomorrow's autonomous fire (2026-05-10 00:30 UTC) will
+  land May-9 data. After it verifies, S11 should re-export landing +
+  re-ingest bronze for May-7/8/9, then re-run silver/gold. All MERGE-
+  idempotent so this is a sequence of smoke commands; SCD-2 dims will
+  pick up any new product_pricing rows naturally.
+- **No production fact_order_line consumer wired yet.** The fact is
+  queryable via the SQL warehouse but no BI / Phase 4 RCA query path
+  exists. That's Phase 4+ work.
+
+**Next:** S11 = chunk 4. The trailing-edge silvers (`silver.inventory_snapshot` —
+1.89M rows, partition discipline matters; `silver.order_status_log`;
+`silver.customer_addresses`) + `gold.fact_inventory_daily` (the only
+remaining Gold table). After chunk 4 lands, **the medallion is fully
+complete** and the chunk-plan section can be deleted from CLAUDE.md.
+
+**Summary:** Chunk 3 shipped clean. The keystone fact `fact_order_line`
+materialised end-to-end on first build with one self-caught bug (decimal
+vs IEEE float arithmetic for tax_amount; verifier flagged it before
+commit). The reusable `asof_attach()` helper makes future facts that
+need SCD-2 dim lookups (e.g. `fact_inventory_daily` against dim_product
+on snapshot_date) a copy-paste exercise. By end of S10 the warehouse has
+all 11/12 of its Gold dims+facts live and revenue analytics are
+queryable across all 12 source days. Chunk 4 is the only remaining
+medallion work — and 3 of its 4 items are trailing-edge with no current
+Gold consumer (`silver.order_status_log` + `silver.customer_addresses`),
+so the only meaningful remaining work is the inventory branch.
 
 ### 2026-05-09 (Session 10 — medallion chunk 2: 3 SCD-2/synthesized Gold dims)
 **Objective:** Build chunk 2 of the medallion ladder per CLAUDE.md plan —

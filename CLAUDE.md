@@ -197,7 +197,7 @@ managed_by  = "terraform"
 | generator/ | **Real-dated + guarded (S6)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. Source DB has 10 real-dated days Apr 27 → May 6, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. |
 | notebooks/bronze/ | **All 12 entities hydrated (S7 + S9.5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). 10 main entities (~1.9M rows) + 2 static seeds added in S9.5: `bronze.default.product_categories` (35 rows) + `bronze.default.stores` (45 rows). DECISIONS #60. |
 | notebooks/silver/ | **7/10 tables done (S8 + S9.5).** | `silver.orders` (3,619), `silver.customers` (248), `silver.order_lines` (12,300), `silver.products` (4,205), `silver.product_pricing` (4,218), `silver.sales_reps` (30), `silver.territory_assignments` (30). All 100% DQ pass on real-dated source. Remaining 3: `silver.inventory_snapshot`, `silver.order_status_log`, `silver.customer_addresses` (chunk 4). |
-| notebooks/gold/ | **9/12 dims+facts done (S8 + S9.5 + S10).** | `dim_customer` (248), `dim_date` (4,018), `dim_sales_channel` (3), `dim_order_status` (6), `dim_product_category` (35), `dim_store` (45) — all S8/S9.5. **S10 chunk 2:** `dim_product` (4,218 = 4,205 current + 13 historical price versions, SCD-2 on list_price), `dim_sales_rep` (30, SCD-2 on territory_id, all currently active), `dim_territory` (9 = 8 real + `D2C_NATIONAL` sentinel). All 8 dims feeding `fact_order_line` are now live. Remaining 3 (chunks 3 + 4): `fact_order_line`, `fact_daily_channel_revenue`, `fact_inventory_daily`. |
+| notebooks/gold/ | **11/12 dims+facts done (S8 + S9.5 + S10).** | All 8 dims live (S8/S9.5/S10). **S10 chunk 3:** `fact_order_line` (12,300 rows = silver.order_lines 1:1, as-of joins to 3 SCD-2 dims with floor-at-earliest fallback, per-channel territory derivation, GST 18% tax, MERGE on `line_id`). `fact_daily_channel_revenue` (Gold→Gold rollup at (date_id, channel_id, category_id, territory_id) grain; units + net_revenue reconcile fact↔rollup exactly). Remaining 1: `fact_inventory_daily` (chunk 4, paired with `silver.inventory_snapshot`). |
 | functions/ | **Stable on FC1 Flex + Logic-App-driven schedule (S9)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Flex timer trigger doesn't reliably fire from cold — verified via 2 missed scheduled fires. Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m to fit the 189K-row inventory write. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. |
 | scheduler/ (IaC `core/scheduler/`) | **Live (S9)** | Logic App Consumption recurrence trigger (`daily-fire`, 00:30 UTC) → HTTP action POSTing to the Function App admin endpoint with `x-functions-key` from `azurerm_function_app_host_keys.primary_key`. Single source of truth for the daily generator schedule. Cost: effectively Rs.0/mo (1 fire/day << 4,000-action free grant). |
 | fastapi/ | Pending | Phase 5 |
@@ -467,17 +467,14 @@ the next un-checked chunk at the start of each session.
 
 **End state:** all 8 dims feeding `fact_order_line` are live.
 
-### Chunk 3 — keystone facts  ⏳ Next (start of S11)
-- [ ] `gold.fact_order_line` — the big one. As-of joins on `order_date` for
-  SCD-2 dims (DECISIONS #56). Per-channel `territory_id` derivation
-  (DECISIONS #55). Measures per DECISIONS #54 (GST 18% derived).
-  Pass-through `line_id` PK (DECISIONS #58).
-- [ ] `gold.fact_daily_channel_revenue` — Gold→Gold rollup off
-  `fact_order_line`, grain `(date_id, channel_id, category_id, territory_id)`.
+### Chunk 3 — keystone facts  ✅ Done (S10, 2026-05-09)
+- ✅ `gold.fact_order_line` (12,300 rows = silver.order_lines 1:1; 100% as-of-join coverage; all FK + channel-conditional invariants pass)
+- ✅ `gold.fact_daily_channel_revenue` (rollup grain = (summary_date_id, channel_id, category_id, territory_id); units + net_revenue reconcile fact↔rollup exactly)
+- ✅ Verify script: `scripts/verify_gold_chunk3.py` (~28 checks, all green)
 
 **End state:** revenue analytics queryable end-to-end via the SQL warehouse.
 
-### Chunk 4 — inventory branch + trailing-edge silver  ⏳
+### Chunk 4 — inventory branch + trailing-edge silver  ⏳ Next (start of S11)
 - [ ] `silver.inventory_snapshot` — 1.89M rows, partition discipline matters.
   Dedup on `(product_id, store_id, snapshot_date)`.
 - [ ] `gold.fact_inventory_daily` — as-of join to `dim_product` on
