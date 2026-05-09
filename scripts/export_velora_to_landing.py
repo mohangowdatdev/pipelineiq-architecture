@@ -55,8 +55,14 @@ LANDING_FS = "landing"
 SQL_COPT_SS_ACCESS_TOKEN = 1256  # ODBC: pre-auth via AAD bearer token
 
 # (schema, table, mode, business_col, business_col_kind)
-# Static reference tables (product_categories, stores, control_flags) are
-# excluded — they are loaded directly into Gold from the seed (per SCHEMA.md).
+# `control_flags` stays excluded — it's an OLTP control surface, not a
+# warehouse input.
+#
+# Static reference tables `product_categories` and `stores` are routed
+# through landing → bronze (S10 chunk 1) even though SCHEMA.md originally
+# said "loaded directly into Gold". The medallion stays clean (no Gold
+# notebook reads source DB), and the existing entity-agnostic bronze
+# ingestion handles them with zero changes.
 #
 # Why business-date columns rather than created_at/updated_at: the generator
 # left audit columns at the GETUTCDATE() default — they record seed time,
@@ -70,6 +76,8 @@ ENTITIES: list[tuple[str, str, str, str | None, str | None]] = [
     ("velora_crm", "customer_addresses", "full", None, None),
     ("velora_pim", "products", "full", None, None),
     ("velora_pim", "product_pricing", "full", None, None),
+    ("velora_pim", "product_categories", "full", None, None),
+    ("velora_pim", "stores", "full", None, None),
     ("velora_pim", "inventory_snapshot", "by_date", "snapshot_date", "date"),
     ("velora_hrm", "sales_reps", "full", None, None),
     ("velora_hrm", "territory_assignments", "full", None, None),

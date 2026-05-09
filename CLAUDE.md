@@ -195,9 +195,9 @@ managed_by  = "terraform"
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
 | generator/ | **Real-dated + guarded (S6)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. Source DB has 10 real-dated days Apr 27 → May 6, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. |
-| notebooks/bronze/ | **All 10 entities hydrated (S7)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). All 10 `bronze.default.*` tables hydrated (~1.9M rows). |
-| notebooks/silver/ | **Pattern-setters live (S8). 2/10 tables done.** | `silver.orders` (3,619 rows) + `silver.customers` (248 rows). Conventions documented in SCHEMA.md. SCD-change tracking computed at Silver (per DECISIONS #52). Remaining 8 tables follow the same shape. |
-| notebooks/gold/ | **First SCD-2 dim live (S8). 1/12 dims+facts done.** | `gold.dim_customer` (248 rows, idempotent). Surrogate key + valid_from + as-of-join conventions in SCHEMA.md (DECISIONS #52, #53, #56). Remaining 11 follow the same shape. |
+| notebooks/bronze/ | **All 12 entities hydrated (S7 + S9.5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). 10 main entities (~1.9M rows) + 2 static seeds added in S9.5: `bronze.default.product_categories` (35 rows) + `bronze.default.stores` (45 rows). DECISIONS #60. |
+| notebooks/silver/ | **7/10 tables done (S8 + S9.5).** | `silver.orders` (3,619), `silver.customers` (248), `silver.order_lines` (12,300), `silver.products` (4,205), `silver.product_pricing` (4,218), `silver.sales_reps` (30), `silver.territory_assignments` (30). All 100% DQ pass on real-dated source. Remaining 3: `silver.inventory_snapshot`, `silver.order_status_log`, `silver.customer_addresses` (chunk 4). |
+| notebooks/gold/ | **6/12 dims+facts done (S8 + S9.5).** | `dim_customer` (248), plus 5 static dims via `build_gold_static_dims.py`: `dim_date` (4,018), `dim_sales_channel` (3), `dim_order_status` (6), `dim_product_category` (35), `dim_store` (45). Remaining 6: `dim_product`, `dim_sales_rep`, `dim_territory` (chunk 2 SCD-2 + synthesized) + `fact_order_line`, `fact_daily_channel_revenue`, `fact_inventory_daily` (chunks 3 + 4). |
 | functions/ | **Stable on FC1 Flex + Logic-App-driven schedule (S9)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Flex timer trigger doesn't reliably fire from cold — verified via 2 missed scheduled fires. Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m to fit the 189K-row inventory write. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. |
 | scheduler/ (IaC `core/scheduler/`) | **Live (S9)** | Logic App Consumption recurrence trigger (`daily-fire`, 00:30 UTC) → HTTP action POSTing to the Function App admin endpoint with `x-functions-key` from `azurerm_function_app_host_keys.primary_key`. Single source of truth for the daily generator schedule. Cost: effectively Rs.0/mo (1 fire/day << 4,000-action free grant). |
 | fastapi/ | Pending | Phase 5 |
@@ -436,6 +436,82 @@ Use this exact structure — one to three lines per field, no filler:
 
 The session log is the canonical human record. The memory/ folder holds only what
 Claude needs that cannot be derived from reading the project files directly.
+
+---
+
+## Medallion chunk plan (S10 → S13)
+
+**Active multi-session plan. Delete this whole section once chunk 4 lands —
+its job is to stay in CLAUDE.md only while it's still open work.**
+
+The remaining 8 Silver tables + 11 Gold dims/facts are split into 4 chunks,
+each one session-sized and ending on a deliverable worth committing. Pick
+the next un-checked chunk at the start of each session.
+
+### Chunk 1 — broaden silver + claim free static dims  ✅ Done (S9.5, 2026-05-09)
+- ✅ `silver.order_lines` (12,300 rows, 100% DQ pass)
+- ✅ `silver.products` (4,205 rows, 100% DQ pass)
+- ✅ `silver.product_pricing` (4,218 rows, 100% DQ pass)
+- ✅ `silver.sales_reps` (30 rows, 100% DQ pass)
+- ✅ `silver.territory_assignments` (30 rows, 100% DQ pass)
+- ✅ Static-dim batch in `notebooks/gold/build_gold_static_dims.py`:
+  `dim_date` (4,018), `dim_sales_channel` (3), `dim_order_status` (6),
+  `dim_product_category` (35), `dim_store` (45)
+- ✅ Bronze extended for `product_categories` + `stores` (DECISIONS #60)
+
+### Chunk 2 — SCD-2 dims + synthesized dim_territory  ⏳ Next (start of S10)
+- [ ] `gold.dim_product` — SCD-2 on `list_price`, joins `silver.products`
+  + `silver.product_pricing`, `valid_from = product_pricing.effective_from`,
+  `valid_to` of closed prior row = `effective_from - 1`. Surrogate key =
+  `xxhash64(product_id, valid_from)`.
+- [ ] `gold.dim_sales_rep` — SCD-2 on `territory_id`, joins
+  `silver.sales_reps` + `silver.territory_assignments`, `valid_from =
+  territory_assignments.assigned_from`. Surrogate key =
+  `xxhash64(rep_id, valid_from)`.
+- [ ] `gold.dim_territory` — synthesized from distinct `territory_id` values
+  in `gold.dim_store` + `silver.territory_assignments` + a hardcoded
+  city/state/region enrichment lookup in the notebook. Add the
+  `D2C_NATIONAL` sentinel row (DECISIONS #55).
+
+**End state:** all 8 dims feeding `fact_order_line` are live.
+
+### Chunk 3 — keystone facts  ⏳
+- [ ] `gold.fact_order_line` — the big one. As-of joins on `order_date` for
+  SCD-2 dims (DECISIONS #56). Per-channel `territory_id` derivation
+  (DECISIONS #55). Measures per DECISIONS #54 (GST 18% derived).
+  Pass-through `line_id` PK (DECISIONS #58).
+- [ ] `gold.fact_daily_channel_revenue` — Gold→Gold rollup off
+  `fact_order_line`, grain `(date_id, channel_id, category_id, territory_id)`.
+
+**End state:** revenue analytics queryable end-to-end via the SQL warehouse.
+
+### Chunk 4 — inventory branch + trailing-edge silver  ⏳
+- [ ] `silver.inventory_snapshot` — 1.89M rows, partition discipline matters.
+  Dedup on `(product_id, store_id, snapshot_date)`.
+- [ ] `gold.fact_inventory_daily` — as-of join to `dim_product` on
+  `snapshot_date`; 7-day trailing avg for `days_of_stock_remaining`.
+- [ ] `silver.order_status_log` — no current Gold consumer (placeholder for
+  future `fact_order_status_transitions`). Trailing-edge.
+- [ ] `silver.customer_addresses` — no current Gold consumer. Trailing-edge.
+
+**End state:** Phase 2 medallion fully complete.
+
+### Reusable patterns (already proven in S8 + S9.5)
+- **Silver smoke:** `.venv/bin/python scripts/run_silver_smoke.py --entity {name}`
+- **Gold smoke:** `.venv/bin/python scripts/run_gold_smoke.py --entity {name}`
+  (entity is the filename suffix after `build_gold_`, e.g. `dim_customer`,
+  `static_dims`, `dim_product`, `fact_order_line`)
+- Notebook skeletons live in `notebooks/silver/` + `notebooks/gold/` and
+  follow the conventions in DECISIONS #52. Copy the closest existing
+  notebook and edit the columns + DQ rules / SCD logic.
+- After each chunk, run a `verify_*.py` script under `scripts/` for
+  end-to-end row-count + key-sanity checks.
+
+### Post-chunk-1 catch-up still owed
+Independent of the chunk plan, after tomorrow's autonomous fire verifies:
+re-run silver+gold for May-7 / May-8 / May-9 source data via
+`run_silver_smoke.py --entity orders|customers|order_lines|products|product_pricing|sales_reps|territory_assignments`
++ `run_gold_smoke.py --entity dim_customer|static_dims`.
 
 ---
 

@@ -2,95 +2,108 @@
 
 ## Current phase
 
-**Phase 0 — Done. Phase 1 — Done. Phase 2 — Bronze 100% (S7). First medallion
-vertical slice through Silver + Gold COMPLETE (S8). SCHEMA.md refit into a
-tight industry-grade blueprint with no design ambiguity (S8). Daily-fire
-orchestration moved off the unreliable Flex timer to a Logic App + function
-timeout bumped (S9). Remaining: 8 Silver tables + 11 Gold dims/facts +
-ADF Bicep.**
+**Phase 0 — Done. Phase 1 — Done. Phase 2 — Bronze 100%. Silver 7/10. Gold
+6/12 (1 SCD-2 dim + 5 static dims). Daily-fire orchestration on Logic App
++ 30-min function timeout (S9). Chunk 1 of the medallion ladder complete
+(S9.5). Remaining: 3 Silver + 6 Gold (3 SCD-2 dims + 3 facts) + ADF Bicep.**
 
-43 Azure resources live (Logic App `pipelineiq-scheduler-dev` added in S9 →
-3 underlying resources: workflow + recurrence trigger + HTTP action).
-Function App on FC1 Flex Consumption stays for the actual generator
-execution; Logic App is now the source of truth for the daily fire.
+43 Azure resources live. Function App on FC1 Flex Consumption + Logic App
+`pipelineiq-scheduler-dev` for the daily fire (DECISIONS #59).
 
 **Source DB:** **12 days of real-dated activity, 2026-04-27 → 2026-05-08**,
-in `velora_oms`. S9 restored full continuity after diagnosing missed cron
-fires + a partial-execution bug; see DECISIONS #59. Tomorrow morning
-(2026-05-10 00:30 UTC) is the first autonomous fire under the new
-Logic-App-driven schedule with the 30-min function timeout.
+in `velora_oms`. Tomorrow morning (2026-05-10 00:30 UTC) is the first
+autonomous fire under the new Logic-App-driven schedule with the 30-min
+function timeout.
 
-**Bronze:** All 10 `bronze.default.*` tables hydrated (S7). 1,891,125 inventory
-+ 3,619 orders + 12,300 lines + 6,897 status logs + smaller masters.
+**Bronze:** **All 12 tables hydrated.** 10 main entities (S7) +
+2 static seeds added S9.5: `product_categories` (35) + `stores` (45)
+per DECISIONS #60.
 
-**Silver:** 2 of 10 tables hydrated (S8) — `silver.default.orders` (3,619 rows,
-100% DQ pass) and `silver.default.customers` (248 rows, 100% DQ pass with SCD
-change tracking computed). Pattern-setters for the remaining 8.
+**Silver (7/10 done):**
+- `orders` (3,619) — S8
+- `customers` (248) — S8
+- `order_lines` (12,300) — S9.5
+- `products` (4,205) — S9.5
+- `product_pricing` (4,218) — S9.5
+- `sales_reps` (30) — S9.5
+- `territory_assignments` (30) — S9.5
+- All 100% DQ pass.
+- Remaining 3 (chunk 4): `inventory_snapshot`, `order_status_log`, `customer_addresses`.
 
-**Gold:** 1 of 12 dims/facts hydrated (S8) — `gold.default.dim_customer`
-(248 rows, SCD Type 2 idempotent, `valid_from` = earliest activity date).
-Verified end-to-end: as-of join from `silver.orders` matches 3,619 / 3,619
-silver orders to a `dim_customer` row.
+**Gold (6/12 done):**
+- `dim_customer` (248, SCD-2) — S8
+- `dim_date` (4,018, FY26 = 365d) — S9.5
+- `dim_sales_channel` (3) — S9.5
+- `dim_order_status` (6) — S9.5
+- `dim_product_category` (35) — S9.5
+- `dim_store` (45, 8 territories) — S9.5
+- All static dims built via single `build_gold_static_dims.py` notebook.
+- Remaining 6: 3 SCD-2 dims (chunk 2: `dim_product`, `dim_sales_rep`,
+  `dim_territory`) + 3 facts (chunks 3-4: `fact_order_line`,
+  `fact_daily_channel_revenue`, `fact_inventory_daily`).
 
-**Quarantine:** Catalog created (S8). All notebooks wire the routing path; no
-rows quarantined yet because the generator produces clean OLTP. Will be
-exercised in Phase 3 failure injection.
+**Quarantine:** All Silver notebooks wire the routing path; no rows
+quarantined yet because the generator produces clean OLTP. Will be exercised
+in Phase 3 failure injection.
+
+**Chunk plan persisted in CLAUDE.md → "## Medallion chunk plan (S10 → S13)".**
+That section is the canonical pick-up document for chunk 2 onwards. Delete
+it once chunk 4 lands.
 
 **SCHEMA.md status (S8):** refit complete. All 10 Silver tables + all 12 Gold
-dims/facts have explicit specs with derivation rules. Conventions for both
-layers documented at the top of each section. Every remaining notebook codes
-straight against the spec.
+dims/facts have explicit specs with derivation rules. S9.5 dropped the
+"loaded directly into Gold" wording for `dim_product_category` + `dim_store`
+to reflect the bronze-routed reality (DECISIONS #60).
 
 ## Next task
 
-**Session 10 plan — pick up the deferred S9 medallion ladder. (S9 was
-entirely consumed by data-integrity restoration + scheduler/timeout fixes —
-see Session Log entry for 2026-05-09. The medallion-build plan below is
-unchanged from S8's wrap, simply rolled forward.)**
+**Session 10 = chunk 2 of the medallion ladder (SCD-2 dims +
+synthesized `dim_territory`).** Full chunk plan lives in CLAUDE.md →
+"## Medallion chunk plan (S10 → S13)" — read that first.
 
-Verify tomorrow morning that 2026-05-10 00:30 UTC autonomous fire landed
-under the Logic-App + 30-min-timeout setup before starting medallion work:
+**Pre-work to do at the start of S10 (in this order):**
 
-```sql
-SELECT order_date, COUNT(*) AS orders_count,
-       MIN(created_at) AS first_insert_utc
-FROM velora_oms.orders WHERE order_date = '2026-05-09';
-```
+1. **Verify tomorrow's 2026-05-10 00:30 UTC autonomous fire landed.** This
+   is the canonical proof of the Logic-App + 30-min-timeout fix (S9):
+   ```sql
+   SELECT order_date, COUNT(*) AS orders_count,
+          MIN(created_at) AS first_insert_utc
+   FROM velora_oms.orders WHERE order_date = '2026-05-09';
+   ```
+   Expect: 1 row with `first_insert_utc` between 00:30–00:40 UTC and 270–550
+   orders. Also verify `velora_oms.order_status_log` (parent date 2026-05-09)
+   and `velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-09'`
+   landed — the two tables that were missing in S9's broken May-8 fire.
 
-Expect: 1 row with `first_insert_utc` between 00:30–00:40 UTC and 270–550
-orders. Also verify status_log + inventory rows landed for 2026-05-09 (the
-two tables that were missing in S9's broken May-8 fire — those are the
-canary for whether the 30-min timeout fix actually closes the loop).
+2. **Catch up silver+gold for May-7 / May-8 / May-9.** Bronze chunk 1's
+   silver tables only saw bronze through May-6 (S7 backfill). Run:
+   ```
+   .venv/bin/python scripts/run_silver_smoke.py --entity orders
+   .venv/bin/python scripts/run_silver_smoke.py --entity customers
+   .venv/bin/python scripts/run_silver_smoke.py --entity order_lines
+   .venv/bin/python scripts/run_silver_smoke.py --entity products
+   .venv/bin/python scripts/run_silver_smoke.py --entity product_pricing
+   .venv/bin/python scripts/run_silver_smoke.py --entity sales_reps
+   .venv/bin/python scripts/run_silver_smoke.py --entity territory_assignments
+   .venv/bin/python scripts/run_gold_smoke.py --entity dim_customer
+   .venv/bin/python scripts/run_gold_smoke.py --entity static_dims
+   ```
+   These all MERGE-on-PK so re-running is safe and idempotent. Bronze for
+   May-7/8/9 needs to land first — verify via the 2026-05-10 fire above
+   then re-export landing + ingest bronze for those 3 days.
 
-**Then proceed with the (still-pending) `gold.fact_order_line` ladder:**
+3. **Then start chunk 2.** Three notebooks to build (see CLAUDE.md plan
+   for full specs):
+   - `notebooks/gold/build_gold_dim_product.py` — SCD-2 on list_price
+   - `notebooks/gold/build_gold_dim_sales_rep.py` — SCD-2 on territory_id
+   - `notebooks/gold/build_gold_dim_territory.py` — synthesized + sentinel
 
-1. **`silver.order_lines`** (~45 min) — straightforward, mirrors `silver.orders`
-   pattern. DQ rules: NULL_LINE_ID, NULL_ORDER_ID, NULL_PRODUCT_ID,
-   UNKNOWN_ORDER_ID (FK to `silver.orders`), UNKNOWN_PRODUCT_ID (FK to
-   `silver.products`), INVALID_QUANTITY (≤ 0), INVALID_UNIT_PRICE (≤ 0).
-2. **`silver.products`** (~45 min) — mutable dim attrs only. List_price is
-   NOT in this table (lives in `silver.product_pricing`). DQ rules:
-   NULL_PRODUCT_ID, NULL_SKU, INVALID_DIVISION, NULL_CATEGORY_ID.
-3. **`silver.product_pricing`** (~45 min) — append-only price-change log.
-   DQ rules: NULL_PRICING_ID, NULL_PRODUCT_ID, UNKNOWN_PRODUCT_ID,
-   INVALID_LIST_PRICE (≤ 0), INVALID_PRICING_TYPE, NULL_EFFECTIVE_FROM.
-4. **`gold.dim_product`** (~90 min) — SCD Type 2 on `list_price`. Joins
-   `silver.products` + `silver.product_pricing` at build time. `valid_from`
-   tracks `product_pricing.effective_from`. Surrogate key =
-   `xxhash64(product_id, valid_from)`.
-5. **`gold.fact_order_line`** (~120 min) — the big one. PK = pass-through
-   `line_id`. As-of joins to `dim_customer` and `dim_product` on `order_date`.
-   `tax_amount = round(line_total_inr * 0.18, 2)`, `net_revenue_inr =
-   line_total_inr`. Per-channel `territory_id` derivation (STORE → store, B2B
-   → as-of dim_sales_rep, D2C → `D2C_NATIONAL` sentinel).
+   The closest existing notebook to copy from for the SCD-2 work is
+   `notebooks/gold/build_gold_dim_customer.py` — same skeleton, just
+   different NK + tracked attrs + source paths.
 
-After (5) the first fact is proven end-to-end. Remaining medallion work is
-pattern repetition: 5 more Silver tables + 8 more Gold dims/facts.
-
-After tomorrow's autonomous fire is verified, **re-run the silver/gold
-layer** to incorporate the new May-7 / May-8 / May-9 data:
-`run_silver_smoke.py --entity orders|customers` + `run_gold_smoke.py
---entity dim_customer`.
+After chunk 2 lands, all 8 dims feeding `fact_order_line` are live, and
+chunk 3 (the keystone fact) becomes a fill-in-the-blank exercise.
 
 ### Phase 0 loose ends (interleave when convenient)
 
@@ -301,6 +314,95 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-09 (Session 9.5 — medallion chunk 1: 5 silver tables + 5 static gold dims)
+**Objective:** Half-session — broaden the medallion ladder per the chunk plan
+proposed at session start. Goal was chunk 1 of the new 4-chunk plan: ship
+5 more Silver tables + the 5 static Gold dims so chunk 2 (SCD-2 dims) can
+start from an "all inputs to fact_order_line ready" state.
+
+**Built:**
+- **5 Silver notebooks**, all following the S8 pattern from
+  `build_silver_orders.py` / `build_silver_customers.py`:
+  `build_silver_order_lines.py`, `build_silver_products.py`,
+  `build_silver_product_pricing.py`, `build_silver_sales_reps.py`,
+  `build_silver_territory_assignments.py`. All ran clean against the live
+  workspace via `run_silver_smoke.py`.
+- **`build_gold_static_dims.py`** — single Gold notebook that builds all 5
+  static dims in one pass: `dim_date` (Python-generated 2020-2030, Indian
+  fiscal calendar, 5 hardcoded national holidays), `dim_sales_channel` (3
+  hardcoded), `dim_order_status` (6 hardcoded), `dim_product_category` (35
+  from bronze), `dim_store` (45 from bronze). MERGE-on-NK pattern is
+  idempotent.
+- **Bronze extension for static seeds** — added `("velora_pim",
+  "product_categories", "full", None, None)` and `("velora_pim", "stores",
+  "full", None, None)` to `scripts/export_velora_to_landing.py` ENTITIES.
+  Ran export + bronze ingestion for both — landed `bronze.default.product_categories`
+  (35 rows) and `bronze.default.stores` (45 rows). DECISIONS #60.
+- **`scripts/verify_silver_chunk1.py`** + **`scripts/verify_gold_static_dims.py`** —
+  end-to-end count + key-sanity checks across all 10 new tables.
+- **CLAUDE.md** — new section `## Medallion chunk plan (S10 → S13)` with the
+  4-chunk break-down, marked self-cleanup once chunk 4 lands. Updated module
+  stability rows: bronze 12/12, silver 7/10, gold 6/12.
+- **DECISIONS.md #60** — static seed tables routed through bronze rather
+  than direct-from-source-via-JDBC at Gold.
+
+**Final counts (this session's deliverables):**
+
+| Table | Rows | DQ pass |
+|---|---|---|
+| `silver.order_lines` | 12,300 | 100% |
+| `silver.products` | 4,205 | 100% |
+| `silver.product_pricing` | 4,218 | 100% |
+| `silver.sales_reps` | 30 | 100% |
+| `silver.territory_assignments` | 30 | 100% |
+| `gold.dim_date` | 4,018 (FY26 = 365 ✓, 5 holidays/yr) | n/a |
+| `gold.dim_sales_channel` | 3 | n/a |
+| `gold.dim_order_status` | 6 | n/a |
+| `gold.dim_product_category` | 35 | n/a |
+| `gold.dim_store` | 45 (8 territories, 5 FLAGSHIP/25 STANDARD/15 EXPRESS) | n/a |
+
+**Worked:**
+- The S8 silver/gold conventions (DECISIONS #52) made every new notebook
+  a fill-in-the-blank exercise — copy `build_silver_orders.py`, swap
+  columns + DQ rules, done. 5 silver notebooks built + smoked in roughly
+  the same wall time it took to build 1 in S8.
+- Parallelizing the 2 bronze ingestions for `product_categories` + `stores`
+  (separate `run_bronze_smoke.py` background runs) hid the cluster cold-start
+  cost. Each landed in ~3-4 min vs ~7-8 min if serialised.
+- Static-dim batch as a single notebook (vs 5 separate ones) was the right
+  call — they share the `write_dim()` helper, run on one cluster, idempotent
+  MERGE works the same for all 5.
+
+**Broke:**
+- **Hit the SCHEMA.md "loaded directly into Gold" wording for
+  `dim_product_category` + `dim_store`** which would have required JDBC
+  to Azure SQL from inside the Gold notebook. Decided against (DECISIONS
+  #60) and routed through bronze instead. SCHEMA.md updated to drop the
+  conflicting wording.
+
+**Uncertainty:**
+- **Silver counts include data only through 2026-05-06.** May-7 / May-8 /
+  May-9 source data hasn't propagated through bronze→silver yet. Once
+  tomorrow's autonomous fire verifies + lands May-9, the silver/gold catch-up
+  step at the top of S10 covers all 9 silver tables + dim_customer +
+  static_dims in one re-run pass. Idempotent MERGE makes this safe.
+- **`silver.products` shows 4,205 rows** — `bronze.products` matches at 4,205,
+  100% DQ pass. Original generator design said 1,200 products; either the
+  catalogue grew over iterations or the count was approximate. Not a defect —
+  bronze and silver align, no data loss. Worth a sanity check at the start
+  of S10 if anything downstream (`fact_order_line`) seems off.
+
+**Next:** S10 = chunk 2 (3 SCD-2 dims). Pre-work: verify autonomous fire +
+catch up silver/gold to May-9. Full chunk plan in CLAUDE.md.
+
+**Summary:** Half-session by design — user paused mid-flow to restart VS
+Code. Chunk 1 of the medallion ladder shipped in full: 5 new Silver tables
++ 5 static Gold dims + the bronze extension to support them. The repo is
+now 2 sessions away from the first revenue fact (chunk 2 builds the SCD-2
+dims, chunk 3 lands `fact_order_line`). The chunk-plan section in CLAUDE.md
+is the single document for the next 3 sessions to pick up against — delete
+once chunk 4 lands.
 
 ### 2026-05-09 (Session 9 — daily-fire reliability: data restore + Logic App + function timeout)
 **Objective:** Verify that the 2026-05-08 00:30 UTC autonomous fire (the cron-reliability proof loose-end from S7) actually landed before starting S9 medallion work. It hadn't — and the diagnostic chain that followed turned the whole session into orchestration-reliability work.

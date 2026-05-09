@@ -285,8 +285,9 @@ is_active       BIT           DEFAULT 1
 ```
 
 Static reference table. 35 rows seeded once by `generator/catalogue.py`.
-No audit columns (by design — never updated post-seed). **Not extracted
-by ADF** — loaded directly into `gold.dim_product_category`.
+No audit columns (by design — never updated post-seed). Routed
+landing → bronze → `gold.dim_product_category` (no Silver hop) per
+DECISIONS #60.
 
 ### velora_pim.products
 ```
@@ -347,9 +348,9 @@ opened_date     DATE          NULL
 ```
 
 Static store master. 45 rows seeded once by `generator/catalogue.py`.
-No audit columns. **Not extracted by ADF** — loaded directly into
-`gold.dim_store`. Referenced by `velora_oms.orders.store_id` (STORE
-channel only) and `velora_pim.inventory_snapshot.store_id`.
+No audit columns. Routed landing → bronze → `gold.dim_store` (no Silver
+hop) per DECISIONS #60. Referenced by `velora_oms.orders.store_id`
+(STORE channel only) and `velora_pim.inventory_snapshot.store_id`.
 
 Added to SCHEMA.md and to `seed_to_db` mid-Session 4 after a data-quality
 sweep caught 45 missing rows; see DECISIONS #44 and the change log below.
