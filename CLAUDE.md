@@ -477,11 +477,6 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   After verifying, **re-run the silver/gold layer** to incorporate May-7,
   May-8, May-9 data: `run_silver_smoke.py --entity orders|customers` +
   `run_gold_smoke.py --entity dim_customer`.
-- **Rotate `AzureWebJobsStorage` account key on `pipelineiqfunctionsdev`.**
-  Key was printed in S6 transcript when listing app settings (~`vz1Z2iSghWL6...`).
-  Storage Account → Keys and Endpoint → Regenerate key1; Terraform will pick
-  up the new key on next apply. Same exposure class as the Portal Key 1
-  rotation item below.
 - **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
   + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
   `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —
@@ -509,12 +504,6 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   a DECISIONS-log item per user instruction — just a carry-over. Trigger is
   user's call, not "wait for architecture stable" — the user can flip it
   anytime.
-- **Rotate Key 1 on `pipeline-iq-resource`** (2026-04-21 S2). First/last 8 chars
-  (`G2F8oS21...ACOGwlg6`, 16 of 84) appeared in S2 transcript during debug. Azure
-  Portal → resource → Keys and Endpoint → Regenerate Key 1 → update the Vercel
-  env var (`az cognitiveservices account keys list ...` piped to
-  `vercel env add AZURE_OPENAI_API_KEY production --value "$K" --yes --sensitive`).
-  Low exposure; recommended as hygiene.
 
 ---
 
