@@ -830,9 +830,13 @@ _gold_timestamp     TIMESTAMP
 ### gold.dim_territory
 
 SCD Type 1. Synthesized in the Gold notebook from the **distinct set of
-`territory_id` values** in `silver.stores` (static seed) +
-`silver.territory_assignments`, plus a city/state/region enrichment
-lookup hardcoded in the notebook.
+`territory_id` values** in `gold.dim_store` (which is sourced from
+`bronze.default.stores` per DECISIONS #60) + `silver.territory_assignments`,
+plus a city/state/region enrichment lookup hardcoded in the notebook
+(matches `generator/config.py::CITIES`). Any observed `territory_id`
+not present in the lookup is written with NULL city/state and
+`region = 'UNKNOWN'` so dashboards never drop rows; the missing keys
+are logged at notebook runtime as the prompt to extend the lookup.
 
 **One sentinel row added explicitly: `D2C_NATIONAL`.** D2C orders have
 no store and no rep, so no natural territory; the sentinel keeps
