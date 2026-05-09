@@ -4,15 +4,21 @@
 
 **Phase 0 — Done. Phase 1 — Done. Phase 2 — Bronze 100% (S7). First medallion
 vertical slice through Silver + Gold COMPLETE (S8). SCHEMA.md refit into a
-tight industry-grade blueprint with no design ambiguity (S8). Remaining:
-8 Silver tables + 11 Gold dims/facts + ADF Bicep.**
+tight industry-grade blueprint with no design ambiguity (S8). Daily-fire
+orchestration moved off the unreliable Flex timer to a Logic App + function
+timeout bumped (S9). Remaining: 8 Silver tables + 11 Gold dims/facts +
+ADF Bicep.**
 
-40 Azure resources live (4th UC catalog `quarantine` added in S8). Function
-App on FC1 Flex Consumption fires daily at 06:00 IST = 00:30 UTC.
+43 Azure resources live (Logic App `pipelineiq-scheduler-dev` added in S9 →
+3 underlying resources: workflow + recurrence trigger + HTTP action).
+Function App on FC1 Flex Consumption stays for the actual generator
+execution; Logic App is now the source of truth for the daily fire.
 
-**Source DB:** 10 days of real-dated activity, **2026-04-27 → 2026-05-06**, in
-`velora_oms`. Tomorrow morning (2026-05-08 00:30 UTC) is the first autonomous
-fire on the IST schedule.
+**Source DB:** **12 days of real-dated activity, 2026-04-27 → 2026-05-08**,
+in `velora_oms`. S9 restored full continuity after diagnosing missed cron
+fires + a partial-execution bug; see DECISIONS #59. Tomorrow morning
+(2026-05-10 00:30 UTC) is the first autonomous fire under the new
+Logic-App-driven schedule with the 30-min function timeout.
 
 **Bronze:** All 10 `bronze.default.*` tables hydrated (S7). 1,891,125 inventory
 + 3,619 orders + 12,300 lines + 6,897 status logs + smaller masters.
@@ -37,7 +43,26 @@ straight against the spec.
 
 ## Next task
 
-**Session 9 plan — `gold.fact_order_line` and its prereqs:**
+**Session 10 plan — pick up the deferred S9 medallion ladder. (S9 was
+entirely consumed by data-integrity restoration + scheduler/timeout fixes —
+see Session Log entry for 2026-05-09. The medallion-build plan below is
+unchanged from S8's wrap, simply rolled forward.)**
+
+Verify tomorrow morning that 2026-05-10 00:30 UTC autonomous fire landed
+under the Logic-App + 30-min-timeout setup before starting medallion work:
+
+```sql
+SELECT order_date, COUNT(*) AS orders_count,
+       MIN(created_at) AS first_insert_utc
+FROM velora_oms.orders WHERE order_date = '2026-05-09';
+```
+
+Expect: 1 row with `first_insert_utc` between 00:30–00:40 UTC and 270–550
+orders. Also verify status_log + inventory rows landed for 2026-05-09 (the
+two tables that were missing in S9's broken May-8 fire — those are the
+canary for whether the 30-min timeout fix actually closes the loop).
+
+**Then proceed with the (still-pending) `gold.fact_order_line` ladder:**
 
 1. **`silver.order_lines`** (~45 min) — straightforward, mirrors `silver.orders`
    pattern. DQ rules: NULL_LINE_ID, NULL_ORDER_ID, NULL_PRODUCT_ID,
@@ -62,22 +87,10 @@ straight against the spec.
 After (5) the first fact is proven end-to-end. Remaining medallion work is
 pattern repetition: 5 more Silver tables + 8 more Gold dims/facts.
 
-**Verify tomorrow's first 06:00-IST autonomous fire** (2026-05-08 00:30 UTC,
-loose end from S7).
-
-```sql
-SELECT order_date, COUNT(*) AS orders_count,
-       MIN(created_at) AS first_insert_utc,
-       MAX(created_at) AS last_insert_utc
-FROM velora_oms.orders
-GROUP BY order_date ORDER BY order_date;
-```
-
-May-7 row should exist with `first_insert_utc` between 00:30–00:40 UTC and
-270–500 orders. If missing or off-window, Flex isn't firing reliably and we
-need to investigate. After verifying, **re-run the silver/gold layer**
-(`run_silver_smoke.py --entity orders|customers` + `run_gold_smoke.py
---entity dim_customer`) to incorporate the new May-7 data.
+After tomorrow's autonomous fire is verified, **re-run the silver/gold
+layer** to incorporate the new May-7 / May-8 / May-9 data:
+`run_silver_smoke.py --entity orders|customers` + `run_gold_smoke.py
+--entity dim_customer`.
 
 ### Phase 0 loose ends (interleave when convenient)
 
@@ -288,6 +301,41 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-09 (Session 9 — daily-fire reliability: data restore + Logic App + function timeout)
+**Objective:** Verify that the 2026-05-08 00:30 UTC autonomous fire (the cron-reliability proof loose-end from S7) actually landed before starting S9 medallion work. It hadn't — and the diagnostic chain that followed turned the whole session into orchestration-reliability work.
+
+**Built:**
+- **Source DB restored to canonically-correct end-state**, 12 days continuous Apr 27 → May 8 in `velora_oms`. Required: wipe May-8 partial-fire state (534 orders + 1,728 lines + 1,857 stale status_log + 1,842 reverted parent statuses + 29 leftover customers/addresses + 15 May-7-backfill leftovers from a UTC/IST timestamp confusion); then re-run May 7 + May 8 generators locally in clean order.
+- **`PipelineIQ-IaC/core/scheduler/`** — new Terraform module: Logic App Workflow + Recurrence trigger (daily 00:30 UTC) + HTTP action POSTing to `/admin/functions/generator` with `x-functions-key` from `azurerm_function_app_host_keys.primary_key` data source. Wired into `clients/velora/main.tf` as `module "scheduler"`. 3 new resources (workflow + trigger + action). Cost effectively Rs.0/mo (1 fire/day << 4,000-action free grant).
+- **`generator/host.json`** — `functionTimeout` bumped 10m → 30m. Function redeployed via `scripts/deploy_function.sh` (167s build).
+- **`CLAUDE.md`** — new section "Azure subscription — non-negotiable default" pinning Sponsorship sub as the global default for this project, with diagnostic symptoms for the wrong-sub failure modes (`ResourceGroupNotFound: pipelineiq-rg-dev`, AAD `28000 / 18456` token-rejection from velora_oms). Memory updated to match (the prior memory only flagged the Portal AI resource on Sponsorship; the data plane was incorrectly assumed to be on SSE BI).
+- **`docs/build_order.md`** — row 4.7 added for the Logic App. Row 4.6 updated with the host.json timeout bump.
+- **DECISIONS.md #59** — Daily fire orchestration moved off Function timer to Logic App Consumption recurrence; supersedes the timer-firing assumption baked into #50.
+
+**Worked:**
+- Logic App plumbing verified end-to-end via REST `POST .../triggers/daily-fire/run` 08:46 UTC: Logic App run Succeeded (200ms) → function host woke (lock lease acquired) → generator's `run()` reached the idempotency guard → returned `{'_skipped': True, 'existing_orders': 534}` because May 8 was already populated. Exactly the right safe no-op.
+- Source-DB restoration logic was non-trivial (status_log entries created by the May-8 fire belong to *prior-date* orders being progressed, not May-8 orders themselves — so my first-pass DELETE filtered by `order_date=May 8` matched 0 rows). The fix: revert each affected order to the from_status of its earliest 2026-05-09 status_log entry, then DELETE all 2026-05-09 status_log rows. Reverted 1,842 orders; deleted 1,857 stale rows. Clean.
+- Local generator runs (May 7 then May 8) completed in ~6 min total wall time. May 7: 405 orders / 1,227 lines / 998 status / 189K inventory. May 8: 534 / 1,728 / 1,249 / 189K. All four tables populated for both dates.
+- Date-derived RNG seed (DECISIONS #41) carried its weight again — May 8's re-run after May 7 was inserted produced exactly the same 534 orders + 19 SCD updates + 29 new customers as the first attempt. Determinism verified.
+
+**Broke:**
+- **Three subscription drifts.** First `az` call failed with `ResourceGroupNotFound: pipelineiq-rg-dev` because the active sub had drifted to SSE BI. Diagnosed by enumerating all subs for `pipelineiq-sql-velora-dev` — found it on `Microsoft Azure Sponsorship`. Root cause: prior memory incorrectly stated PipelineIQ-Architecture data plane lived on SSE BI; in fact the **entire** project (data + Portal AI) is on Sponsorship. Pinned via `az account set` + CLAUDE.md hard rule + memory entry. Symptom on AAD-token path is different (`28000 / 18456 Login failed for <token-identified principal>`) — same root cause: token issued for the wrong tenant.
+- **Manual-invoke partial execution.** First diagnostic step (manual-firing the function via `/admin/functions/generator` to land May 8) wrote 534 orders + 1,728 lines, then **silently stopped** — no status_log, no inventory. Root cause: `host.json` `functionTimeout = 00:10:00`, while inventory write alone takes 5-7 min on Flex's smaller compute. This is what S9's host.json bump fixes; tomorrow's autonomous fire is the proof.
+- **Status-log wipe missed prior-date entries.** First pass deleted only `order_status_log WHERE order_id IN (May-8 orders)`, returning 0 rows. The May-8 fire had advanced 1,842 *prior-date* orders' statuses and written log entries pointing at them. Fixed by switching to `WHERE created_at >= '2026-05-09T00:00:00'` and reverting parent statuses from the earliest entry's from_status.
+- **UTC vs IST timestamp confusion.** Local generator log shows IST timestamps in the human-readable prefix; the SQL `created_at` columns store UTC. My first attempt to wipe May-7 backfill leftovers used the IST window `13:45:00 - 13:55:00` and matched 0 customers. Real window was UTC `08:15:00 - 08:20:00`. Fixed.
+- **Terraform v3→v4 attribute renames.** First plan failed with `hours/minutes` not supported on `azurerm_logic_app_trigger_recurrence.schedule` (v4 requires `at_these_hours/at_these_minutes`) and `master_key` not on `azurerm_function_app_host_keys` (v4 renamed to `primary_key`). Both diagnosed by inspecting `terraform providers schema -json` for the actual attribute names.
+- **`AzureWebJobsStorage` AccountKey appeared in transcript twice.** Pre-existing CLAUDE.md carry-over to rotate this key just got more urgent.
+
+**Uncertainty:**
+- **Tomorrow's 2026-05-10 00:30 UTC autonomous fire is the actual end-to-end proof.** Today's manual REST trigger only proved the plumbing (Logic App fires → function host wakes → guard short-circuits). Tomorrow's fire targets 2026-05-09 (a fresh date), and we verify *all 4 tables* (orders / lines / status_log / inventory) get written within the 30-min timeout window. If status_log + inventory still come up empty, the timeout fix wasn't enough and we need to investigate further (possibly memory pressure on FC1's 2GB allocation, or pyodbc cursor lifecycle issues across the long inventory write).
+- **Function timer trigger is now redundant** — Logic App is the source of truth. Timer left registered as harmless fallback because the idempotency guard makes a double-fire safe. Could be disabled in `function.json` later for cleanliness; not urgent.
+- **App Insights telemetry on Flex** still mostly empty between fires (S6/S7 carry-over), but the manual-trigger window today produced a clean trace chain (60+ entries). May Just Work for scheduled fires too — verify tomorrow.
+- **Deprecated extension bundle 3.41.0** warning surfaced in App Insights. Non-blocking; address when convenient.
+
+**Next:** Session 10 = verify tomorrow's autonomous fire, then resume the deferred S9 medallion ladder: `silver.order_lines` → `silver.products` → `silver.product_pricing` → `gold.dim_product` → **`gold.fact_order_line`** (the first fact). All have explicit specs in SCHEMA.md from S8.
+
+**Summary:** S9 was meant to be the first medallion-fact session but became a hard-stop reliability triage. Net result: PipelineIQ's daily-fire orchestration is now actually reliable (Logic App + 30-min function timeout, both addressing real bugs that were silently breaking the pipeline pre-S9), and the source DB is in canonical correct end-state with 12 continuous days. Three real architectural artefacts landed: DECISIONS #59 (Logic App), `core/scheduler/` Terraform module, and a non-negotiable subscription pin in CLAUDE.md + memory after a 30-minute detour caused by sub drift. The medallion ladder slips one session — but starting S10 with a working schedule + correct data is worth far more than S9 ending with a broken cron and a 1-day data hole. Repos to push: architecture (`generator/host.json`, `CLAUDE.md`, `DECISIONS.md`, `PROGRESS.md`, `docs/build_order.md`) + IaC (`core/scheduler/*`, `clients/velora/main.tf`).
 
 ### 2026-05-07 (Session 8 — first Silver+Gold slice, schema blueprint refit)
 **Objective:** Land the first vertical slice through the medallion (Silver orders, Silver customers, Gold dim_customer with SCD-2), close the Vercel auto-deploy loose end from S7, then refit SCHEMA.md as a tight industry-grade blueprint with no "follow the same pattern" placeholders or unspec'd derivation rules.

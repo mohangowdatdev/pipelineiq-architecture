@@ -198,7 +198,8 @@ managed_by  = "terraform"
 | notebooks/bronze/ | **All 10 entities hydrated (S7)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). All 10 `bronze.default.*` tables hydrated (~1.9M rows). |
 | notebooks/silver/ | **Pattern-setters live (S8). 2/10 tables done.** | `silver.orders` (3,619 rows) + `silver.customers` (248 rows). Conventions documented in SCHEMA.md. SCD-change tracking computed at Silver (per DECISIONS #52). Remaining 8 tables follow the same shape. |
 | notebooks/gold/ | **First SCD-2 dim live (S8). 1/12 dims+facts done.** | `gold.dim_customer` (248 rows, idempotent). Surrogate key + valid_from + as-of-join conventions in SCHEMA.md (DECISIONS #52, #53, #56). Remaining 11 follow the same shape. |
-| functions/ | **Stable on FC1 Flex (S6)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50): Y1 + Linux + non-HTTP triggers was the documented sad path — silent timer drops. Cron `0 0 6 * * *` unchanged. Real-world reliability proof = next 06:00 UTC fire. ADF replacements for Bronze chain still pending in Tier 6. |
+| functions/ | **Stable on FC1 Flex + Logic-App-driven schedule (S9)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Flex timer trigger doesn't reliably fire from cold — verified via 2 missed scheduled fires. Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m to fit the 189K-row inventory write. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. |
+| scheduler/ (IaC `core/scheduler/`) | **Live (S9)** | Logic App Consumption recurrence trigger (`daily-fire`, 00:30 UTC) → HTTP action POSTing to the Function App admin endpoint with `x-functions-key` from `azurerm_function_app_host_keys.primary_key`. Single source of truth for the daily generator schedule. Cost: effectively Rs.0/mo (1 fire/day << 4,000-action free grant). |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
 | IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
@@ -243,6 +244,33 @@ databricks jobs run-now --job-id {job_id}
 # (run when velora_oms / Azure SQL connections fail with firewall errors,
 #  or when the user says "update ip firewall at source")
 bash scripts/update_sql_firewall_ip.sh
+```
+
+---
+
+## Azure subscription — non-negotiable default
+
+**Every Azure resource in this project lives on `Microsoft Azure Sponsorship`**
+(subscription id `ea05f17f-b2bb-40ac-a391-afe41a9f5cbf`, tenant
+`23d48723-f83f-4245-9aec-192176d3b96c` = `SailAnalyticsAP.onmicrosoft.com`).
+That includes `velora_oms` (Azure SQL), the Function App
+(`pipelineiq-functions-dev`), ADLS, Databricks, Key Vault, Postgres, the Portal
+Azure OpenAI resource (`pipeline-iq-resource`) — everything. The user also has a
+separate `SSE BI Subscription` on a different tenant (`2278c488-...`) for
+unrelated work.
+
+**Rule:** Before *any* `az` CLI call, `pyodbc`/`DefaultAzureCredential` against
+`velora_oms`, or terraform run touching this project, ensure the active sub is
+Sponsorship. `az account set` is global to `~/.azure/`, so it stays sticky once
+set — but verify before assuming. Symptoms of being on the wrong sub:
+`ResourceGroupNotFound: pipelineiq-rg-dev`, `Login failed for user
+'<token-identified principal>'. The server is not currently configured to
+accept this token` (= AAD token issued for the wrong tenant).
+
+```bash
+# Always run at session start (idempotent, no-op if already set):
+az account set --subscription "Microsoft Azure Sponsorship"
+az account show --query "[name,tenantId]" -o tsv  # verify
 ```
 
 ---
@@ -432,18 +460,23 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Likely a Flex-specific instrumentation tweak (Python OpenTelemetry mode,
   worker extension, or auto-instrumentation app setting). Investigate when
   observability is needed for Phase 4+ — not blocking Phase 2.
-- **Verify tomorrow's first 06:00-IST autonomous fire** (2026-05-08 00:30 UTC).
-  S7 changed the cron from 06:00 UTC → 06:00 IST (00:30 UTC); today's data
-  was a manual fire because the change happened mid-day. Tomorrow's fire is
-  the actual reliability proof. Check via:
+- **Verify tomorrow's first Logic-App-driven autonomous fire** (2026-05-10
+  00:30 UTC). S9 found the Flex timer wasn't firing at all (2 missed
+  windows), moved scheduling to a Logic App + bumped `functionTimeout` to
+  30 min. Tomorrow's fire is the canonical proof of *both* fixes — it must
+  land May-9 data in **all four** tables (orders, lines, status_log,
+  inventory) within the 30-min window. Check via:
   ```sql
   SELECT order_date, COUNT(*) AS orders_count, MIN(created_at) AS first_insert_utc
-  FROM velora_oms.orders GROUP BY order_date ORDER BY order_date;
+  FROM velora_oms.orders WHERE order_date='2026-05-09';
   ```
-  Expect a 2026-05-07 row with `first_insert_utc` between 00:30–00:40 UTC and
-  270–500 orders. After verifying, **re-run the silver/gold layer**
-  (`run_silver_smoke.py --entity orders|customers` + `run_gold_smoke.py
-  --entity dim_customer`) to incorporate May-7 data.
+  Plus row counts on `velora_oms.order_status_log` (parent date 2026-05-09)
+  and `velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-09'`. If
+  status_log + inventory come up 0 again, the timeout fix wasn't enough —
+  investigate memory pressure on FC1's 2 GB or pyodbc cursor lifecycle.
+  After verifying, **re-run the silver/gold layer** to incorporate May-7,
+  May-8, May-9 data: `run_silver_smoke.py --entity orders|customers` +
+  `run_gold_smoke.py --entity dim_customer`.
 - **Rotate `AzureWebJobsStorage` account key on `pipelineiqfunctionsdev`.**
   Key was printed in S6 transcript when listing app settings (~`vz1Z2iSghWL6...`).
   Storage Account → Keys and Endpoint → Regenerate key1; Terraform will pick
