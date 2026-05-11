@@ -4,6 +4,28 @@ Read this file before writing any notebook, SQL query, ADF dataset,
 or data-related code. It is the authoritative column-level reference
 for every table in the architecture.
 
+## Contents
+
+- [Data lifecycle, frequency, volume](#data-lifecycle-frequency-volume) — generator cadence, evolution patterns, volume forecast
+- [Azure SQL Database — Velora source tables](#azure-sql-database--velora-source-tables) — 12 source tables across 4 schemas
+- [Bronze layer — Delta tables](#bronze-layer--delta-tables) — 12 entity-agnostic append-only tables
+- [Silver layer — conformed Delta tables](#silver-layer--conformed-delta-tables) — 10 dedup'd + DQ-validated tables
+- [Gold layer — star schema Delta tables](#gold-layer--star-schema-delta-tables) — 9 dims + 3 facts
+- [Quarantine tables](#quarantine-tables) — 1 per Silver entity, lazily created
+- [PostgreSQL control plane tables](#postgresql-control-plane-tables) — 5 operational + 2 observability
+- [Schema change log](#schema-change-log) — append-only, newest first
+
+## At a glance (current state, 2026-05-11)
+
+| Layer | Tables | Status | Volume reference (14 days) |
+|---|---|---|---|
+| Source (Azure SQL `velora_oms`) | 12 | Live, 14 real-dated days 2026-04-27 → 2026-05-10 | ~2.7M rows total (inventory dominates) |
+| Bronze (`bronze.default.*`) | 12 | All hydrated | append-only; multiple ingestion waves accumulate |
+| Silver (`silver.default.*`) | 10 | All built, 100% DQ pass on current data | 2,648,025 in `inventory_snapshot`; <20K in everything else combined |
+| Gold dims (`gold.default.dim_*`) | 9 | All built | 8 dims with surrogates; `dim_date` covers 2020-2030 |
+| Gold facts (`gold.default.fact_*`) | 3 | All built | `fact_order_line`, `fact_daily_channel_revenue`, `fact_inventory_daily` |
+| Quarantine (`quarantine.default.*`) | 0 active | Routing wired on every Silver | Lazily created on first DQ failure |
+
 ---
 
 ## Data lifecycle, frequency, volume
@@ -404,17 +426,21 @@ _bronze_timestamp    TIMESTAMP -- when Databricks wrote this row to bronze
 _ingestion_date      DATE      -- partition column = to_date(_ingestion_timestamp)
 ```
 
-Bronze tables (10), all under the `bronze` catalog, `default` schema:
+Bronze tables (12), all under the `bronze` catalog, `default` schema:
 `bronze.default.{orders, order_lines, order_status_log, customers,
 customer_addresses, products, product_pricing, inventory_snapshot,
-sales_reps, territory_assignments}`.
+sales_reps, territory_assignments, product_categories, stores}`.
+
+The last two (`product_categories`, `stores`) are static reference tables
+routed through landing → bronze per DECISIONS #60; they still bypass
+Silver and feed `gold.dim_product_category` + `gold.dim_store` directly.
 
 Partition: all Bronze tables partition by `_ingestion_date` (a derived
 DATE, not the raw TIMESTAMP — partitioning on a TIMESTAMP creates
 high-cardinality partitions).
 
 Bronze is **append-only and entity-agnostic** — one notebook
-(`notebooks/bronze/ingest_to_bronze.py`) handles all 10 entities,
+(`notebooks/bronze/ingest_to_bronze.py`) handles all 12 entities,
 parameterised by `entity_name`. No business logic, no dedup, no DQ.
 Schema drift is intentionally tolerated via `mergeSchema = true`.
 
@@ -451,6 +477,17 @@ dq_rejection_reason   STRING NULL    `;`-separated rejection codes when dq_passe
 - **Bad rows route to `quarantine.default.{entity}`** with the full
   rejection-reason string and the original record JSON-serialised in
   `raw_record`.
+
+**Documented per-table deviations from these conventions:**
+- `silver.inventory_snapshot` partitions by `snapshot_date` (NOT
+  `_silver_date`) — DECISIONS #63. Volume + downstream pruning needs.
+- `silver.inventory_snapshot` dedups on the composite
+  `(product_id, store_id, snapshot_date)` (NOT just the PK `snapshot_id`)
+  — re-extracted dates would otherwise produce duplicate (product, store,
+  date) rows with different `snapshot_id`s.
+- `silver.order_status_log` `INVALID_STATUS` DQ rule allows 7 states
+  (the 6 in `gold.dim_order_status` + `RETURN_INITIATED` that the
+  generator emits as a transitional state) — DECISIONS #64.
 
 **SCD-change tracking (only on tables whose Gold dim has SCD-2 attrs):**
 - `_prev_<attr>` columns capture the about-to-be-overwritten value.
@@ -1202,6 +1239,30 @@ schema evolves. Always read this before writing data code.*
 
 Append-only record of every schema edit. New rows on top. Never edit
 or remove prior rows — superseded entries get a "superseded by #N" note.
+
+### #6 — 2026-05-11 (Session 11.2) — Bronze count + Silver per-table deviations clarified
+
+- **Change:** two consistency fixes after chunk 4 landed:
+  - Bronze section now correctly says **12 tables** (was 10) — the static
+    reference tables `product_categories` + `stores` are bronze entities
+    too per DECISIONS #60, even though they bypass Silver and feed Gold
+    static dims directly. Both items added to the bronze table list.
+  - Silver "Conventions for all Silver tables" section now lists three
+    documented per-table deviations: (a) `silver.inventory_snapshot`
+    partitions by `snapshot_date` not `_silver_date` (DECISIONS #63),
+    (b) inventory dedups on the composite (product_id, store_id,
+    snapshot_date) not the bare PK, (c) `silver.order_status_log` allows
+    the 7-state set including `RETURN_INITIATED` (DECISIONS #64).
+- **Why:** the Bronze count drift was a real stakeholder-facing
+  inaccuracy after S9.5 + S10 + S11.2 added new entities. The Silver
+  deviations were correctly captured in DECISIONS but invisible from
+  SCHEMA — meaning a fresh reader of the conventions section would think
+  the rules were universally applied, then be surprised by the inventory
+  notebook code. Documenting deviations next to the convention closes
+  that gap.
+- **Code impact:** none (notebooks already implement this; only the docs
+  were stale).
+- **Reference:** DECISIONS #60, #63, #64.
 
 ### #5 — 2026-05-07 (Session 8) — Silver + Gold full spec-out, derivation rules locked
 

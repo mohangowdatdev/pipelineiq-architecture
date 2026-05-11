@@ -6,6 +6,19 @@ PipelineIQ monitors Azure data pipelines in real time. When a pipeline fails, it
 
 The AI never acts without human approval. Every step from triage to remediation requires an explicit green-light.
 
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [Demo dataset — Velora Retail Group](#demo-dataset--velora-retail-group)
+- [Architecture](#architecture)
+- [Tech stack](#tech-stack)
+- [Companion repos](#companion-repos)
+- [Repository layout](#repository-layout)
+- [Getting started](#getting-started) — prereqs, clone, bootstrap, provision, run
+- [Build phases](#build-phases)
+- [Development conventions](#development-conventions)
+- [Author](#author)
+
 ---
 
 ## Why this exists

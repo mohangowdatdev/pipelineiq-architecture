@@ -1,5 +1,18 @@
 # PipelineIQ — Planning
 
+## Contents
+
+- [Client: Velora Retail Group](#client-velora-retail-group) — narrative + the problem this solves
+- [Full stack](#full-stack) — every Azure service + role + tier
+- [Dataset and data generation](#dataset-and-data-generation) — generator design + source tables + daily volumes
+- [ADF pipeline design](#adf-pipeline-design) — one parameterised pipeline for all 10 source tables
+- [PostgreSQL control plane tables](#postgresql-control-plane-tables) — operational + observability schemas
+- [Gold data model — star schema](#gold-data-model--star-schema) — 9 dims + 3 facts
+- [Observability failure scenarios (6 classes)](#observability-failure-scenarios-6-classes) — what PipelineIQ detects + diagnoses
+- [Modular architecture](#modular-architecture) — Azure-native, swap-ready by docs
+- [Cost estimate (Central India, 1 USD = Rs. 95, PAYG)](#cost-estimate-central-india-1-usd--rs-95-payg) — ~Rs. 5K/month
+- [Hard constraints](#hard-constraints) — non-negotiables
+
 ## Client: Velora Retail Group
 
 Mid-market omnichannel retailer, Bangalore-headquartered.
