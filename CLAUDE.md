@@ -194,11 +194,11 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | **Real-dated + guarded (S6)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. Source DB has 10 real-dated days Apr 27 → May 6, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. |
+| generator/ | **Real-dated + guarded (S6) + 40613-resilient (S11)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. DECISIONS #62 (S11): chunked inventory write w/ per-chunk commits. Source DB has 14 real-dated days Apr 27 → May 10, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. `scripts/inventory_only.py --date YYYY-MM-DD` is the laptop fallback for inventory-only writes when the function fire dropped inventory. |
 | notebooks/bronze/ | **All 12 entities hydrated (S7 + S9.5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). 10 main entities (~1.9M rows) + 2 static seeds added in S9.5: `bronze.default.product_categories` (35 rows) + `bronze.default.stores` (45 rows). DECISIONS #60. |
 | notebooks/silver/ | **7/10 tables done (S8 + S9.5).** | `silver.orders` (3,619), `silver.customers` (248), `silver.order_lines` (12,300), `silver.products` (4,205), `silver.product_pricing` (4,218), `silver.sales_reps` (30), `silver.territory_assignments` (30). All 100% DQ pass on real-dated source. Remaining 3: `silver.inventory_snapshot`, `silver.order_status_log`, `silver.customer_addresses` (chunk 4). |
 | notebooks/gold/ | **11/12 dims+facts done (S8 + S9.5 + S10).** | All 8 dims live (S8/S9.5/S10). **S10 chunk 3:** `fact_order_line` (12,300 rows = silver.order_lines 1:1, as-of joins to 3 SCD-2 dims with floor-at-earliest fallback, per-channel territory derivation, GST 18% tax, MERGE on `line_id`). `fact_daily_channel_revenue` (Gold→Gold rollup at (date_id, channel_id, category_id, territory_id) grain; units + net_revenue reconcile fact↔rollup exactly). Remaining 1: `fact_inventory_daily` (chunk 4, paired with `silver.inventory_snapshot`). |
-| functions/ | **Stable on FC1 Flex + Logic-App-driven schedule (S9)** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Flex timer trigger doesn't reliably fire from cold — verified via 2 missed scheduled fires. Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m to fit the 189K-row inventory write. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. |
+| functions/ | **Stable on FC1 Flex + Logic-App-driven schedule + S11 cold-start + inventory fixes** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m. **S11 (DECISIONS #61 + #62):** `_connect_with_resume_retry` wraps `pyodbc.connect` to retry on Azure SQL 40613 / HYT00 (cold-DB wake-up); inventory write switched to chunked-per-chunk-commit (10K rows/chunk) with progress logging — both addressing two distinct silent-failure modes that took down 5/10 + 5/11 autonomous fires. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. |
 | scheduler/ (IaC `core/scheduler/`) | **Live (S9)** | Logic App Consumption recurrence trigger (`daily-fire`, 00:30 UTC) → HTTP action POSTing to the Function App admin endpoint with `x-functions-key` from `azurerm_function_app_host_keys.primary_key`. Single source of truth for the daily generator schedule. Cost: effectively Rs.0/mo (1 fire/day << 4,000-action free grant). |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
@@ -474,7 +474,7 @@ the next un-checked chunk at the start of each session.
 
 **End state:** revenue analytics queryable end-to-end via the SQL warehouse.
 
-### Chunk 4 — inventory branch + trailing-edge silver  ⏳ Next (start of S11)
+### Chunk 4 — inventory branch + trailing-edge silver  ⏳ Next (start of S11.2)
 - [ ] `silver.inventory_snapshot` — 1.89M rows, partition discipline matters.
   Dedup on `(product_id, store_id, snapshot_date)`.
 - [ ] `gold.fact_inventory_daily` — as-of join to `dim_product` on
@@ -525,23 +525,30 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   Likely a Flex-specific instrumentation tweak (Python OpenTelemetry mode,
   worker extension, or auto-instrumentation app setting). Investigate when
   observability is needed for Phase 4+ — not blocking Phase 2.
-- **Verify tomorrow's first Logic-App-driven autonomous fire** (2026-05-10
-  00:30 UTC). S9 found the Flex timer wasn't firing at all (2 missed
-  windows), moved scheduling to a Logic App + bumped `functionTimeout` to
-  30 min. Tomorrow's fire is the canonical proof of *both* fixes — it must
-  land May-9 data in **all four** tables (orders, lines, status_log,
-  inventory) within the 30-min window. Check via:
+- **Verify tomorrow's autonomous fire under the S11 fixes** (2026-05-12
+  00:30 UTC, writes 2026-05-11). S11 caught the 5/10 + 5/11 fires both
+  failing at ~15s with SQL 40613 (Azure SQL serverless wake-up) and
+  shipped two distinct fixes (DECISIONS #61 + #62): (a) `_connect_with_resume_retry`
+  helper retries on 40613 + HYT00 with exponential backoff up to ~5 min;
+  (b) inventory write switched to chunked-per-chunk-commit with progress
+  logs, after a manual fire on 5/11 wrote orders+lines+status_log then
+  silently lost 189K inventory rows when the function host killed the
+  Python worker mid-batch. Tomorrow's fire must land 2026-05-11 data in
+  **all four** tables. Check via:
   ```sql
-  SELECT order_date, COUNT(*) AS orders_count, MIN(created_at) AS first_insert_utc
-  FROM velora_oms.orders WHERE order_date='2026-05-09';
+  SELECT order_date, COUNT(*) FROM velora_oms.orders WHERE order_date='2026-05-11' GROUP BY order_date;
+  SELECT COUNT(*) FROM velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-11';
+  SELECT COUNT(*) FROM velora_oms.order_status_log WHERE created_at >= '2026-05-12T00:25:00';
   ```
-  Plus row counts on `velora_oms.order_status_log` (parent date 2026-05-09)
-  and `velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-09'`. If
-  status_log + inventory come up 0 again, the timeout fix wasn't enough —
-  investigate memory pressure on FC1's 2 GB or pyodbc cursor lifecycle.
-  After verifying, **re-run the silver/gold layer** to incorporate May-7,
-  May-8, May-9 data: `run_silver_smoke.py --entity orders|customers` +
-  `run_gold_smoke.py --entity dim_customer`.
+  If inventory still comes up 0, App Insights will now show exactly which
+  chunk it died on (look for `Inventory snapshot: committed N / 189225`
+  trace). At that point investigate gRPC host-worker timeout on Flex or
+  scale to EP1 Premium for inventory step. Fallback today: `scripts/inventory_only.py
+  --date <YYYY-MM-DD>` runs only inventory locally.
+  After verifying, **catch up silver/gold** for 2026-05-07 through whatever
+  the latest source date is: re-run `export_velora_to_landing.py` +
+  bronze ingestion + `run_silver_smoke.py` per entity + `run_gold_smoke.py`
+  per dim/fact (idempotent MERGEs everywhere).
 - **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
   + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
   `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —

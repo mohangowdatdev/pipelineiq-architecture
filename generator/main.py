@@ -30,6 +30,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timezone
 from typing import Dict, Optional
 
@@ -63,6 +64,61 @@ logging.basicConfig(
 logger = logging.getLogger("generator.main")
 
 
+def _connect_with_resume_retry(
+    conn_str: str,
+    max_attempts: int = 12,
+    initial_backoff_s: float = 10.0,
+    max_backoff_s: float = 30.0,
+) -> "pyodbc.Connection":
+    """
+    pyodbc.connect with retry on Azure SQL serverless wake-up errors.
+
+    Azure SQL serverless auto-pauses when idle. On the first connect after
+    pause, two distinct failure modes can fire before the DB is ready:
+
+      1. HYT00 "Login timeout expired" — connect itself times out before
+         the server even responds. Mitigated by `timeout=90` kwarg
+         (DECISIONS #42 / #50 addendum).
+      2. 40613 "Database '<x>' on server '<y>' is not currently available"
+         — TCP+TLS+auth handshake succeeds within ~0.1s, then the server
+         immediately returns this error because it's still warming up.
+         `Connection Timeout` cannot help: the server has already replied.
+         Only application-level retry works. Caused S10 5/10 + 5/11
+         autonomous fires to fail at ~15s after Logic-App-driven invoke.
+
+    Retries up to `max_attempts` times with exponential backoff capped at
+    `max_backoff_s`. Total wall-time budget ≈ 5 min — well inside the
+    30-min function timeout.
+    """
+    import pyodbc as _pyodbc
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _pyodbc.connect(conn_str, timeout=90)
+        except _pyodbc.Error as e:
+            msg = str(e)
+            transient = (
+                "40613" in msg
+                or "is not currently available" in msg
+                or "HYT00" in msg
+                or "Login timeout expired" in msg
+            )
+            if not transient:
+                raise
+            last_err = e
+            if attempt == max_attempts:
+                break
+            backoff = min(initial_backoff_s * (1.5 ** (attempt - 1)), max_backoff_s)
+            logger.warning(
+                "Connect attempt %d/%d hit transient SQL serverless wake-up error "
+                "(%s) — sleeping %.0fs before retry",
+                attempt, max_attempts, msg.split("\n")[0][:160], backoff,
+            )
+            time.sleep(backoff)
+    assert last_err is not None
+    raise last_err
+
+
 def run(
     run_date: date,
     dry_run: bool = False,
@@ -84,13 +140,12 @@ def run(
     Faker.seed(effective_seed)
     fake = Faker(["en_IN"])
 
-    # `timeout=90` sets the ODBC Login Timeout attribute via pyodbc's API.
-    # The connection string's `Connection Timeout=90` keyword is not reliably
-    # honored by ODBC Driver 18 under AAD MSI auth — the default 15s Login
-    # Timeout still fires on cold-start when Azure SQL serverless is paused.
-    # Caused all S5/S6 scheduled 06:00 UTC fires to fail at ~15s with HYT00
-    # `Login timeout expired` — see DECISIONS #42 + S6 incident_log.
-    conn = pyodbc.connect(config.get_connection_string(), timeout=90)
+    # Connect with retry on Azure SQL serverless wake-up errors (40613,
+    # HYT00). See `_connect_with_resume_retry` docstring for the failure
+    # modes — connect-side timeout (HYT00) and post-connect 40613 are
+    # both possible and need distinct handling. Together they covered
+    # every cold-start failure observed in S5/S6/S10 scheduled fires.
+    conn = _connect_with_resume_retry(config.get_connection_string())
     conn.autocommit = False
 
     try:
@@ -344,21 +399,50 @@ def _write_inventory_snapshot(
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
+    # Chunked write with per-chunk commits + progress logs.
+    # On Flex Consumption, the function host has been observed to silently
+    # kill the Python worker mid-`executemany` for the full 189K-row insert,
+    # losing all inventory rows for the day even though main-batch tables
+    # had committed (S11 incident, 2026-05-11). Splitting into committed
+    # chunks of 10K rows means: (a) progress is durable on partial failure,
+    # (b) we get a log line every chunk so the failure point is visible in
+    # App Insights, (c) each individual `executemany` is short enough that
+    # any host-side timeout is unlikely to fire mid-call.
+    logger.info(
+        "Inventory snapshot: starting write of %d rows for date %s "
+        "(chunk size = %d)",
+        len(rows), run_date, 10_000,
+    )
     conn.autocommit = False
-    cursor = conn.cursor()
-    cursor.fast_executemany = True
+    written = 0
     try:
-        batch = config.SQL_INSERT_BATCH_SIZE
-        for i in range(0, len(rows), batch):
-            cursor.executemany(sql, rows[i: i + batch])
-        conn.commit()
+        chunk_size = 10_000
+        for i in range(0, len(rows), chunk_size):
+            cursor = conn.cursor()
+            cursor.fast_executemany = True
+            sub_batch = config.SQL_INSERT_BATCH_SIZE
+            for j in range(0, len(rows[i: i + chunk_size]), sub_batch):
+                cursor.executemany(
+                    sql,
+                    rows[i + j: i + j + sub_batch],
+                )
+            conn.commit()
+            written += min(chunk_size, len(rows) - i)
+            logger.info(
+                "Inventory snapshot: committed %d / %d rows for %s",
+                written, len(rows), run_date,
+            )
     except Exception:
         conn.rollback()
+        logger.exception(
+            "Inventory snapshot failed after %d / %d rows committed for %s",
+            written, len(rows), run_date,
+        )
         raise
     finally:
         conn.autocommit = True
 
-    logger.info("Inventory snapshot: wrote %d rows for date %s", len(rows), run_date)
+    logger.info("Inventory snapshot: completed %d rows for date %s", len(rows), run_date)
     return len(rows)
 
 

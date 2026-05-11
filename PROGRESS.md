@@ -4,10 +4,12 @@
 
 **Phase 0 — Done. Phase 1 — Done. Phase 2 — Bronze 100%. Silver 7/10. Gold
 11/12 (3 SCD-2 dims + 5 static + 1 synthesized + 2 facts). Daily-fire
-orchestration on Logic App + 30-min function timeout (S9). Chunks 1 + 2 + 3
-of the medallion ladder complete (S9.5 + S10). Revenue analytics queryable
-end-to-end via the SQL warehouse. Remaining: 3 trailing-edge Silver +
-`fact_inventory_daily` (chunk 4) + ADF Bicep.**
+orchestration on Logic App + 30-min function timeout (S9) + S11 cold-start
++ chunked-inventory fixes (DECISIONS #61 + #62). Chunks 1 + 2 + 3 of the
+medallion ladder complete (S9.5 + S10). Source DB has 14 real-dated days
+(2026-04-27 → 2026-05-10). Revenue analytics queryable end-to-end via the
+SQL warehouse. Remaining: 3 trailing-edge Silver + `fact_inventory_daily`
+(chunk 4) + ADF Bicep.**
 
 43 Azure resources live. Function App on FC1 Flex Consumption + Logic App
 `pipelineiq-scheduler-dev` for the daily fire (DECISIONS #59).
@@ -669,6 +671,37 @@ now 2 sessions away from the first revenue fact (chunk 2 builds the SCD-2
 dims, chunk 3 lands `fact_order_line`). The chunk-plan section in CLAUDE.md
 is the single document for the next 3 sessions to pick up against — delete
 once chunk 4 lands.
+
+### 2026-05-11 (Session 11.1 — autonomous-fire RCA: SQL 40613 cold-start + silent inventory loss)
+**Objective:** Verify the 2026-05-10 + 2026-05-11 00:30 UTC autonomous fires (the canonical reliability proof from S9). If broken, diagnose + fix top-priority before any chunk-4 work.
+
+**Built:**
+- **`generator/main.py::_connect_with_resume_retry`** — wraps `pyodbc.connect` with retry on Azure SQL serverless wake-up errors. Catches both SQL `40613` ("Database is not currently available") and `HYT00` Login Timeout. Exponential backoff (10s → 30s cap), 12 attempts, ~5-min total budget. Replaces bare `pyodbc.connect(...)` at top of `run()`. DECISIONS #61.
+- **`generator/main.py::_write_inventory_snapshot`** rewrite — inventory write now chunks 189,225 rows into 10K-row commits with per-chunk progress logging (`Inventory snapshot: committed N / 189225 rows for <date>`). Replaces single-batch `executemany` over all rows. DECISIONS #62.
+- **`scripts/inventory_only.py`** — laptop fallback that runs only the inventory write for a given date (bypasses the orders-based idempotency guard). Used to recover the 5/10 inventory after the function lost it.
+- **DECISIONS #61** — pyodbc 40613 retry helper.
+- **DECISIONS #62** — chunked inventory write with per-chunk commits + progress logging.
+- **CLAUDE.md** — pending/carry-over updated to track tomorrow's 2026-05-12 fire as the canonical proof of both fixes; `functions/` and `generator/` module-stability rows updated.
+
+**Worked:**
+- Diagnostic chain ran fast: Logic App run history (both 5/10 + 5/11 fires Succeeded with HTTP 202) ruled out the trigger; App Insights `AppExceptions` at 03:30 UTC immediately showed the SQL 40613 wrapped in `RpcException`. Diagnosis to fix took ~30 min.
+- Local backfill of 5/9 (laptop, ~6 min) + manual function fire for 5/10 (after the 40613 fix landed) proved the cold-start retry works end-to-end. Function wrote orders+lines+status_log+commit cleanly (App Insights "Transaction committed successfully" at 03:25:01).
+- After identifying the silent inventory-loss bug, `scripts/inventory_only.py` recovered 5/10's 189K rows in ~3 min from laptop. Source DB now in canonical end state through 2026-05-10.
+- Function metric trail (CpuPercentage + MemoryWorkingSet at 1-min interval) was load-bearing: showed mem peaked at 673 MB (under 2 GB Flex limit) then dropped to 0 — ruled out OOM as cause of inventory loss. Pointed at host-side worker reaping, hence the chunked-with-commit defensive fix.
+
+**Broke:**
+- **DECISIONS #50 addendum was incomplete.** It identified pyodbc Login Timeout (HYT00) as the cold-start symptom on Y1 Linux Consumption. S11 found the *Flex* cold-start hits a *different* error (40613 — server-side, replied after a successful connect). Both can fire on serverless wake-up; both need application-level retry. Helper now catches both.
+- **Silent inventory loss after main commit (5/11 manual fire).** Function wrote orders + lines + status_log cleanly, then `Transaction committed successfully` at 03:25:01.5 UTC, then nothing. Inventory_5_10 stayed at 0. App Insights had zero exceptions. Function CPU at 1% briefly (worker building 189K rows in memory), then 0% by 03:27 — Python worker terminated cleanly with no signal. Most likely Flex Consumption host reaped the worker mid-`executemany` (single 5+ min synchronous call) or gRPC timeout between host and worker. Not OOM — memory only hit 673 MB. Chunked-per-chunk-commit fix means partial progress survives, and progress logs make the next failure point visible.
+- **`scripts/inventory_only.py` first attempt referenced `config.AZURE_SQL_SERVER`** which doesn't exist (config builds the connection string from env vars directly). Trivial fix.
+
+**Uncertainty:**
+- **Tomorrow's 2026-05-12 00:30 UTC autonomous fire is the canonical proof under both fixes.** It targets 2026-05-11 (a fresh date with no idempotency-guard short-circuit). Must land orders + lines + status_log + 189,225 inventory rows within 30-min timeout. If inventory comes up partial, App Insights will now show exactly which chunk it died on.
+- **Root cause of the function host killing the worker mid-inventory still unidentified.** Chunked-with-commit is a defensive fix that turns a silent-fail into a visible-fail-with-partial-progress. Future deep-dive: is it gRPC `MaxMessageSize`? Flex worker idle reaping? Some pyodbc cursor lifecycle thing? Investigate if even chunked writes show worker death; otherwise leave as known-but-mitigated.
+- **`scripts/inventory_only.py` is a temporary ops crutch.** Once the chunked function fire is proven reliable, the script can be deleted (or kept as the `--force` re-seed path).
+
+**Next:** Session 11.2 = (1) verify 2026-05-12 00:30 UTC fire end-to-end; (2) if green, catch up silver/gold for 2026-05-07 → 2026-05-11; (3) start chunk 4 (`silver.inventory_snapshot` + `gold.fact_inventory_daily` + 2 trailing-edge silvers). Half-session split avoids burning a full session number on bug-fix-only work, same convention as S9.5.
+
+**Summary:** S11.1 was meant to verify orchestration then start chunk 4 — became a half-session of root-cause-and-fix on two distinct silent-failure modes that the S9 Logic-App + 30-min-timeout fix did NOT address. Net result: function now retries on both Azure SQL serverless cold-start signatures (40613 + HYT00), and inventory writes are durable on partial failure with per-chunk progress logs. Source DB caught up to 14 days continuous (Apr 27 → May 10) via laptop backfill of 5/9 + manual function fire for 5/10 + laptop inventory recovery for 5/10. Chunk 4 deferred to S11.2 (same session number — bug-fix work doesn't earn a full session bump, S9.5 convention). Starting S11.2 with verifiable autonomous orchestration is worth more than starting chunk 4 against a still-broken pipeline. Repos to push: architecture (`generator/main.py`, `scripts/inventory_only.py`, `CLAUDE.md`, `DECISIONS.md`, `PROGRESS.md`).
 
 ### 2026-05-09 (Session 9 — daily-fire reliability: data restore + Logic App + function timeout)
 **Objective:** Verify that the 2026-05-08 00:30 UTC autonomous fire (the cron-reliability proof loose-end from S7) actually landed before starting S9 medallion work. It hadn't — and the diagnostic chain that followed turned the whole session into orchestration-reliability work.
