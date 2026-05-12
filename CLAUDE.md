@@ -194,11 +194,11 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | **Real-dated + guarded (S6) + 40613-resilient (S11)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. DECISIONS #62 (S11): chunked inventory write w/ per-chunk commits. Source DB has 14 real-dated days Apr 27 → May 10, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. `scripts/inventory_only.py --date YYYY-MM-DD` is the laptop fallback for inventory-only writes when the function fire dropped inventory. |
+| generator/ | **Real-dated + guarded (S6) + 40613-resilient (S11)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. DECISIONS #62 (S11): chunked inventory write w/ per-chunk commits. Source DB has 15 real-dated days Apr 27 → May 11, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. `scripts/inventory_only.py --date YYYY-MM-DD` is the laptop fallback for inventory-only writes when the function fire dropped inventory. |
 | notebooks/bronze/ | **All 12 entities hydrated (S7 + S9.5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). 10 main entities (~1.9M rows) + 2 static seeds added in S9.5: `bronze.default.product_categories` (35 rows) + `bronze.default.stores` (45 rows). DECISIONS #60. |
 | notebooks/silver/ | **All 10 tables done (S8 + S9.5 + S11.2).** | All 10 silvers live with 100% DQ pass on real-dated source through 2026-05-10. Counts: `orders` (~4.5K), `customers` (~340), `order_lines` (~18K), `products` (4,205), `product_pricing` (4,218), `sales_reps` (30), `territory_assignments` (30), `inventory_snapshot` (2,648,025 — partitioned by `snapshot_date` per DECISIONS #63), `order_status_log` (11,694, allows `RETURN_INITIATED` per DECISIONS #64), `customer_addresses` (339, every customer has 1 primary). |
-| notebooks/gold/ | **All 12 dims+facts done (S8 + S9.5 + S10 + S11.2).** | All 8 dims live + 3 facts. **S11.2 chunk 4:** `fact_inventory_daily` (2,648,025 rows = silver.inventory_snapshot 1:1; as-of join to dim_product on snapshot_date with floor-at-earliest; 7-day rolling-avg `days_of_stock_remaining` with <7-day-history NULL per DECISIONS #65; silver↔gold reconcile exactly on closing_stock + units_sold). Phase 2 medallion **fully complete**. |
-| functions/ | **Stable on FC1 Flex + Logic-App-driven schedule + S11 cold-start + inventory fixes** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m. **S11 (DECISIONS #61 + #62):** `_connect_with_resume_retry` wraps `pyodbc.connect` to retry on Azure SQL 40613 / HYT00 (cold-DB wake-up); inventory write switched to chunked-per-chunk-commit (10K rows/chunk) with progress logging — both addressing two distinct silent-failure modes that took down 5/10 + 5/11 autonomous fires. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. |
+| notebooks/gold/ | **All 12 dims+facts done (S8 + S9.5 + S10 + S11.2 + S12 catch-up).** | 9 dims + 3 facts live. **S12 update:** `dim_order_status` extended from 6 → 7 rows with `RETURN_INITIATED` (closes DECISIONS #64 gap). 5/11 caught up end-to-end: `fact_order_line` 19,352, `fact_inventory_daily` 2,837,250 (silver↔gold reconcile exactly), `dim_customer` 407 (SCD-2 grew from 339), `dim_product` 4,223 (SCD-2 grew with 5 new price-change rows). Phase 2 medallion **fully complete**. |
+| functions/ | **Stable on FC1 Flex + Logic-App schedule + S11 cold-start/inventory fixes + S12 telemetry** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m. **S11 (DECISIONS #61 + #62):** `_connect_with_resume_retry` retries on 40613/HYT00; inventory write chunked at 10K rows/chunk with per-chunk commit + progress logging. **S12 (DECISIONS #66):** `azure-monitor-opentelemetry` SDK init in `generator/main.py` so user-code `logger.info` calls reach LA `AppTraces` (workspace-backed AI, not classic). Function App diagnostic settings → `pipelineiq-logs-dev` for platform-side `FunctionAppLogs`. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. **2026-05-12 fire partial:** orders/lines/status_log clean, inventory died at 20K/189K — recovered via laptop AAD-token script. Next fire (2026-05-13) is the canonical proof under all 3 fixes. |
 | scheduler/ (IaC `core/scheduler/`) | **Live (S9)** | Logic App Consumption recurrence trigger (`daily-fire`, 00:30 UTC) → HTTP action POSTing to the Function App admin endpoint with `x-functions-key` from `azurerm_function_app_host_keys.primary_key`. Single source of truth for the daily generator schedule. Cost: effectively Rs.0/mo (1 fire/day << 4,000-action free grant). |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
@@ -454,63 +454,66 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
 - ~~Tier 4.6 Azure Functions app~~ **Done (S5 addendum, 2026-05-01; migrated to FC1
   Flex Consumption in S6, 2026-05-06).** Function App `pipelineiq-functions-dev`
   live on FC1. See DECISIONS #50 + #51 + `core/functions/` IaC module.
-- **App Insights telemetry not flowing on Flex Consumption.** The Function
-  executes (proven via `velora_oms` side-effects) but `requests` / `traces` /
-  `exceptions` tables in App Insights stay empty. Was also broken on Y1.
-  Likely a Flex-specific instrumentation tweak (Python OpenTelemetry mode,
-  worker extension, or auto-instrumentation app setting). Investigate when
-  observability is needed for Phase 4+ — not blocking Phase 2.
-- **Verify tomorrow's autonomous fire under the S11 fixes** (2026-05-12
-  00:30 UTC, writes 2026-05-11). S11 caught the 5/10 + 5/11 fires both
-  failing at ~15s with SQL 40613 (Azure SQL serverless wake-up) and
-  shipped two distinct fixes (DECISIONS #61 + #62): (a) `_connect_with_resume_retry`
-  helper retries on 40613 + HYT00 with exponential backoff up to ~5 min;
-  (b) inventory write switched to chunked-per-chunk-commit with progress
-  logs, after a manual fire on 5/11 wrote orders+lines+status_log then
-  silently lost 189K inventory rows when the function host killed the
-  Python worker mid-batch. Tomorrow's fire must land 2026-05-11 data in
-  **all four** tables. Check via:
+- ~~App Insights telemetry not flowing on Flex Consumption~~ **Resolved (S12, DECISIONS #66).**
+  The original diagnosis was wrong — AI is workspace-backed, so data was in LA tables
+  `AppTraces` / `AppRequests` / `AppExceptions` all along, not the classic AI
+  tables that `az monitor app-insights query` hits. S12 also added
+  `azure-monitor-opentelemetry` SDK init in `generator/main.py` for clean
+  structured logging + Function App diagnostic settings → `pipelineiq-logs-dev`
+  for platform-side `FunctionAppLogs`. **Query path:** use Log Analytics on
+  `pipelineiq-logs-dev` workspace (KQL on `AppTraces` etc), not classic AI CLI.
+- **Verify the 2026-05-13 00:30 UTC autonomous fire** (writes 2026-05-12) —
+  the first fire under both the S11 fixes (#61 + #62) **and** the S12 telemetry
+  fix (#66). Previous fire (2026-05-12, writing 5/11) cold-start retry worked
+  (orders + lines + status_log committed cleanly) but inventory partial-died
+  at exactly 20,000 / 189,225 rows — same host-worker-kill bug as 5/11 manual
+  fire. With #66 in place, `AppTraces` should now show every 10K chunk-commit
+  trace, pinpointing the death point if it fires again. Check via:
   ```sql
-  SELECT order_date, COUNT(*) FROM velora_oms.orders WHERE order_date='2026-05-11' GROUP BY order_date;
-  SELECT COUNT(*) FROM velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-11';
-  SELECT COUNT(*) FROM velora_oms.order_status_log WHERE created_at >= '2026-05-12T00:25:00';
+  -- on velora_oms
+  SELECT order_date, COUNT(*) FROM velora_oms.orders WHERE order_date='2026-05-12' GROUP BY order_date;
+  SELECT COUNT(*) FROM velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-12';
+  SELECT COUNT(*) FROM velora_oms.order_status_log WHERE created_at >= '2026-05-13T00:25:00';
   ```
-  If inventory still comes up 0, App Insights will now show exactly which
-  chunk it died on (look for `Inventory snapshot: committed N / 189225`
-  trace). At that point investigate gRPC host-worker timeout on Flex or
-  scale to EP1 Premium for inventory step. Fallback today: `scripts/inventory_only.py
-  --date <YYYY-MM-DD>` runs only inventory locally.
-  After verifying, **catch up silver/gold** for 2026-05-07 through whatever
-  the latest source date is: re-run `export_velora_to_landing.py` +
-  bronze ingestion + `run_silver_smoke.py` per entity + `run_gold_smoke.py`
-  per dim/fact (idempotent MERGEs everywhere).
+  And in LA workspace (NOT classic AI):
+  ```kusto
+  AppTraces
+  | where TimeGenerated between (datetime(2026-05-13T00:25:00Z)..datetime(2026-05-13T01:00:00Z))
+  | where Message has 'Inventory' or Message has 'committed' or Message has 'generator'
+  | project TimeGenerated, SeverityLevel, Message
+  | order by TimeGenerated asc
+  ```
+  If inventory comes up partial again, look for the last `Inventory snapshot:
+  committed N / 189225 rows` trace — that's the diagnostic gain. Then
+  investigate gRPC host-worker timeout on Flex or scale to EP1 Premium.
+  Laptop fallback: ad-hoc AAD-token recovery script (S12 inlined to `/tmp` —
+  worth promoting to a real `scripts/recover_inventory.py` with AAD auth if
+  this fires again).
 - **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
   + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
   `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —
   the scaffold script is a reasonable substitute until Tier 6 lands.
-- **`docs/runbooks/databricks_account_admin_bootstrap.md` step 5 verification path
-  is slightly stale.** The runbook says "click avatar → Manage Account should be
-  visible" but Databricks's newer UI doesn't surface a literal "Manage Account" link.
-  Working verification: open `https://accounts.azuredatabricks.net` directly as the
-  promoted user; if the sidebar shows Workspaces / User management / Cloud Resources,
-  the role is active. Update the runbook on next touch.
+- ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
+- **`scripts/inventory_only.py` needs AAD auth mode in `generator/config.py`.**
+  Currently the script imports `config.get_connection_string()` which only
+  supports `password` (laptop) or `msi` (function). On laptop without
+  `AZURE_SQL_PASSWORD` it fails. S12 sidestepped via inline AAD-token script.
+  Cleanup: add `aad` mode to `config.py` that uses `DefaultAzureCredential`
+  + ODBC token attr (`SQL_COPT_SS_ACCESS_TOKEN=1256`). Low priority.
 - **Portal Preview + Development env vars** (2026-04-21 S2). Only Production has
   `AZURE_OPENAI_API_KEY` in Vercel — CLI blocked Preview on branch-scoping and
   Development on the `--sensitive` flag. Dashboard overrides both. Not blocking
   the live site; finish via dashboard if/when PR previews or `vercel dev` are
   needed.
-- **Repos belong on `mohangowdatdev` (personal portfolio); `mohangowdat-sail` is
-  the future company-handoff destination, not the canonical home.** PipelineIQ
-  is the user's personal pet project — `mohangowdatdev` is the primary GitHub
-  account it should live under. Currently the 3 repos
-  (`pipelineiq-architecture`, `pipelineiq-iac`, `pipelineiq-portal`) sit on
-  `mohangowdat-sail`; that's a temporary state. Migration plan: transfer all 3
-  repos to `mohangowdatdev` (both identities already authenticated locally),
-  update local `git remote set-url`. Push to `mohangowdat-sail` only happens
-  later as a one-time handoff with company-side customisations layered in. Not
-  a DECISIONS-log item per user instruction — just a carry-over. Trigger is
-  user's call, not "wait for architecture stable" — the user can flip it
-  anytime.
+- **Repos live on `mohangowdatdev` (personal portfolio); `mohangowdat-sail` is
+  the future one-time company-handoff destination.** PipelineIQ is the user's
+  personal pet project. All 3 repos (`pipelineiq-architecture`,
+  `pipelineiq-iac`, `pipelineiq-portal`) are already on `mohangowdatdev` as of
+  S11.2 — verified via `git remote -v` in S12. Future step: a one-time push to
+  `mohangowdat-sail` with company-side customisations layered in. Trigger is
+  user's call — not "wait for architecture stable". Not a DECISIONS-log item
+  per user instruction — just a carry-over so future sessions don't
+  re-litigate the org choice.
 
 ---
 

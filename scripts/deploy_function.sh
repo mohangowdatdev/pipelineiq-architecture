@@ -34,6 +34,7 @@ cp "$REPO_ROOT/generator/host.json" "$STAGE_DIR/host.json"
 cat > "$STAGE_DIR/requirements.txt" <<'PY'
 azure-functions>=1.18.0
 azure-identity>=1.15.0
+azure-monitor-opentelemetry>=1.6.0
 pyodbc>=5.0.0
 numpy>=1.26.0
 pandas>=2.2.0

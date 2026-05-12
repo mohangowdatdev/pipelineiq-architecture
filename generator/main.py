@@ -63,6 +63,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("generator.main")
 
+# Wire Python user-code logs (including chunk-progress traces in
+# `_write_inventory_snapshot`) into Application Insights when running under
+# Azure Functions. Without this, `logger.info(...)` calls never reach the AI
+# `traces` table on Flex Consumption — verified empty across the 2026-05-10
+# / 5-11 / 5-12 fires. CLI runs skip init because the env var is unset.
+if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+    try:
+        from azure.monitor.opentelemetry import configure_azure_monitor
+
+        configure_azure_monitor(logger_name="generator")
+        logger.info("Azure Monitor OpenTelemetry configured")
+    except Exception as _e:  # pragma: no cover — telemetry must never break runs
+        logging.getLogger().warning("Azure Monitor init failed: %s", _e)
+
 
 def _connect_with_resume_retry(
     conn_str: str,

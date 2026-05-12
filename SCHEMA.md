@@ -216,8 +216,8 @@ order_id        NVARCHAR(36)  PK
 customer_id     NVARCHAR(36)  FK -> velora_crm.customers
 channel_type    NVARCHAR(20)  -- 'D2C' | 'B2B' | 'STORE'
 order_date      DATE
-status          NVARCHAR(30)  -- 'PENDING'|'PROCESSING'|'SHIPPED'|
-                              --  'DELIVERED'|'CANCELLED'|'RETURNED'
+status          NVARCHAR(30)  -- 'PENDING'|'PROCESSING'|'SHIPPED'|'DELIVERED'|
+                              --  'CANCELLED'|'RETURN_INITIATED'|'RETURNED'
 store_id        NVARCHAR(20)  NULL (only for STORE channel)
 rep_id          NVARCHAR(36)  NULL (only for B2B channel)
 total_amount    DECIMAL(12,2)
@@ -893,11 +893,14 @@ _gold_timestamp     TIMESTAMP
 
 ### gold.dim_order_status
 
-SCD Type 0 (static). 6 hardcoded rows in the Gold notebook covering the
-known status set.
+SCD Type 0 (static). 7 hardcoded rows in the Gold notebook — 6 terminal/active
+states plus `RETURN_INITIATED`, the transitional state the generator emits
+between DELIVERED and RETURNED (DECISIONS #64). Mirrors the valid-status
+set enforced by `silver.order_status_log` so a future
+`fact_order_status_transitions` has a clean FK target.
 
 ```
-status_id           STRING    PK    -- matches velora_oms.orders.status values
+status_id           STRING    PK    -- matches velora_oms.orders.status values + RETURN_INITIATED
 status_name         STRING
 status_category     STRING          -- 'ACTIVE' | 'CLOSED' | 'EXCEPTION'
 sort_order          INT
@@ -906,12 +909,13 @@ _gold_timestamp     TIMESTAMP
 ```
 
 Hardcoded values:
-- `PENDING`     / Pending           / ACTIVE    / 1
-- `PROCESSING`  / Processing        / ACTIVE    / 2
-- `SHIPPED`     / Shipped           / ACTIVE    / 3
-- `DELIVERED`   / Delivered         / CLOSED    / 4
-- `CANCELLED`   / Cancelled         / EXCEPTION / 5
-- `RETURNED`    / Returned          / EXCEPTION / 6
+- `PENDING`          / Pending          / ACTIVE    / 1
+- `PROCESSING`       / Processing       / ACTIVE    / 2
+- `SHIPPED`          / Shipped          / ACTIVE    / 3
+- `DELIVERED`        / Delivered        / CLOSED    / 4
+- `CANCELLED`        / Cancelled        / EXCEPTION / 5
+- `RETURN_INITIATED` / Return Initiated / EXCEPTION / 6
+- `RETURNED`         / Returned         / EXCEPTION / 7
 
 ### gold.dim_date
 

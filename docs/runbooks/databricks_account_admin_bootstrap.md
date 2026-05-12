@@ -90,24 +90,26 @@ Terraform.
 
 ## Sanity check from the target user's side
 
-After the admin completes step 4, the newly-promoted user should:
+After the admin completes step 4, the newly-promoted user should
+open the account console directly (the in-workspace "Manage Account"
+shortcut is not surfaced by the current Databricks UI):
 
 ```bash
-# open the workspace in a normal browser
-open https://adb-7405617631498102.2.azuredatabricks.net
+# open the account console in a normal browser
+open https://accounts.azuredatabricks.net
 ```
 
-Sign in as `mohan.gowda@SailAnalyticsAP.onmicrosoft.com`. Click the
-email avatar in the top-right corner. **"Manage Account"** should now
-be visible as a menu item. Clicking it should take you into the
-account console with full admin rights.
+Sign in as `mohan.gowda@SailAnalyticsAP.onmicrosoft.com`. If the
+sidebar shows **Workspaces / User management / Cloud Resources**,
+the Account Admin role is active. That sidebar is gated to account
+admins — a non-admin sees only their workspace picker.
 
-If "Manage Account" does not appear:
+If the sidebar shows only a workspace picker (no admin sections):
 
 - Check that the invite was accepted — the user may need to accept an
   email invitation before the role takes effect
 - Confirm the role toggle is actually on in the account console
-- Wait 1–2 minutes for role propagation, refresh the workspace page
+- Wait 1–2 minutes for role propagation, then reload the page
 
 ---
 

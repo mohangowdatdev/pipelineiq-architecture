@@ -214,19 +214,24 @@ write_dim(df_dim_channel, dim_channel_tbl, "channel_id")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. `dim_order_status` — 6 hardcoded rows
+# MAGIC ## 3. `dim_order_status` — 7 hardcoded rows
 # MAGIC
-# MAGIC Matches the 6 known `velora_oms.orders.status` values per SCHEMA.md.
+# MAGIC 6 terminal/active states from SCHEMA.md plus `RETURN_INITIATED` —
+# MAGIC the transitional state generator emits between DELIVERED and
+# MAGIC RETURNED (DECISIONS #64). Silver.order_status_log allows all 7;
+# MAGIC dim_order_status mirrors that so future fact_order_status_transitions
+# MAGIC has a clean FK target.
 
 # COMMAND ----------
 
 status_rows = [
-    Row(status_id="PENDING",    status_name="Pending",    status_category="ACTIVE",    sort_order=1),
-    Row(status_id="PROCESSING", status_name="Processing", status_category="ACTIVE",    sort_order=2),
-    Row(status_id="SHIPPED",    status_name="Shipped",    status_category="ACTIVE",    sort_order=3),
-    Row(status_id="DELIVERED",  status_name="Delivered",  status_category="CLOSED",    sort_order=4),
-    Row(status_id="CANCELLED",  status_name="Cancelled",  status_category="EXCEPTION", sort_order=5),
-    Row(status_id="RETURNED",   status_name="Returned",   status_category="EXCEPTION", sort_order=6),
+    Row(status_id="PENDING",          status_name="Pending",          status_category="ACTIVE",    sort_order=1),
+    Row(status_id="PROCESSING",       status_name="Processing",       status_category="ACTIVE",    sort_order=2),
+    Row(status_id="SHIPPED",          status_name="Shipped",          status_category="ACTIVE",    sort_order=3),
+    Row(status_id="DELIVERED",        status_name="Delivered",        status_category="CLOSED",    sort_order=4),
+    Row(status_id="CANCELLED",        status_name="Cancelled",        status_category="EXCEPTION", sort_order=5),
+    Row(status_id="RETURN_INITIATED", status_name="Return Initiated", status_category="EXCEPTION", sort_order=6),
+    Row(status_id="RETURNED",         status_name="Returned",         status_category="EXCEPTION", sort_order=7),
 ]
 df_dim_status = spark.createDataFrame(status_rows)
 write_dim(df_dim_status, dim_status_tbl, "status_id")
