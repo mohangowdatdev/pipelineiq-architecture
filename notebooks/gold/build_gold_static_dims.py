@@ -221,6 +221,14 @@ write_dim(df_dim_channel, dim_channel_tbl, "channel_id")
 # MAGIC RETURNED (DECISIONS #64). Silver.order_status_log allows all 7;
 # MAGIC dim_order_status mirrors that so future fact_order_status_transitions
 # MAGIC has a clean FK target.
+# MAGIC
+# MAGIC **Sort-order policy for future state additions:** sort_order is
+# MAGIC for display ordering only. When adding new transient states
+# MAGIC (e.g. `PARTIAL_SHIPMENT` between SHIPPED and DELIVERED), re-number
+# MAGIC the existing rows so the workflow stays in logical order. The
+# MAGIC `write_dim` MERGE updates sort_order on match (`UPDATE SET *`), so
+# MAGIC re-numbering is free — no gaps reserved upfront. status_id is the
+# MAGIC NK / stable identifier; sort_order is the renumbering variable.
 
 # COMMAND ----------
 

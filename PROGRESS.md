@@ -19,7 +19,7 @@
 | Landing (ADLS Parquet) | ✅ Up to date | 5 by-date partitions for orders + inventory; full snapshot per other entity through 2026-05-11. |
 | Bronze (Delta) | ✅ 12/12 tables | Append-only. Entity-agnostic ingest. Re-ingested 8 entities for 5/11 in S12. |
 | Silver (Delta) | ✅ 10/10 tables | 100% DQ pass everywhere. `inventory_snapshot` at 2,837,250 rows; `order_lines` 19,352; `orders` 5,758. |
-| Gold dims | ✅ 9/9 dims | 3 SCD-2, 1 synthesized, 5 static. **`dim_order_status` now 7 rows incl. `RETURN_INITIATED`** (S12, DECISIONS #64 follow-through). |
+| Gold dims | ✅ 9/9 dims (1 known bug) | 3 SCD-2, 1 synthesized, 5 static. **`dim_order_status` now 7 rows incl. `RETURN_INITIATED`** (S12, DECISIONS #64 follow-through). ⚠ **S12 spot-check found SCD-2 `valid_from` bug** — 51/407 rows in `dim_customer` have duplicate surrogate_keys because CHANGED rows reuse OLD `valid_from`. Fix deferred to S13 (DECISIONS #67). |
 | Gold facts | ✅ 3/3 facts | `fact_order_line` 19,352 (1:1 silver), `fact_daily_channel_revenue` 5,436, `fact_inventory_daily` 2,837,250 (1:1 silver). |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
@@ -88,31 +88,36 @@ to 7 rows; `velora_oms.orders.status` enum updated to include RETURN_INITIATED.
 
 ## Next task
 
-**Session 13 = pick one of:**
+**Session 13 priority order:**
 
 1. **Verify 2026-05-13 00:30 UTC autonomous fire end-to-end** (writes
    2026-05-12). With S12's telemetry fix in place, this is the first
    fire that will produce queryable chunk-progress logs in `AppTraces`.
    Expected: orders + lines + status_log + 189,225 inventory rows. If
    inventory still partial-commits, `AppTraces` will now show exactly
-   which 10K chunk the worker died on — that's the diagnostic that was
-   blocked until S12.
+   which 10K chunk the worker died on.
 
-2. **Tier 6 ADF (Bicep)** — replace `scripts/export_velora_to_landing.py`
-   with a real ADF pipeline. Linked services (SQL, ADLS, KV, Databricks) +
-   parameterised datasets + copy pipeline `velora_oms.*` → `landing/`.
-   Not blocking dev but the scaffold script is technical debt.
+2. **Fix the SCD-2 `valid_from` bug** found in S12 spot-check (DECISIONS #67).
+   `notebooks/gold/build_gold_dim_customer.py` step 6 reuses the OLD
+   `valid_from` (= earliest-activity-date per DECISIONS #53) when inserting
+   the NEW version of a CHANGED customer — should use change-detection
+   date (e.g. `_silver_timestamp::date` of the silver MERGE batch, or
+   `current_date()`). 51 of 407 rows in `dim_customer` currently have
+   duplicate `xxhash64(customer_id, valid_from)` surrogate keys. Likely
+   same bug in `dim_product` + `dim_sales_rep`. Fix:
+   - Clarify DECISIONS #53 to split the rule: FIRST-EVER row → earliest
+     activity; NEW version on CHANGED → change-detection date
+   - Patch step 6 in all 3 dim notebooks
+   - Re-run idempotent MERGE on the 3 dims (old SKs UPDATE, new SKs INSERT)
+   - Update SCHEMA.md "Conventions for all Gold tables"
+   - Re-verify with a corrected overlap check (use row position or `<>`,
+     not `sk_a < sk_b` — that masks identical-SK pairs)
 
-3. **Start Phase 3 (failure injection + incident store).** `failure_injector.py`
-   is written but unverified end-to-end. DECISIONS #43 already pivoted the
-   architectural home of failure injection from generator to landing layer,
-   so the work is: write `scripts/inject_failure_to_landing.py` for the 6
-   scenarios + `pipeline_exec_log` + `incident_store` schemas.
-
-**Default recommendation:** option 1 first (cheap, validates S12's
-telemetry fix), then option 3 (the next big phase). Option 2 (ADF Bicep)
-can wait until Phase 3 is dogfooded with failure scenarios — better to
-know the failure pipeline shape before automating extraction.
+3. **Tier 6 ADF (Bicep)** OR **start Phase 3 (failure injection)** — pick
+   one. Tier 6 replaces `scripts/export_velora_to_landing.py` with a real
+   ADF pipeline. Phase 3 is the architectural meat: failure injection +
+   incident store + AI RCA. Default: Phase 3 first since Tier 6 is
+   operational debt that doesn't unblock the product narrative.
 
 ### Carry-over: 2026-05-13 autonomous-fire checklist
 
@@ -454,10 +459,10 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 
 **Uncertainty:**
 - **Root cause of the Flex host killing the worker mid-inventory still unidentified.** The chunked-with-commit defense (#62) plus telemetry (#66) means the next failure will show exactly which 10K chunk dies. Hypothesis to revisit if it dies again: gRPC `MaxMessageSize` between host and Python worker, or Flex worker-idle-reaping despite active CPU. May need EP1 Premium fallback if Flex truly can't sustain 5+ min synchronous Python work — but proving it requires the failure to manifest with telemetry first.
-- **`dim_customer` SCD-2 growth** from 339 → 407 = +68 new versions. Confirms generator's segment/city update rate is in the expected band; not anomalous but worth a future spot-check that the SCD timeline is correct (i.e., per-customer versions have non-overlapping `valid_from` / `valid_to`).
+- ~~`dim_customer` SCD-2 growth~~ **Spot-checked at S12 wrap (post-original-write).** 407 rows / 356 distinct customers / 305 × 1-version + 51 × 2-version. Found a real SCD-2 `valid_from` bug — 51/407 rows have duplicate `surrogate_key` because CHANGED rows reuse the OLD `valid_from` (= earliest-activity-date) for the NEW version instead of using the change-detection date. Close-out logic is correct, but fact joins via `xxhash64(NK, valid_from)` may attribute to the wrong dim version for these 51 customers. Same convention used in `dim_product` + `dim_sales_rep` — likely same bug. Tracked in CLAUDE.md pending/carry-overs + DECISIONS #67. **Fix deferred to S13** — focused session for the 3 dim notebooks + DECISIONS #53 rule clarification + SCHEMA.md update + re-verify.
 - **Duplicate logs in AppTraces** (each `logger.info` appears twice due to OT handler + runtime root handler). Cosmetic. Fix would be `logging.getLogger("generator").propagate = False` after `configure_azure_monitor` — but deferred to avoid another deploy round-trip.
 
-**Next:** Session 13 = (1) verify 2026-05-13 00:30 UTC autonomous fire end-to-end with the new chunk-progress traces in AppTraces; (2) Tier 6 ADF Bicep OR start Phase 3 (failure injection). Default recommendation: option 1 first (proves S12 telemetry), then Phase 3.
+**Next:** Session 13 = (1) verify 2026-05-13 00:30 UTC autonomous fire end-to-end with the new chunk-progress traces in AppTraces; (2) **fix the SCD-2 `valid_from` bug in dim_customer + verify dim_product + dim_sales_rep + clarify DECISIONS #53 rule** (DECISIONS #67 — found in S12 spot-check); (3) Tier 6 ADF Bicep OR start Phase 3 (failure injection). Default recommendation: option 1 first (proves S12 telemetry), option 2 next (real correctness bug, blocks honest per-customer trend analysis), then Phase 3.
 
 **Summary:** S12 was a "carry-over cleanup" session that turned into a meaningful observability win + one fresh data point on the Flex host-worker-kill. All 4 carry-overs closed: telemetry now flows (and we know AI is workspace-backed, not classic-AI — corrects a misdiagnosis carried since Phase 0); `dim_order_status` now mirrors the 7-state silver set; runbook step 5 reflects the current UI; CLAUDE.md repo-org note no longer lies. 5/11 fully integrated into silver/gold (2,837,250 inventory rows reconcile exactly silver↔gold). Tomorrow's 5/13 fire is the canonical reliability+telemetry proof together. Repos to push: architecture (5 files: requirements.txt, deploy_function.sh, main.py, build_gold_static_dims.py, SCHEMA.md, runbook, CLAUDE.md, PROGRESS.md, DECISIONS.md) + IaC (core/functions/main.tf).
 

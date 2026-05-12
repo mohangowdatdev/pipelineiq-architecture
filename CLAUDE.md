@@ -500,6 +500,33 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   `AZURE_SQL_PASSWORD` it fails. S12 sidestepped via inline AAD-token script.
   Cleanup: add `aad` mode to `config.py` that uses `DefaultAzureCredential`
   + ODBC token attr (`SQL_COPT_SS_ACCESS_TOKEN=1256`). Low priority.
+- **SCD-2 `valid_from` bug for CHANGED rows in `dim_customer`** (S12 spot-check
+  finding). 51 of 407 rows (12.5%) have a duplicate `surrogate_key` — the same
+  `xxhash64(customer_id, valid_from)` value is used for both the closed-out
+  version AND the new version of the same customer, because the notebook
+  reuses the **original** `valid_from` (= earliest-activity-date per
+  DECISIONS #53) for the NEW version of a CHANGED row instead of using the
+  change-detection date. Close-out logic is correct (`valid_to = change_date - 1`,
+  `is_current = false`) and the version-count distribution looks healthy
+  (305 × 1 + 51 × 2, no 3+), but fact joins to `dim_customer` via
+  `xxhash64(customer_id, valid_from)` may attribute revenue to the wrong
+  version for these 51 customers. **Likely the same bug in `dim_product`
+  and `dim_sales_rep`** (same SCD-2 convention per DECISIONS #52 + #57).
+  Fix: in `notebooks/gold/build_gold_dim_customer.py` step 6 (and equivalent
+  in dim_product / dim_sales_rep), use `current_date()` or the
+  `_silver_timestamp::date` of the change-detection batch as `valid_from`
+  for NEW-action rows on CHANGED customers, NOT the earliest-activity-date
+  rule (which is only correct for FIRST-EVER rows). Then re-run the 3 dim
+  notebooks (idempotent MERGEs — old surrogate_keys get UPDATE-SET, new
+  ones get INSERT). Also fix the buggy overlap check (uses `sk_a < sk_b`,
+  filters out identical-SK pairs — should use `<>` or row-position). S13
+  candidate.
+- **Cosmetic: each user log appears twice in `AppTraces`** (OT handler
+  attached by `configure_azure_monitor` + the Functions runtime's root
+  handler both forward). Doesn't affect debuggability. Fix:
+  `logging.getLogger("generator").propagate = False` right after
+  `configure_azure_monitor()` in `generator/main.py`. Defer to the next
+  generator deploy round-trip — not worth a deploy on its own.
 - **Portal Preview + Development env vars** (2026-04-21 S2). Only Production has
   `AZURE_OPENAI_API_KEY` in Vercel — CLI blocked Preview on branch-scoping and
   Development on the `--sensitive` flag. Dashboard overrides both. Not blocking

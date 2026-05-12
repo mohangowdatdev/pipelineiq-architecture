@@ -917,6 +917,13 @@ Hardcoded values:
 - `RETURN_INITIATED` / Return Initiated / EXCEPTION / 6
 - `RETURNED`         / Returned         / EXCEPTION / 7
 
+**Sort-order policy:** `sort_order` is for display ordering only —
+`status_id` is the stable NK. When adding new transient states
+(e.g. `PARTIAL_SHIPMENT` between SHIPPED and DELIVERED), re-number the
+existing rows so the workflow stays in logical order. The `write_dim`
+MERGE updates `sort_order` on match (`UPDATE SET *`), so re-numbering
+is free — no reserved gaps needed.
+
 ### gold.dim_date
 
 SCD Type 0 (static). Generated once for `2020-01-01` → `2030-12-31` by a
