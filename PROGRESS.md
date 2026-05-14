@@ -88,25 +88,71 @@ to 7 rows; `velora_oms.orders.status` enum updated to include RETURN_INITIATED.
 
 ## Next task
 
-**Session 14 priority order:**
+**Session 14 priority order (confirmed at S13 wrap):**
 
 1. **Verify the 2026-05-15 00:30 UTC autonomous fire end-to-end** (writes
-   2026-05-14). This is the canonical proof under all 3 S13 changes:
-   timer disabled (no race), inventory chunk_size 10K → 5K, per-sub-batch
-   gRPC keepalive logging. Expected: orders + lines + status_log + **189,225
-   inventory rows in 38 chunk-commits** (instead of the historical 19 ×
-   10K commits, since chunk_size halved). If inventory STILL partial-dies
-   at 20K (or any N×5K), the 3-pronged S13 mitigation didn't fix the root
-   cause — escalate to (a) move inventory write to a Databricks scheduled
-   job, or (b) upgrade Function App to EP1 Premium (always-on instance,
-   no idle reaper). Both are bigger changes than S13's mitigation, held
-   in reserve until proven necessary.
+   2026-05-14). Canonical proof under all 3 S13 mitigations: timer disabled
+   (no race), inventory chunk_size 10K → 5K, per-sub-batch gRPC keepalive
+   logging. Expected: single fire (no timer race), `chunk_size=5000
+   sub_batch=1000` in startup log, ~190 sub-batch traces, 38 chunk-commits
+   ending at `189225 / 189225`, completion in ~10 min. If inventory STILL
+   partial-dies at any N×5K boundary, the 3-pronged S13 mitigation didn't
+   fix the root cause — escalate to (a) move inventory write to a
+   Databricks scheduled job, or (b) upgrade Function App to EP1 Premium.
+   Verification queries are queued below in `### Verification queries`.
 
-2. **Tier 6 ADF (Bicep)** OR **start Phase 3 (failure injection)** — pick
-   one. Tier 6 replaces `scripts/export_velora_to_landing.py` with a real
-   ADF pipeline. Phase 3 is the architectural meat: failure injection +
-   incident store + AI RCA. Default: Phase 3 first since Tier 6 is
-   operational debt that doesn't unblock the product narrative.
+2. **Tier 6 ADF (Bicep) + `pipeline.*` control-plane activation** — built
+   together as ONE coherent architectural slice. This closes the
+   long-standing "metadata-driven" gap (see CLAUDE.md `## Architecture vs
+   reality`): the Postgres `pipeline.*` schema has been provisioned +
+   seeded (12 entities in `entity_registry`, 12 in `watermarks`) since
+   Phase 0 but no consumer reads it. Tier 6 makes ADF the consumer.
+   Building them separately would be wrong:
+   - ADF without metadata = laptop script rewritten in ADF JSON (no gain)
+   - Metadata without ADF = orphaned tables (today's state)
+   Scope (estimate ~2 sessions, possibly 1 long one):
+   - **IaC** (`PipelineIQ-IaC`): Bicep for ADF resource, 4 linked services
+     (Azure SQL, ADLS Gen2, Key Vault, Databricks), 2 parameterized
+     datasets (SQL source + ADLS sink), 1 master parameterized copy
+     pipeline that loops over `entity_registry`, schedule trigger, ADF
+     diagnostic settings → `pipelineiq-logs-dev`.
+   - **Function REST endpoints** (architected since PLANNING.md but never
+     built): `get_watermark(entity)`, `commit_watermark(entity, ts)`,
+     `register_file(path, entity, rows, run_id)`, `log_run_start/end`.
+     These give ADF activities a way to read/write Postgres without
+     embedding connection strings in ADF.
+   - **Wire everything**: ADF reads `entity_registry` to know what to
+     copy → calls `get_watermark` to know FROM date → copies to
+     `landing/{entity}/[date=X|full]/` → calls `register_file` for the
+     landed Parquet → calls `commit_watermark` on success → logs the
+     run to `pipeline_exec_log`. All 5 `pipeline.*` tables come alive
+     from 0 consumers to "every run touches them."
+   - **Cutover**: replace the daily Logic-App-driven Function fire as
+     the bronze trigger; keep the Function for source generation only.
+     Decommission `scripts/export_velora_to_landing.py` from the
+     production flow (keep it as a manual-recovery escape hatch).
+   - **Validate**: pick a date, run the full ADF chain, confirm
+     `pipeline_exec_log` has rows, `file_registry` has the landed
+     Parquet entries, `watermarks` advanced.
+
+3. **Phase 3 — failure injection + `pipelineiq.incident_store`** — the
+   architectural meat (AI RCA loop). Defer until Tier 6 lands, because
+   Phase 3's failure-detection code reads from `pipeline_exec_log` and
+   ADF diagnostic logs (both come online in Tier 6). Roughly 2-3 sessions.
+
+4. **Phase 4 — pgvector `iac_embeddings`** — IaC repo webhook + chunker
+   + Azure OpenAI embeddings + UPSERT. ~1-2 sessions. Independent of
+   Tier 6.
+
+### Why Tier 6 + metadata is now S14 priority (changed from "Phase 3 first")
+
+Earlier S13 wrap recommended Phase 3 over Tier 6. Reversed at session end
+because the user surfaced the architecture-vs-reality gap explicitly:
+the metadata-driven design has been a slide deck, not a built feature, for
+13 sessions. Phase 3 needs `pipeline_exec_log` and ADF diagnostic events
+to detect failures — building Phase 3 first means stubbing out those
+upstream signals. Tier 6 + metadata first means Phase 3 has real signals
+to consume.
 
 ### Verification queries for the 5/15 00:30 UTC fire
 

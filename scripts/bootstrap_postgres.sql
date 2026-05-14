@@ -188,7 +188,12 @@ VALUES
     ('velora_pim.inventory_snapshot',   'velora_pim', 'inventory_snapshot',   'snapshot_date','full',        'daily', TRUE, 3, NULL),
     -- HRM entities (reps must precede assignments)
     ('velora_hrm.sales_reps',           'velora_hrm', 'sales_reps',           'updated_at',   'incremental', 'daily', TRUE, 1, NULL),
-    ('velora_hrm.territory_assignments','velora_hrm', 'territory_assignments', 'created_at',  'incremental', 'daily', TRUE, 2, 'velora_hrm.sales_reps')
+    ('velora_hrm.territory_assignments','velora_hrm', 'territory_assignments', 'created_at',  'incremental', 'daily', TRUE, 2, 'velora_hrm.sales_reps'),
+    -- Static reference seeds (added in S9.5 / DECISIONS #60; seeded into
+    -- entity_registry retroactively in S13). No real watermark — these
+    -- tables only change when the generator/seed code changes.
+    ('velora_pim.product_categories',   'velora_pim', 'product_categories',   'category_id',  'full',        'daily', TRUE, 11, NULL),
+    ('velora_pim.stores',               'velora_pim', 'stores',               'opened_date',  'full',        'daily', TRUE, 12, NULL)
 ON CONFLICT (entity_name) DO NOTHING;
 
 -- ── Seed initial watermarks ───────────────────────────────────────────────────
@@ -207,7 +212,10 @@ VALUES
     ('velora_pim.product_pricing',      'dev', '2024-12-31 00:00:00+00', '2025-01-01 00:00:00+00'),
     ('velora_pim.inventory_snapshot',   'dev', '2024-12-31',             '2025-01-01'),
     ('velora_hrm.sales_reps',           'dev', '2024-12-31 00:00:00+00', '2025-01-01 00:00:00+00'),
-    ('velora_hrm.territory_assignments','dev', '2024-12-31 00:00:00+00', '2025-01-01 00:00:00+00')
+    ('velora_hrm.territory_assignments','dev', '2024-12-31 00:00:00+00', '2025-01-01 00:00:00+00'),
+    -- Static seeds (S13 retroactive seed)
+    ('velora_pim.product_categories',   'dev', '2024-12-31 00:00:00+00', '2025-01-01 00:00:00+00'),
+    ('velora_pim.stores',               'dev', '2024-12-31 00:00:00+00', '2025-01-01 00:00:00+00')
 ON CONFLICT (entity_name, environment) DO NOTHING;
 
 \echo 'Bootstrap PostgreSQL complete.'

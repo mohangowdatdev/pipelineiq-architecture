@@ -165,6 +165,32 @@ Azure Monitor + Log Analytics
 
 ---
 
+## Architecture vs reality (read this before claiming "metadata-driven")
+
+The diagram above is the **architected** topology, not the **built** one. Honest gap inventory as of S13:
+
+| Architected | Built? | Notes |
+|---|---|---|
+| Azure SQL serverless source (`velora_oms`) | ✅ | Phase 1 + S6 real-dated reset, 17 days through 2026-05-13 |
+| Generator on Function App (Flex) → source DB | ✅ | S13 worker-kill 3-pronged mitigation deployed; awaiting 5/15 fire proof |
+| Logic App schedule | ✅ | Sole fire path after S13 (timer trigger neutered) |
+| **ADF Copy Activity** landing extract | ❌ | **Tier 6 deferred.** Replaced today by `scripts/export_velora_to_landing.py` (laptop scaffold, hardcoded entity list). |
+| ADLS Gen2 medallion (landing/bronze/silver/gold) | ✅ | Phase 2 fully complete |
+| Bronze/Silver/Gold Databricks notebooks | ✅ | Entity-agnostic ingestion, all 12 entities through gold |
+| Databricks SQL Warehouse | ✅ | Used for verification + future Power BI / VS Code |
+| **PostgreSQL `pipeline.*` schema** (control plane) | ⚠️ **Built, NOT consumed** | Tables exist, `entity_registry` (12 rows) + `watermarks` (12 rows) seeded — but no consumer reads from them. ADF doesn't exist; bronze/silver/gold notebooks hardcode their entity. `process_queue` / `file_registry` / `pipeline_exec_log` are all 0 rows because nothing writes to them. |
+| **PostgreSQL `pipelineiq.*` schema** (AI RCA) | ⚠️ Tables exist, 0 rows | `incident_store` populates in Phase 3 (failure injection + AI RCA). `iac_embeddings` populates in Phase 4 (IaC repo webhook + chunker). Both deferred. |
+| Function REST API (`get_watermark`, `commit_watermark`, `register_file`) | ❌ | Architected but never written. The current Function only writes synthetic source data; it does not expose REST endpoints to ADF or notebooks. |
+| FastAPI backend | ❌ Phase 5 | |
+| React dashboard | ❌ Phase 6 | (Portal SPA exists separately at `pipelineiq-portal`.) |
+| IaC repo push → embed → pgvector | ❌ Phase 4 | |
+
+**The honest read:** the medallion is solid, the Postgres control plane is provisioned + seeded but **architecturally orphaned** (no consumer wires it in). The next architectural unit (Tier 6 + `pipeline.*` activation) closes this gap by making ADF the actual consumer of `entity_registry`, `watermarks`, `pipeline_exec_log`, and `file_registry` — that's when "metadata-driven" stops being a slide and becomes a fact.
+
+**Why the gap exists:** Phase 2 (medallion) was prioritised as the demonstrable artifact. Tier 6 ADF + control-plane wiring was deferred so Phase 2 could ship via the laptop scaffold. The shortcut paid off (we have a complete medallion across 17 days of data); the cost is that "metadata-driven" remained a design promise, not a built feature, until Tier 6 lands.
+
+---
+
 ## Naming convention
 
 All Azure resources: `pipelineiq-{component}-{environment}`
