@@ -44,8 +44,12 @@ def main() -> None:
     effective_seed = args.seed + args.date.toordinal()
     rng = np.random.default_rng(effective_seed)
 
-    log.info("Connecting via config.get_connection_string()")
-    conn = pyodbc.connect(config.get_connection_string(), timeout=90)
+    if config.SQL_AUTH_MODE == "aad":
+        log.info("Connecting via DefaultAzureCredential (AAD token)")
+        conn = config.connect_aad(timeout=120)
+    else:
+        log.info("Connecting via config.get_connection_string() (mode=%s)", config.SQL_AUTH_MODE)
+        conn = pyodbc.connect(config.get_connection_string(), timeout=90)
 
     cur = conn.cursor()
     cur.execute(

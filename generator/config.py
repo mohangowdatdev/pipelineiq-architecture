@@ -259,10 +259,48 @@ def get_connection_string() -> str:
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=90;"
     )
     if SQL_AUTH_MODE == "msi":
-        # System-assigned managed identity (Azure Function MSI auth).
         return base + "Authentication=ActiveDirectoryMsi;"
-    # Password auth — laptop / CI.
+    if SQL_AUTH_MODE == "aad":
+        # AAD via DefaultAzureCredential — caller must supply an access token
+        # via `attrs_before={1256: token_struct}` on `pyodbc.connect`. ODBC
+        # Driver 18 does NOT accept "Authentication=ActiveDirectoryDefault"
+        # as a connection-string value (only the explicit per-flow values
+        # like ActiveDirectoryPassword / ActiveDirectoryMsi work that way).
+        # Token-attr is the only way to use the credential chain.
+        # Helper `connect_aad()` below wraps this.
+        return base
     return base + f"UID={SQL_USERNAME};PWD={SQL_PASSWORD};"
+
+
+def connect_aad(timeout: int = 90):
+    """Connect to Azure SQL using DefaultAzureCredential (AAD token).
+
+    Used by recovery scripts that don't have a password handy on laptop.
+    On laptop: picks up `az login` cached creds. In Azure: picks up MSI.
+    Requires the AAD principal to be a SQL user with CONNECT + DML
+    grants (true for `mohan.gowda` per S5 setup).
+    """
+    import struct
+    import pyodbc
+    from azure.identity import DefaultAzureCredential
+
+    # Force aad mode for the connection-string side regardless of env.
+    base = (
+        f"DRIVER={{{SQL_DRIVER}}};"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};"
+        f"Encrypt=yes;TrustServerCertificate=no;Connection Timeout={timeout};"
+    )
+    cred = DefaultAzureCredential()
+    token = cred.get_token("https://database.windows.net/.default").token
+    exp = b"".join(bytes((b, 0)) for b in token.encode("utf-8"))
+    token_struct = struct.pack(f"<I{len(exp)}s", len(exp), exp)
+    SQL_COPT_SS_ACCESS_TOKEN = 1256
+    return pyodbc.connect(
+        base,
+        timeout=timeout,
+        attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct},
+    )
 
 
 def get_adjusted_volume(base_min: int, base_max: int, run_date: date,

@@ -88,36 +88,55 @@ to 7 rows; `velora_oms.orders.status` enum updated to include RETURN_INITIATED.
 
 ## Next task
 
-**Session 13 priority order:**
+**Session 14 priority order:**
 
-1. **Verify 2026-05-13 00:30 UTC autonomous fire end-to-end** (writes
-   2026-05-12). With S12's telemetry fix in place, this is the first
-   fire that will produce queryable chunk-progress logs in `AppTraces`.
-   Expected: orders + lines + status_log + 189,225 inventory rows. If
-   inventory still partial-commits, `AppTraces` will now show exactly
-   which 10K chunk the worker died on.
+1. **Verify the 2026-05-15 00:30 UTC autonomous fire end-to-end** (writes
+   2026-05-14). This is the canonical proof under all 3 S13 changes:
+   timer disabled (no race), inventory chunk_size 10K → 5K, per-sub-batch
+   gRPC keepalive logging. Expected: orders + lines + status_log + **189,225
+   inventory rows in 38 chunk-commits** (instead of the historical 19 ×
+   10K commits, since chunk_size halved). If inventory STILL partial-dies
+   at 20K (or any N×5K), the 3-pronged S13 mitigation didn't fix the root
+   cause — escalate to (a) move inventory write to a Databricks scheduled
+   job, or (b) upgrade Function App to EP1 Premium (always-on instance,
+   no idle reaper). Both are bigger changes than S13's mitigation, held
+   in reserve until proven necessary.
 
-2. **Fix the SCD-2 `valid_from` bug** found in S12 spot-check (DECISIONS #67).
-   `notebooks/gold/build_gold_dim_customer.py` step 6 reuses the OLD
-   `valid_from` (= earliest-activity-date per DECISIONS #53) when inserting
-   the NEW version of a CHANGED customer — should use change-detection
-   date (e.g. `_silver_timestamp::date` of the silver MERGE batch, or
-   `current_date()`). 51 of 407 rows in `dim_customer` currently have
-   duplicate `xxhash64(customer_id, valid_from)` surrogate keys. Likely
-   same bug in `dim_product` + `dim_sales_rep`. Fix:
-   - Clarify DECISIONS #53 to split the rule: FIRST-EVER row → earliest
-     activity; NEW version on CHANGED → change-detection date
-   - Patch step 6 in all 3 dim notebooks
-   - Re-run idempotent MERGE on the 3 dims (old SKs UPDATE, new SKs INSERT)
-   - Update SCHEMA.md "Conventions for all Gold tables"
-   - Re-verify with a corrected overlap check (use row position or `<>`,
-     not `sk_a < sk_b` — that masks identical-SK pairs)
-
-3. **Tier 6 ADF (Bicep)** OR **start Phase 3 (failure injection)** — pick
+2. **Tier 6 ADF (Bicep)** OR **start Phase 3 (failure injection)** — pick
    one. Tier 6 replaces `scripts/export_velora_to_landing.py` with a real
    ADF pipeline. Phase 3 is the architectural meat: failure injection +
    incident store + AI RCA. Default: Phase 3 first since Tier 6 is
    operational debt that doesn't unblock the product narrative.
+
+### Verification queries for the 5/15 00:30 UTC fire
+
+```sql
+-- on velora_oms (use AAD token / az login auth — laptop)
+SELECT order_date, COUNT(*) AS n FROM velora_oms.orders
+WHERE order_date='2026-05-14' GROUP BY order_date;
+
+SELECT COUNT(*) FROM velora_pim.inventory_snapshot
+WHERE snapshot_date='2026-05-14';
+
+SELECT COUNT(*) FROM velora_oms.order_status_log
+WHERE created_at >= '2026-05-15T00:25:00';
+```
+
+```kusto
+// LA workspace pipelineiq-logs-dev (NOT az monitor app-insights query)
+AppTraces
+| where TimeGenerated between (datetime(2026-05-15T00:25:00Z)..datetime(2026-05-15T01:00:00Z))
+| where Message has_any ('Inventory','generator','committed','sub-batch','chunk_size','Function fire','completed')
+| where Message !startswith 'LoggerFilterOptions' and Message !startswith '{' and Message !contains 'pandas only supports'
+| project TimeGenerated, SeverityLevel, Message
+| order by TimeGenerated asc
+```
+
+Expected (S13-fix happy path): single fire (no timer race),
+`chunk_size=5000 sub_batch=1000` in startup log, then ~190 sub-batch
+traces (38 chunks × 5 sub-batches each), 38 chunk-commit traces ending
+at `189225 / 189225`, then `Azure Function completed for 2026-05-14`
+with non-`_skipped` payload.
 
 ### Carry-over: 2026-05-13 autonomous-fire checklist
 
@@ -429,7 +448,43 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 
 ## Session Log
 
-### 2026-05-12 (Session 12 — autonomous-fire verification + carry-over cleanup)
+### 2026-05-14 (Session 13 — Flex worker-kill structural fix + dim_customer SCD-2 lazy-eval bug + 5/12+5/13 catch-up)
+**Objective:** Verify S12's deferred carry-overs end-to-end (5/13 + 5/14 fires under all S11 + S12 fixes), apply structural fix for the Flex worker-kill on inventory writes, fix the dim_customer SCD-2 surrogate-key collision bug found in S12, recover damaged inventory rows, catch up bronze/silver/gold for 5/12 + 5/13.
+
+**Built:**
+- **`generator/function.json`** — disabled Cron timer trigger (`schedule: 0 0 0 31 2 *` — Feb 31, never fires). Logic App admin-invoke is now the SOLE fire path. Eliminates the timer/Logic-App race that was causing both worker invocations to share Flex's reaping fate. (DECISIONS #69)
+- **`generator/main.py::_write_inventory_snapshot`** — `chunk_size` 10_000 → 5_000 (twice as many commits = host bookkeeping sees activity every ~13s instead of ~25s). Added `logger.info` INSIDE the sub-batch loop, after each `executemany`, so gRPC traffic between Python worker and host fires every ~2.5s (well inside any reasonable keepalive window). (DECISIONS #69)
+- **`generator/config.py`** — added `aad` mode for `AZURE_SQL_AUTH_MODE`. New `connect_aad(timeout=90)` helper uses `DefaultAzureCredential` + `attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct}` (the only path supported by ODBC Driver 18). Closes the S12 carry-over for `scripts/inventory_only.py` not working on laptop without password. (DECISIONS #70)
+- **`scripts/inventory_only.py`** — picks `connect_aad()` when `SQL_AUTH_MODE == "aad"`, else falls back to the prior password/MSI behavior. Back-compat preserved.
+- **`notebooks/gold/build_gold_dim_customer.py`** — patched step 3 with `df_actioned = df_actioned.cache()` after categorization. Pins the lazy DataFrame to its pre-step-4 state so step 6's filter doesn't re-categorize SCD2_CHANGE rows as NEW after step 4 has flipped is_current=false. (DECISIONS #68 — supersedes the misdiagnosed DECISIONS #67)
+- **One-off cleanup MERGE** for `gold.default.dim_customer` — for each customer with sk-collision, set the current row's `valid_from = closed_row.valid_to + 1` (= the actual change-detection date) and recompute surrogate_key as `xxhash64(customer_id, new_valid_from)`. Closed rows untouched. Result: 407 → 407 distinct SKs → 0 collisions.
+- **DECISIONS #68 + #69 + #70** logged.
+
+**Worked:**
+- **5/12 + 5/13 inventory recovered** in 5 min each via `AZURE_SQL_AUTH_MODE=aad python scripts/inventory_only.py --date 2026-05-12` and `--date 2026-05-13 --force` (force was needed for 5/13 because 20K partial rows existed from the failed autonomous fire). Both at 189,225 rows. The new `aad` mode + `connect_aad()` helper made this a clean one-liner; no Key Vault round-trip, no inline `/tmp` script as in S12.
+- **SCD-2 bug verification** flipped the original DECISIONS #67 diagnosis. Spot-check showed `dim_product` is CLEAN (4205/4223/0) and `dim_sales_rep` is CLEAN (30/30/0). Only `dim_customer` had the bug. Real root cause: Spark lazy DataFrame re-evaluation across step 4's MERGE write — much subtler than the formula bug DECISIONS #67 described.
+- **One-off cleanup of 51 historical collisions** went smoothly via a single SQL MERGE — closed rows kept their original sk + valid_from, current rows got the right change-detection date inferred from `closed.valid_to + 1`. 407 → 407 distinct SKs → 0 collisions.
+- **Function deploy** (`bash scripts/deploy_function.sh`) ran in 188s including remote build. Manual admin-invoke after deploy returned `Duration=561ms` with `_skipped:True, existing_orders:389` for 5/13 — confirms new code is on the host, idempotency guard is live. **Real test (5/15 00:30 UTC autonomous fire) is pending.**
+- **Telemetry diagnosis** of why workers die: traced the 5/14 00:30 UTC fire end-to-end. Saw the timer fire start at 00:30:00, hit a Connect retry, then Logic App fire start at 00:30:22 (singleton listener stopped + restarted as HTTP target), Connect retry succeeded at 00:30:41, Transaction committed, Inventory chunk 1 at 00:31:46 (10K), chunk 2 at 00:32:11 (20K), then SILENCE. Timer fire returned at 00:30:55 with `_skipped:True`. Hypothesis: the timer fire's worker exit at 00:30:55 cued Flex's worker reaper (no visible HTTP activity), which killed the still-running Logic App fire's worker ~85s later. The 3-pronged S13 mitigation addresses both the race (no more timer) and the keepalive silence (per-sub-batch logging).
+- **Bronze + silver catch-up for 5/12 + 5/13** ran clean. 6 bronze entities in parallel (5-7 min wall each), 6 silver entities in parallel (cluster cold-start each), 0 DQ rejects on every silver. silver.inventory_snapshot grew to 3,215,700 rows (17 days × 189,225). silver.orders to 6,393. silver.order_lines to 21,405.
+- **Final medallion verify EXACT** after rebuild: dim_customer 404/404/404/0 collisions; silver↔gold inventory reconcile 3,215,700 / 175.5M closing / 65.6M sold (exact); silver↔gold order_line 21,405 (exact); 0 FK orphans on fact_order_line → dim_customer.
+
+**Broke:**
+- **First `scripts/inventory_only.py` retry** failed on laptop with `Invalid value specified for connection string attribute 'Authentication'`. ODBC Driver 18 doesn't accept `ActiveDirectoryDefault` as a string value — only the explicit per-flow values. Fixed by switching to the token-attr path (S12's proven pattern) and promoting the helper to `config.connect_aad()`. Took two iterations on `config.py` to get right.
+- **Bash output buffering** on `python | tail -50` patterns: tail buffers until input EOF, so background tasks looked stalled when they were actually still running. Fixed by using `python -u` + `tee` for the verify scripts.
+- **First SCD-2 fix attempt (`.cache()` only) FAILED.** After cleanup of the original 51 collisions, re-ran dim_customer notebook — produced 13 NEW collisions on top of the cleaned state. Same lazy-eval pattern. `.cache()` is a hint, not a contract — Spark may evict cached partitions or skip caching for partial-aggregate operations like `groupBy.count`. Escalated to bulletproof Delta temp-table materialization: `df_actioned.write.format("delta").saveAsTable(_tmp)` + `df_actioned = spark.table(_tmp)` immediately after categorization. Temp table dropped at end of step 8. Rebuilt dim_customer + fact_order_line + fact_daily_channel_revenue from scratch (lost ~64 synthetic SCD-2 history rows; current state preserved). Final verify: 404/404/404/0 collisions, all reconciles EXACT. Real fix landed in `build_gold_dim_customer.py` lines 154-181.
+- **Smart-cleanup MERGE for the 13 new collisions** failed with `DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE` because some customers had become 3-version (1 historical closed + 1 cleaned-current + 1 new closed). The post-S13-cleanup state + dim_customer re-run produced row geometries the cleanup MERGE couldn't disambiguate. DROP + REBUILD was the cleanest path forward and authorized by user.
+
+**Uncertainty:**
+- **Whether the 3-pronged worker-kill mitigation actually works** — need the 5/15 00:30 UTC fire to confirm. If inventory still dies, the structural answer is to move inventory writing OUT of the Function (Databricks scheduled job, no Flex constraint) or upgrade to EP1 Premium. Either is bigger than S13's fix.
+- **fact_order_line correctness for the 51 affected customers' post-change orders.** Cleanup updated dim_customer's surrogate_keys for 51 rows. fact_order_line was built BEFORE the cleanup, so for any orders placed AFTER the change-detection date by those 51 customers, the fact's `customer_surrogate_key` references the OLD (now-changed) sk. Re-running the gold catch-up rebuilds fact_order_line with the correct sks — queued in this session's gold wave.
+- **dim_product current state** — DECISIONS #67's claim that dim_product had the same bug was wrong; verified clean. But the gold catch-up will re-run dim_product on the new 5/12 + 5/13 silver state, which may detect new SCD-2 changes (price events) — those should also land cleanly with no collisions.
+
+**Next:** Session 14 = (1) verify 2026-05-15 00:30 UTC autonomous fire with all S13 mitigations active — `AppTraces` should now show single-fire (no timer race), 38 chunk-commits at 5K rows each, ~190 sub-batch traces, ending in non-`_skipped` completion; (2) Tier 6 ADF (Bicep) OR Phase 3 failure injection — default Phase 3 since it's the architectural meat. If 5/15 still dies, escalation track is "move inventory to Databricks scheduled job" — sketched in DECISIONS #69 fallback note.
+
+**Summary:** S13 closed THREE meaningful loops: (1) the laptop AAD recovery path (`AZURE_SQL_AUTH_MODE=aad ... inventory_only.py --date X`) — no more inline `/tmp` scripts; (2) the dim_customer SCD-2 collision bug — was misdiagnosed in S12 as a formula bug, real root cause is Spark lazy-eval, fix is one `.cache()` call; (3) the Flex worker-kill — applied 3 mitigations (no timer race, halved chunks, gRPC keepalive logging) without paying for EP1 yet, escalation path documented if 5/15 fire still dies. Source recovered to **17 days** through 2026-05-13. dim_customer at **407/407/0** (no collisions). Function code deployed and live. Repos to push: architecture (config.py, function.json, main.py, build_gold_dim_customer.py, scripts/inventory_only.py, CLAUDE.md, DECISIONS.md, PROGRESS.md). Bronze/silver/gold catch-up for 5/12 + 5/13 in flight at S13 wrap (counts will land in S14 verify).
+
+
 **Objective:** Status-check then finish 4 carry-overs: (1) fix Flex App Insights telemetry, (2) catch up silver/gold for 2026-05-11, (3) add `RETURN_INITIATED` to `gold.dim_order_status`, (4) update databricks account admin bootstrap runbook step 5.
 
 **Built:**

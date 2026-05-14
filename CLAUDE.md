@@ -194,11 +194,11 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | **Real-dated + guarded (S6) + 40613-resilient (S11)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. DECISIONS #62 (S11): chunked inventory write w/ per-chunk commits. Source DB has 15 real-dated days Apr 27 → May 11, 2026. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. `scripts/inventory_only.py --date YYYY-MM-DD` is the laptop fallback for inventory-only writes when the function fire dropped inventory. |
+| generator/ | **Real-dated + guarded (S6) + 40613-resilient (S11) + Flex worker-kill mitigated (S13)** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. DECISIONS #62 (S11): chunked inventory write w/ per-chunk commits. **DECISIONS #69 (S13): inventory chunk_size halved 10K→5K + per-sub-batch logging (gRPC keepalive). DECISIONS #70 (S13): `aad` mode in `config.py` so `scripts/inventory_only.py` works on laptop without password.** Source DB has **17 real-dated days Apr 27 → May 13, 2026** (S13 recovered 5/12 + 5/13 inventory full from laptop). Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. `AZURE_SQL_AUTH_MODE=aad ... python scripts/inventory_only.py --date YYYY-MM-DD` is the laptop fallback for inventory-only writes when the function fire dropped inventory. |
 | notebooks/bronze/ | **All 12 entities hydrated (S7 + S9.5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). 10 main entities (~1.9M rows) + 2 static seeds added in S9.5: `bronze.default.product_categories` (35 rows) + `bronze.default.stores` (45 rows). DECISIONS #60. |
 | notebooks/silver/ | **All 10 tables done (S8 + S9.5 + S11.2).** | All 10 silvers live with 100% DQ pass on real-dated source through 2026-05-10. Counts: `orders` (~4.5K), `customers` (~340), `order_lines` (~18K), `products` (4,205), `product_pricing` (4,218), `sales_reps` (30), `territory_assignments` (30), `inventory_snapshot` (2,648,025 — partitioned by `snapshot_date` per DECISIONS #63), `order_status_log` (11,694, allows `RETURN_INITIATED` per DECISIONS #64), `customer_addresses` (339, every customer has 1 primary). |
-| notebooks/gold/ | **All 12 dims+facts done (S8 + S9.5 + S10 + S11.2 + S12 catch-up).** | 9 dims + 3 facts live. **S12 update:** `dim_order_status` extended from 6 → 7 rows with `RETURN_INITIATED` (closes DECISIONS #64 gap). 5/11 caught up end-to-end: `fact_order_line` 19,352, `fact_inventory_daily` 2,837,250 (silver↔gold reconcile exactly), `dim_customer` 407 (SCD-2 grew from 339), `dim_product` 4,223 (SCD-2 grew with 5 new price-change rows). Phase 2 medallion **fully complete**. |
-| functions/ | **Stable on FC1 Flex + Logic-App schedule + S11 cold-start/inventory fixes + S12 telemetry** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m. **S11 (DECISIONS #61 + #62):** `_connect_with_resume_retry` retries on 40613/HYT00; inventory write chunked at 10K rows/chunk with per-chunk commit + progress logging. **S12 (DECISIONS #66):** `azure-monitor-opentelemetry` SDK init in `generator/main.py` so user-code `logger.info` calls reach LA `AppTraces` (workspace-backed AI, not classic). Function App diagnostic settings → `pipelineiq-logs-dev` for platform-side `FunctionAppLogs`. Function timer remains registered as harmless fallback (idempotency guard from #51 makes double-fire safe). ADF replacements for Bronze chain still pending in Tier 6. **2026-05-12 fire partial:** orders/lines/status_log clean, inventory died at 20K/189K — recovered via laptop AAD-token script. Next fire (2026-05-13) is the canonical proof under all 3 fixes. |
+| notebooks/gold/ | **All 12 dims+facts done (S8 + S9.5 + S10 + S11.2 + S12 catch-up + S13 SCD-2 fix).** | 9 dims + 3 facts live. **S12:** `dim_order_status` extended 6 → 7 rows with `RETURN_INITIATED`. **S13 (DECISIONS #68):** `build_gold_dim_customer.py` patched — `df_actioned.cache()` after categorization eliminates the lazy-eval bug that was producing duplicate surrogate_keys on SCD2_CHANGE rows. `dim_product` + `dim_sales_rep` are CLEAN (verified) — they don't have the bug because they derive valid_from from immutable source-effective dates. Historical 51 collisions in `dim_customer` cleaned up via one-off SQL MERGE (set current row's valid_from = closed.valid_to + 1, recompute sk). Result: 407 → 407 distinct SKs → 0 collisions. Phase 2 medallion fully complete. |
+| functions/ | **Stable on FC1 Flex + Logic-App schedule + S11 cold-start/inventory fixes + S12 telemetry + S13 worker-kill mitigation** | Migrated Y1 → FC1 Flex Consumption (DECISIONS #50). **S9 (DECISIONS #59):** Daily fire moved to a Logic App (`pipelineiq-scheduler-dev`, `core/scheduler/` IaC) that POSTs to `/admin/functions/generator` at 00:30 UTC. Function `host.json` `functionTimeout` bumped 10m → 30m. **S11 (DECISIONS #61 + #62):** `_connect_with_resume_retry` retries on 40613/HYT00; inventory write chunked at 10K rows/chunk with per-chunk commit + progress logging. **S12 (DECISIONS #66):** `azure-monitor-opentelemetry` SDK init in `generator/main.py` so user-code `logger.info` calls reach LA `AppTraces` (workspace-backed AI, not classic). Function App diagnostic settings → `pipelineiq-logs-dev` for platform-side `FunctionAppLogs`. **S13 (DECISIONS #69): TIMER TRIGGER DISABLED** (`function.json` schedule `0 0 0 31 2 *` = Feb 31 = never; Logic App admin-invoke is sole fire path). Eliminates the timer/Logic-App race that caused both workers to share Flex's reaping fate. Inventory `chunk_size` 10K → 5K + per-sub-batch logger.info (gRPC keepalive). 5/13 + 5/14 fires in S13 telemetry showed deterministic worker-kill at 20K rows; the 3-pronged S13 mitigation is the test. ADF replacements for Bronze chain still pending in Tier 6. **Source recovered to 17 days through 2026-05-13** (S13 inventory recovery via laptop). **5/15 00:30 UTC fire is the canonical proof** under all S13 changes — if inventory still partial-dies, escalate to EP1 Premium or move inventory to a Databricks scheduled job. |
 | scheduler/ (IaC `core/scheduler/`) | **Live (S9)** | Logic App Consumption recurrence trigger (`daily-fire`, 00:30 UTC) → HTTP action POSTing to the Function App admin endpoint with `x-functions-key` from `azurerm_function_app_host_keys.primary_key`. Single source of truth for the daily generator schedule. Cost: effectively Rs.0/mo (1 fire/day << 4,000-action free grant). |
 | fastapi/ | Pending | Phase 5 |
 | react/ | Pending | Phase 6 |
@@ -462,65 +462,44 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   structured logging + Function App diagnostic settings → `pipelineiq-logs-dev`
   for platform-side `FunctionAppLogs`. **Query path:** use Log Analytics on
   `pipelineiq-logs-dev` workspace (KQL on `AppTraces` etc), not classic AI CLI.
-- **Verify the 2026-05-13 00:30 UTC autonomous fire** (writes 2026-05-12) —
-  the first fire under both the S11 fixes (#61 + #62) **and** the S12 telemetry
-  fix (#66). Previous fire (2026-05-12, writing 5/11) cold-start retry worked
-  (orders + lines + status_log committed cleanly) but inventory partial-died
-  at exactly 20,000 / 189,225 rows — same host-worker-kill bug as 5/11 manual
-  fire. With #66 in place, `AppTraces` should now show every 10K chunk-commit
-  trace, pinpointing the death point if it fires again. Check via:
-  ```sql
-  -- on velora_oms
-  SELECT order_date, COUNT(*) FROM velora_oms.orders WHERE order_date='2026-05-12' GROUP BY order_date;
-  SELECT COUNT(*) FROM velora_pim.inventory_snapshot WHERE snapshot_date='2026-05-12';
-  SELECT COUNT(*) FROM velora_oms.order_status_log WHERE created_at >= '2026-05-13T00:25:00';
-  ```
-  And in LA workspace (NOT classic AI):
-  ```kusto
-  AppTraces
-  | where TimeGenerated between (datetime(2026-05-13T00:25:00Z)..datetime(2026-05-13T01:00:00Z))
-  | where Message has 'Inventory' or Message has 'committed' or Message has 'generator'
-  | project TimeGenerated, SeverityLevel, Message
-  | order by TimeGenerated asc
-  ```
-  If inventory comes up partial again, look for the last `Inventory snapshot:
-  committed N / 189225 rows` trace — that's the diagnostic gain. Then
-  investigate gRPC host-worker timeout on Flex or scale to EP1 Premium.
-  Laptop fallback: ad-hoc AAD-token recovery script (S12 inlined to `/tmp` —
-  worth promoting to a real `scripts/recover_inventory.py` with AAD auth if
-  this fires again).
+- ~~Verify the 2026-05-13 00:30 UTC autonomous fire~~ **Done (S13).** Fire wrote
+  orders/lines/status cleanly (40613 retry worked) but inventory died at 20K/189K
+  AGAIN — making it 3-for-3 deterministic Flex worker-kill (5/11, 5/12, 5/14
+  fires all died at exactly 20K rows ~85-130s into inventory). Recovered via
+  `scripts/inventory_only.py` with the new `aad` mode. **S13 applied 3-pronged
+  structural mitigation** (DECISIONS #69): (1) timer trigger disabled (`function.json`
+  schedule = Feb 31 = never fires) — Logic App admin-invoke is sole path,
+  eliminates the timer/Logic-App race; (2) inventory chunk_size 10K → 5K (more
+  frequent commits); (3) per-sub-batch `logger.info` in `_write_inventory_snapshot`
+  (gRPC traffic every ~2.5s instead of ~25s). Function deployed.
+- **Verify the 2026-05-15 00:30 UTC autonomous fire** (writes 2026-05-14) —
+  the canonical proof under all three S13 mitigations. Expected: single fire
+  (no timer race), 38 chunk-commit traces (5K each, 189225 / 5000 ≈ 38), ~190
+  sub-batch traces. If inventory still partial-dies at any N×5K boundary, the
+  3-pronged mitigation didn't fix the root cause — escalate to (a) move
+  inventory writing OUT of the Function to a Databricks scheduled job, OR
+  (b) upgrade Function App to EP1 Premium (always-on instance, no idle reaper).
+  Verification SQL + KQL queued in PROGRESS.md `## Next task`.
 - **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
   + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
   `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —
   the scaffold script is a reasonable substitute until Tier 6 lands.
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
-- **`scripts/inventory_only.py` needs AAD auth mode in `generator/config.py`.**
-  Currently the script imports `config.get_connection_string()` which only
-  supports `password` (laptop) or `msi` (function). On laptop without
-  `AZURE_SQL_PASSWORD` it fails. S12 sidestepped via inline AAD-token script.
-  Cleanup: add `aad` mode to `config.py` that uses `DefaultAzureCredential`
-  + ODBC token attr (`SQL_COPT_SS_ACCESS_TOKEN=1256`). Low priority.
-- **SCD-2 `valid_from` bug for CHANGED rows in `dim_customer`** (S12 spot-check
-  finding). 51 of 407 rows (12.5%) have a duplicate `surrogate_key` — the same
-  `xxhash64(customer_id, valid_from)` value is used for both the closed-out
-  version AND the new version of the same customer, because the notebook
-  reuses the **original** `valid_from` (= earliest-activity-date per
-  DECISIONS #53) for the NEW version of a CHANGED row instead of using the
-  change-detection date. Close-out logic is correct (`valid_to = change_date - 1`,
-  `is_current = false`) and the version-count distribution looks healthy
-  (305 × 1 + 51 × 2, no 3+), but fact joins to `dim_customer` via
-  `xxhash64(customer_id, valid_from)` may attribute revenue to the wrong
-  version for these 51 customers. **Likely the same bug in `dim_product`
-  and `dim_sales_rep`** (same SCD-2 convention per DECISIONS #52 + #57).
-  Fix: in `notebooks/gold/build_gold_dim_customer.py` step 6 (and equivalent
-  in dim_product / dim_sales_rep), use `current_date()` or the
-  `_silver_timestamp::date` of the change-detection batch as `valid_from`
-  for NEW-action rows on CHANGED customers, NOT the earliest-activity-date
-  rule (which is only correct for FIRST-EVER rows). Then re-run the 3 dim
-  notebooks (idempotent MERGEs — old surrogate_keys get UPDATE-SET, new
-  ones get INSERT). Also fix the buggy overlap check (uses `sk_a < sk_b`,
-  filters out identical-SK pairs — should use `<>` or row-position). S13
-  candidate.
+- ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Done (S13, DECISIONS #70).**
+  `generator/config.py` now exposes `aad` mode + `connect_aad()` helper that uses
+  `DefaultAzureCredential` + ODBC token attr (`SQL_COPT_SS_ACCESS_TOKEN=1256`).
+  Usage: `AZURE_SQL_AUTH_MODE=aad ... python scripts/inventory_only.py --date 2026-05-12`.
+- ~~SCD-2 `valid_from` bug for CHANGED rows in `dim_customer`~~ **Done (S13, DECISIONS #68 — supersedes #67).**
+  Real bug was Spark lazy-eval, NOT a `valid_from` formula bug as DECISIONS #67
+  claimed. `df_actioned` was being recomputed in step 6 AFTER step 4 had flipped
+  is_current=false, causing SCD2_CHANGE rows to re-categorize as NEW with
+  valid_from=first_activity_date (collision). Fix was a single `df_actioned.cache()`
+  in `build_gold_dim_customer.py`. `dim_product` + `dim_sales_rep` are CLEAN
+  (verified — they use source-effective dates, not joins against the dim's own
+  is_current). Historical 51 collisions cleaned in-place via SQL MERGE (set
+  current row's `valid_from = closed.valid_to + 1`, recompute sk). 407 → 407
+  distinct SKs → 0 collisions. fact_order_line was rebuilt during the gold
+  catch-up wave so its customer_surrogate_key picks up the corrected sks.
 - **Cosmetic: each user log appears twice in `AppTraces`** (OT handler
   attached by `configure_azure_monitor` + the Functions runtime's root
   handler both forward). Doesn't affect debuggability. Fix:

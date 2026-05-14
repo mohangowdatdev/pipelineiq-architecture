@@ -413,35 +413,50 @@ def _write_inventory_snapshot(
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
-    # Chunked write with per-chunk commits + progress logs.
-    # On Flex Consumption, the function host has been observed to silently
-    # kill the Python worker mid-`executemany` for the full 189K-row insert,
-    # losing all inventory rows for the day even though main-batch tables
-    # had committed (S11 incident, 2026-05-11). Splitting into committed
-    # chunks of 10K rows means: (a) progress is durable on partial failure,
-    # (b) we get a log line every chunk so the failure point is visible in
-    # App Insights, (c) each individual `executemany` is short enough that
-    # any host-side timeout is unlikely to fire mid-call.
+    # Chunked write with per-chunk commits + sub-batch progress logs.
+    #
+    # S11 (#62): split into 10K-row committed chunks so partial failures don't
+    # lose the whole day. Worked, but inventory still died mid-3rd-chunk on
+    # 5/11, 5/12, 5/13 fires — 100% reproducible at ~85-130s into the write.
+    #
+    # S13 root cause (telemetry from #66 made this visible): silent worker
+    # kill, no exception. Most likely the Flex Consumption host's gRPC
+    # keepalive between host and Python worker times out when pyodbc's
+    # `executemany` blocks the Python thread for ≥ ~25s with no host-side
+    # callbacks. The 3 dies happened all happened within ~25s of the second
+    # successful chunk-commit log.
+    #
+    # S13 mitigation:
+    #   1. Halve `chunk_size` (10K → 5K) so each `cursor.commit()` fires
+    #      twice as often — keeps host-side bookkeeping warm.
+    #   2. Log a trace after EACH sub-batch executemany so gRPC traffic
+    #      flows every 2-3 seconds, not every 25 seconds.
+    #   3. Keep per-chunk commit semantics for durability on partial fail.
+    chunk_size = 5_000
     logger.info(
         "Inventory snapshot: starting write of %d rows for date %s "
-        "(chunk size = %d)",
-        len(rows), run_date, 10_000,
+        "(chunk_size=%d sub_batch=%d)",
+        len(rows), run_date, chunk_size, config.SQL_INSERT_BATCH_SIZE,
     )
     conn.autocommit = False
     written = 0
     try:
-        chunk_size = 10_000
         for i in range(0, len(rows), chunk_size):
             cursor = conn.cursor()
             cursor.fast_executemany = True
             sub_batch = config.SQL_INSERT_BATCH_SIZE
-            for j in range(0, len(rows[i: i + chunk_size]), sub_batch):
-                cursor.executemany(
-                    sql,
-                    rows[i + j: i + j + sub_batch],
+            chunk_rows = rows[i: i + chunk_size]
+            for j in range(0, len(chunk_rows), sub_batch):
+                cursor.executemany(sql, chunk_rows[j: j + sub_batch])
+                logger.info(
+                    "Inventory snapshot: sub-batch %d/%d in chunk starting at %d "
+                    "for %s",
+                    (j // sub_batch) + 1,
+                    (len(chunk_rows) + sub_batch - 1) // sub_batch,
+                    i, run_date,
                 )
             conn.commit()
-            written += min(chunk_size, len(rows) - i)
+            written += len(chunk_rows)
             logger.info(
                 "Inventory snapshot: committed %d / %d rows for %s",
                 written, len(rows), run_date,

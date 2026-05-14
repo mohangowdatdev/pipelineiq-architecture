@@ -151,6 +151,36 @@ df_actioned = (
         )
 )
 
+# Materialize the categorization to a Delta temp table BEFORE any mutations
+# in steps 4 + 5 can change the dim's is_current state.
+#
+# Background: `df_actioned` is a lazy DataFrame whose lineage references
+# `df_dim_current` (filtered on is_current = true). If we let it stay lazy,
+# step 4's MERGE flips is_current=false on SCD2_CHANGE rows, then step 6's
+# re-evaluation of `df_actioned.filter(...)` re-reads dim_customer in its
+# new state — those customers no longer appear current, the join produces
+# NULL `_dim_*` columns, and the categorization silently flips from
+# SCD2_CHANGE to NEW. Step 6 then inserts the new version with
+# valid_from = first_activity_date (the NEW-action rule) instead of
+# valid_from = current_date (the SCD2_CHANGE rule), producing a
+# surrogate_key collision with the row step 4 just closed.
+#
+# `.cache()` is not bulletproof — Spark may evict cached partitions under
+# memory pressure, and not all DataFrame ops actually populate the cache
+# (groupBy.count uses partial aggregates that can skip caching some
+# partitions). Persisting to a Delta temp table is a guaranteed
+# materialization that survives any later access. The temp table is
+# dropped at the end of step 8.
+#
+# S13 incident: lazy-eval bug produced 51 surrogate-key collisions in
+# `dim_customer`, then RE-PRODUCED 13 more after the first .cache()-only
+# fix attempt (S13 second pass). Bulletproof temp-table fix landed S13
+# third pass.
+_actioned_tbl = f"{gold_catalog}.{schema_name}._tmp_dim_customer_actioned_{pipeline_run_id.replace('-', '')}"
+spark.sql(f"DROP TABLE IF EXISTS {_actioned_tbl}")
+df_actioned.write.format("delta").saveAsTable(_actioned_tbl)
+df_actioned = spark.table(_actioned_tbl)
+
 action_counts = df_actioned.groupBy("_action").count().collect()
 for row in action_counts:
     print(f"  {row['_action']}: {row['count']:,}")
@@ -311,6 +341,9 @@ elif insert_count > 0:
     )
 else:
     print("No new dim rows to insert.")
+
+# Drop the temp categorization table now that all writes are done.
+spark.sql(f"DROP TABLE IF EXISTS {_actioned_tbl}")
 
 # COMMAND ----------
 
