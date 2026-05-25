@@ -12,6 +12,8 @@
 - [Modular architecture](#modular-architecture) — Azure-native, swap-ready by docs
 - [Cost estimate (Central India, 1 USD = Rs. 95, PAYG)](#cost-estimate-central-india-1-usd--rs-95-payg) — ~Rs. 5K/month
 - [Hard constraints](#hard-constraints) — non-negotiables
+- [Phase-by-phase exit criteria](#phase-by-phase-exit-criteria) — what "done" means for each phase
+- [Phase dependencies](#phase-dependencies) — what blocks what, what can run in parallel
 
 ## Client: Velora Retail Group
 
@@ -335,3 +337,93 @@ Databricks All-Purpose 30-min auto-terminate is non-negotiable.
 - Unity Catalog enabled on Databricks from day one.
 - Databricks All-Purpose clusters always have 30-min auto-terminate.
 - PostgreSQL incident_store and pipeline_exec_log are append-only.
+
+---
+
+## Phase-by-phase exit criteria
+
+Each phase is "done" only when every bullet below is true. No fuzzy
+exits — if you can't tick all the boxes, the phase isn't done. Use
+`docs/build_order.md` for resource-level status; this section is for
+phase-level "ship/no-ship" gates.
+
+### Phase 0 — Foundations
+Done when:
+- All Tier 0–5 items in `docs/build_order.md` are `Done`.
+- 30+ Azure resources live in `pipelineiq-rg-dev` (KV, ADLS, LAW, Postgres, Databricks workspace, UC metastore + catalogs, SQL warehouse, Function App + scheduler, OpenAI + GPT-4o deployment, Azure SQL + bootstrap schema).
+- `terraform plan` from `clients/velora/` is clean.
+
+### Phase 1 — Data generator
+Done when:
+- Function App fires daily at 00:30 UTC via Logic App. **Inventory write owned by Databricks Job at 00:35 UTC** (S14, DECISIONS #71).
+- `velora_oms` has ≥14 consecutive days of activity. Each day: ~300-500 orders, ~1200-1700 order_lines, ~1000-1300 status_log rows, 189,225 inventory_snapshot rows.
+- Idempotency guard prevents double-fire collisions. Generator runs in <2 min wall (Function) + ~5 min wall (Databricks Job).
+- All 6 failure-injector flags exercised once via `python generator/main.py --failure <class>` (output verified, downstream impact deferred to Phase 3).
+
+### Phase 2 — Medallion (landing → bronze → silver → gold)
+Done when:
+- All 12 entities ingested through gold. silver 10/10, gold 12/12 (9 dims + 3 facts).
+- 0 DQ rejects on real-dated generator output. Quarantine path wired for every silver notebook (exercised via Phase 3 failure injection).
+- silver↔gold reconciliation passes on row count + key measures.
+- dim_customer SCD-2: 0 surrogate-key collisions (post-DECISIONS #68 bulletproof fix).
+- ADF replacement for `scripts/export_velora_to_landing.py` ships in Phase 0 Tier 6.
+
+### Phase 3 — Failure injection + RCA loop
+Done when:
+- All 6 failure scenarios injectable via flag; each produces a row in `pipelineiq.incident_store` within 5 min of detection.
+- Incident rows have: root_cause_summary (1-2 sentences), affected_component, evidence (raw log lines + IaC chunks used), suggested_fix, confidence (0-1).
+- Slack webhook fires for severity ≥ medium.
+- KQL query on Azure Monitor catches ADF + Databricks job failures and routes to FastAPI within 60s.
+- **Blocker:** requires Phase 0 Tier 6 (ADF + `pipeline_exec_log`) — Phase 3 reads failure signals from there.
+
+### Phase 4 — pgvector IaC embeddings
+Done when:
+- Every .tf and .bicep file in `PipelineIQ-IaC/main` is chunked, embedded, and stored in `pipelineiq.iac_embeddings`.
+- Azure DevOps webhook on push to `main` re-chunks changed files within 60s.
+- Phase 3 RCA loop retrieves top-K chunks via cosine similarity (typical K=5, threshold >0.7).
+- pgvector ivfflat index returns results in <100ms p99.
+- **Can run in parallel with Tier 6 / Phase 3** — no dependencies between them.
+
+### Phase 5 — FastAPI backend on Container Apps
+Done when:
+- FastAPI deployed to `pipelineiq-fastapi-dev` on Container Apps (scale-to-zero).
+- REST endpoints live: `/v1/incidents`, `/v1/pipelines/{run_id}/status`, `/v1/iac/chunks`, `/v1/webhooks/iac`.
+- Internal KQL polling cron runs every 60s; on new failure → triggers RCA loop → writes incident → fires Slack.
+- Authentication: function-key / API key for service-to-service, AAD (optional) for human callers.
+- Logs stream to `pipelineiq-logs-dev`.
+
+### Phase 6 — React dashboard
+Done when:
+- React app deployed to Static Web Apps (free tier).
+- Three views render: live pipeline status, incident timeline, per-incident RCA detail.
+- Each incident row links to the IaC chunks used + raw log excerpt + suggested fix (Markdown render).
+- AAD auth wired (optional for dev).
+- End-to-end demo: trigger a failure scenario via flag → see the incident appear in the timeline within 5 min → Slack alert fires with link back to the React UI.
+
+---
+
+## Phase dependencies
+
+```
+Phase 0 (Foundations)
+   │
+   └── Phase 1 (Generator) ───┐
+                              │
+   └── Tier 6 (ADF + metadata)┼─── Phase 3 (RCA loop)
+                              │
+   └── Phase 4 (pgvector) ────┘
+                              │
+                              └── Phase 5 (FastAPI)
+                                       │
+                                       └── Phase 6 (React)
+```
+
+Reading the graph:
+- Phase 2 (Medallion) runs alongside Phase 1 — both consume Phase 0 only.
+- **Tier 6 (ADF + `pipeline.*` activation) is the bottleneck** — it unlocks Phase 3 by providing real `pipeline_exec_log` failure signals.
+- **Phase 4 (pgvector) is independent of Tier 6** — can interleave to save context-switching cost.
+- Phase 3 needs both Tier 6 (signals) AND Phase 4 (retrieval context) to be honest. Either can land first; Phase 3 finishes second.
+- Phase 5 (FastAPI) orchestrates Phase 3's loop — needs Phase 3's code paths to exist (even if not yet end-to-end verified).
+- Phase 6 (React) consumes Phase 5's REST endpoints — last in the chain.
+
+See `docs/forward_plan.md` for the session-by-session sequencing this dependency graph implies.

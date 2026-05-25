@@ -563,8 +563,11 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
 | Situation | Read this |
 |---|---|
 | Writing any notebook or SQL | SCHEMA.md |
-| Starting a new phase | PROGRESS.md |
+| Starting a new phase | PROGRESS.md + docs/forward_plan.md |
 | Picking up after a session gap | PROGRESS.md → ## Session Log (last entry) |
+| Sequencing the work that remains | docs/forward_plan.md (S15 → S21 outline + dependency graph) |
+| Phase exit criteria | PLANNING.md → ## Phase-by-phase exit criteria |
+| Resource-level "what exists in Azure" | docs/build_order.md |
 | Unsure about a design choice | DECISIONS.md |
 | Understanding full architecture | PLANNING.md |
 | Writing a specific service's code | docs/{service}.md if it exists |

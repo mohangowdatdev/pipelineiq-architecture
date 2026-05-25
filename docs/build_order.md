@@ -118,8 +118,9 @@ pgvector IaC embeddings. Lives in `pipelineiq-iac/core/postgres.tf` and
 | 4.5 | `bootstrap_postgres.sql` executed against `postgres` DB | Done | 2026-04-21 | `PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv) psql ...` | `pipeline` + `pipelineiq` schemas, 6 control tables, pgvector extension, `iac_embeddings` ivfflat index, 10 entity_registry rows seeded |
 | 4.6 | Azure Functions app `pipelineiq-functions-dev` (Python 3.11, **Flex Consumption FC1**) | Done | 2026-05-06 | `PipelineIQ-IaC/core/functions/` | **Migrated Y1 → FC1 in S6** (DECISIONS #50): Y1 Linux Consumption silently dropped scheduled timer fires. Now FC1 + private deployment-package container + system-assigned MSI. MSI re-granted on velora_oms after destroy/recreate (new principal `ccdac37d-...`). Generator now uses `today_utc - 1` (DECISIONS #51 supersedes #49 date-resolution) + idempotency guard skips already-seeded dates. **S9: `functionTimeout` bumped 10m → 30m** in `host.json` — partial executions on Flex were timing out during the 189K-row inventory write. Cron unchanged: `0 30 0 * * *` (00:30 UTC = 06:00 IST), but **timer trigger no longer the source of truth** — see 4.7. |
 | 4.7 | Logic App `pipelineiq-scheduler-dev` (Consumption) — daily 00:30 UTC POST → function admin endpoint | Done | 2026-05-09 | `PipelineIQ-IaC/core/scheduler/` | **DECISIONS #59.** Created in S9 because Flex Consumption timer triggers don't reliably fire from cold (verified 2026-05-09: 2 consecutive scheduled fires for May 7 + May 8 silently no-op'd despite a healthy function + correct cron — App Insights showed 0 host-startup events for those windows). Logic App is the new source of truth for the daily fire; function timer remains registered as happy-bonus fallback (idempotency guard from DECISIONS #51 makes any double-fire safe). Plumbing verified end-to-end via REST trigger 08:46 UTC: Logic App→function host wake→generator `run()`→guard short-circuit. Cost: ~Rs.0/mo (1 fire/day << 4,000-action free grant). |
+| 4.8 | Function REST endpoints — `get_watermark`, `commit_watermark`, `register_file`, `log_run_start`, `log_run_end` | Pending | — | `functions/api/` (new sub-app) | Architected since Phase 0, never written. Consumed by ADF Web Activities so pipeline doesn't embed Postgres conn strings. `get_watermark(entity)` reads `pipeline.watermarks.last_successful_load`; `commit_watermark(entity, ts)` advances it on confirmed success; `register_file(entity, path, rows, run_id)` writes `pipeline.file_registry`; `log_run_*` writes `pipeline.pipeline_exec_log`. Same Function App host; new function group `api/`. Auth: function-key per call. Blocker for Tier 6.7. |
 
-Blocker for Tier 7: 4.5–4.7 Done.
+Blocker for Tier 7: 4.5–4.7 Done. Blocker for Tier 6.7–6.11: 4.8 Done.
 
 ---
 
@@ -139,6 +140,8 @@ secrets referenced via Key Vault).
 | 5.6 | SQL Warehouse `pipelineiq-dev-sqlwh` (2X-Small, auto-stop 10m) | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_sql_endpoint.this` | ID `71a1e581f197abf0`. Classic tier. Verified by `bronze.default.customers` SELECT statement returning 158 rows. |
 | 5.7 | Secret scope backed by Key Vault | Done | 2026-05-01 | `core/databricks_uc/main.tf` `databricks_secret_scope.kv` | Name `pipelineiq-dev-kv`. AAD-backed pointer to Key Vault `pipelineiq-kv-dev`. |
 | 5.8 | Databricks access connector (managed identity for ADLS) | Done | 2026-05-01 | `core/databricks_uc/main.tf` `azurerm_databricks_access_connector.this` | `pipelineiq-dev-dbx-ac`. System-assigned identity. Granted Storage Blob Data Contributor on `pipelineiqadlsdev` via `azurerm_role_assignment.ac_blob_contributor`. |
+| 5.9 | Source-system simulator notebook + scheduled Job — `pipelineiq-inventory-dev` | Done | 2026-05-25 | `core/inventory_workflow/` + `notebooks/source_sim/write_inventory_snapshot.py` | **S14, DECISIONS #71.** Inventory write migrated off the Function App (Flex worker reaper killed every fire 5/14-5/24 at 1-4 chunks of 5K). New Databricks Job, single-node DS3_v2, schedule `0 35 0 ? * *` (00:35 UTC daily, 5 min after Function fire). Spark JDBC bulk insert, numPartitions=8, batchsize=10000. Deterministic xxhash64 synthesis. `verify_order_landed` widget enforces two-writer race protection. Smoke-tested 2026-05-14: 189,225 / 4,205 / 45. Supersedes #62 + #69. |
+| 5.10 | KV `Key Vault Secrets User` role assignment for AzureDatabricks first-party SP | Done | 2026-05-25 | `core/databricks_uc/main.tf` `azurerm_role_assignment.databricks_kv_secrets_user` | **S14.** KV-backed secret scopes call KV via the well-known AzureDatabricks SP (`ee589af4-...` in this tenant), not via the access connector MSI. New `azure_databricks_sp_object_id` variable wires the principal_id from `terraform.tfvars`. Surfaced when the inventory notebook tried to pull `sql-admin-password`. |
 
 Blocker for Tier 6: 5.1–5.7 Done.
 
@@ -152,13 +155,19 @@ Terraform for ADF-internal objects (linked services, datasets, pipelines).
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
 | 6.1 | Data Factory `pipelineiq-adf-dev` | Pending | — | `pipelineiq-iac/core/adf.tf` | Managed identity, Git disabled (bicep-first) |
-| 6.2 | Linked services: Azure SQL, ADLS, Key Vault, Databricks | Pending | — | `pipelineiq-iac/pipelineiq_app/adf/*.bicep` | |
-| 6.3 | Parameterised datasets (Velora) | Pending | — | Bicep | One per source table |
-| 6.4 | Copy pipeline: Azure SQL → landing | Pending | — | Bicep | Watermark-based incremental |
-| 6.5 | Databricks notebook activities: Bronze / Silver / Gold | Pending | — | Bicep | Each reads `_pipeline_run_id` param |
-| 6.6 | Diagnostic settings → Log Analytics | Pending | — | Terraform | All pipeline run events streamed |
+| 6.2 | Linked services: Azure SQL, ADLS, Key Vault, Databricks | Pending | — | `pipelineiq-iac/pipelineiq_app/adf/*.bicep` | One Bicep file per linked service |
+| 6.3 | Parameterised datasets (Velora) | Pending | — | Bicep | SQL source dataset + ADLS Parquet sink dataset, both parameterised by `{schema, table, watermark_column, load_type}` from `pipeline.entity_registry` |
+| 6.4 | Copy pipeline: Azure SQL → landing | Pending | — | Bicep | Watermark-based incremental. ForEach over `entity_registry` rows. Per-entity copy activity emits to `landing/{entity}/[date={YYYY-MM-DD}|full]/`. |
+| 6.5 | Databricks notebook activities: Bronze / Silver / Gold | Pending | — | Bicep | Each reads `_pipeline_run_id` param + entity name. Chained: Bronze on landing event → Silver on bronze success → Gold on silver success. |
+| 6.6 | Diagnostic settings → Log Analytics | Pending | — | Terraform | All ADF pipeline run events stream to `pipelineiq-logs-dev`. Required for Phase 3 failure detection. |
+| 6.7 | `pipeline.entity_registry` CONSUMED by ADF master pipeline | Pending | — | Bicep ForEach + Web Activity → Function `get_watermark` | "Metadata-driven" goes from slide to fact. Each iteration: get watermark, copy SQL → landing, register file, commit watermark on success. Blocker: 4.8 (Function REST endpoints). |
+| 6.8 | `pipeline.watermarks` read/written via Function REST | Pending | — | ADF Web Activities `GET /get_watermark` + `POST /commit_watermark` | Per-entity watermark advances only on successful end-to-end (landing → bronze → silver → gold) — see 6.10 sequencing. |
+| 6.9 | `pipeline.file_registry` written on every landed Parquet | Pending | — | ADF Web Activity `POST /register_file` | Audit trail: file_path, source_entity, landed_at, row_count, pipeline_run_id. Currently 0 rows (no consumer). |
+| 6.10 | `pipeline.pipeline_exec_log` written on run start + end | Pending | — | ADF Web Activity `POST /log_run_start` + `POST /log_run_end` | Phase 3 reads from here for failure detection signals. Currently 0 rows. |
+| 6.11 | Cutover: production fire path is ADF, not laptop script | Pending | — | Decommission `scripts/export_velora_to_landing.py` from prod | Keep the script as a manual-recovery escape hatch. Logic App still fires Function for source-system writes; ADF kicks off at 00:35 UTC after Function commits + inventory Job completes. |
+| 6.12 | Cluster identity for ADF Web Activity → Function App | Pending | — | Function-key auth via KV-resolved secret | Same pattern as Logic App scheduler today. |
 
-Blocker for Tier 8: 6.1–6.6 Done.
+Blocker for Tier 8: 6.1–6.6 Done. Blocker for Phase 3 (Tier 7.10): 6.7–6.10 Done — Phase 3 needs `pipeline_exec_log` signals + ADF diagnostic logs to detect failures.
 
 ---
 
@@ -174,9 +183,13 @@ immaterial. See DECISIONS.md #25.
 | 7.1 | Azure OpenAI account `pipelineiq-openai-dev` (South India) | Done | 2026-04-21 | `PipelineIQ-IaC/core/openai/main.tf` | S0 SKU, custom_subdomain = account name → `https://pipelineiq-openai-dev.openai.azure.com/` |
 | 7.2 | GPT-4o model deployment | Done | 2026-04-21 | `azurerm_cognitive_deployment.this["gpt-4o"]` | Model version `2024-11-20`, Standard SKU, capacity 10. South India hosts GPT-4o — confirmed. |
 | 7.3 | OpenAI key + endpoint stored in Key Vault | Done | 2026-04-21 | `azurerm_key_vault_secret` `openai-api-key` + `openai-endpoint` | |
-| 7.4 | Container Apps environment `pipelineiq-aca-dev` | Pending | — | `pipelineiq-iac/core/container_apps.tf` | Central India |
-| 7.5 | FastAPI Container App `pipelineiq-fastapi-dev` | Pending | — | Terraform | Managed identity + Key Vault refs |
-| 7.6 | Ingress: public HTTPS with managed cert | Pending | — | Terraform | |
+| 7.4 | Container Apps environment `pipelineiq-aca-dev` | Pending | — | `pipelineiq-iac/core/container_apps.tf` | Central India. Scale-to-zero on the ACA env. |
+| 7.5 | FastAPI Container App `pipelineiq-fastapi-dev` | Pending | — | Terraform | Managed identity + Key Vault refs. Endpoints: `/v1/incidents/*`, `/v1/pipelines/*`, internal KQL polling cron, IaC webhook receiver. |
+| 7.6 | Ingress: public HTTPS with managed cert | Pending | — | Terraform | Custom domain optional for dev. |
+| 7.7 | Azure OpenAI embeddings deployment — `text-embedding-3-small` (or `-large`) | Pending | — | `core/openai/main.tf` `azurerm_cognitive_deployment.this["embeddings"]` | South India, same account as GPT-4o (7.1). Capacity 30 = ~30K tokens/min. Required for Phase 4. |
+| 7.8 | IaC chunker + pgvector populator | Pending | — | `fastapi/iac_chunker.py` | Walks `PipelineIQ-IaC/` repo, chunks each .tf / .bicep file (~500 tokens with 50-token overlap), embeds via 7.7, UPSERTs to `pipelineiq.iac_embeddings` (file_path + branch + resource_type + content + embedding vector(1536)). Phase 4 deliverable. |
+| 7.9 | Azure DevOps webhook → chunker | Pending | — | DevOps service connection + FastAPI route `POST /v1/webhooks/iac` | Webhook fires on `git push` to `PipelineIQ-IaC/main`. FastAPI re-runs the chunker for changed files only. Auth: HMAC secret in KV. Phase 4 deliverable. |
+| 7.10 | RCA loop — KQL ingestion → GPT-4o → `incident_store` → Slack | Pending | — | `fastapi/rca_loop.py` | Cron polls Log Analytics via KQL for ADF + Databricks failures since last_seen_ts. For each new failure: pull top-K IaC chunks via pgvector cosine similarity, retrieve last N raw log lines, call GPT-4o with the JSON output schema (root_cause_summary, affected_component, evidence, suggested_fix, confidence), UPSERT `pipelineiq.incident_store`, POST Slack webhook. Phase 3 deliverable. Blocker: 6.10 (`pipeline_exec_log` populated). |
 
 Blocker for Tier 8: 7.1–7.6 Done.
 
@@ -188,10 +201,12 @@ React frontend + Azure DevOps webhook target for IaC change capture.
 
 | # | Item | Status | Date | Path / command | Notes |
 |---|---|---|---|---|---|
-| 8.1 | Static Web Apps `pipelineiq-react-dev` | Pending | — | `pipelineiq-iac/core/static_web_apps.tf` | Free tier |
+| 8.1 | Static Web Apps `pipelineiq-react-dev` | Pending | — | `pipelineiq-iac/core/static_web_apps.tf` | Free tier. Optionally wire AAD auth via Static Web Apps built-in identity (no separate IdP needed). |
 | 8.2 | Custom domain + managed cert | Pending | — | Terraform | Optional for dev |
-| 8.3 | Azure DevOps service connection + webhook secret | Pending | — | Manual + Key Vault | Per-repo webhook → FastAPI |
-| 8.4 | Event Grid → Slack webhook binding | Pending | — | `pipelineiq-iac/core/eventgrid.tf` | Alert delivery channel |
+| 8.3 | Azure DevOps service connection + webhook secret | Pending | — | Manual + Key Vault | Per-repo webhook → FastAPI. Secret in KV as `devops-webhook-secret`. Sets up the 7.9 hookup. |
+| 8.4 | Event Grid → Slack webhook binding | Pending | — | `pipelineiq-iac/core/eventgrid.tf` | Alternate alert delivery channel. NB: today's plan is FastAPI POSTs Slack directly (7.10), Event Grid is reserved for broader notification fan-out (email, Teams, etc.). |
+| 8.5 | Slack incoming webhook URL in Key Vault | Pending | — | `azurerm_key_vault_secret.slack_webhook_url` | Slack workspace setup (manual, one-time) generates the URL; stored in KV; FastAPI (7.10) reads via managed identity. |
+| 8.6 | React UI — pipeline status timeline + incident detail + RCA replay | Pending | — | `react/src/` | Three views: live pipeline status (rows from `pipeline_exec_log`), incident timeline (rows from `incident_store`), per-incident RCA detail page with evidence + suggested fix + IaC chunks used. Phase 6. |
 
 ---
 
@@ -219,6 +234,11 @@ actually works end-to-end.
 | 9.4k | Chunk 4 — silver.inventory_snapshot + fact_inventory_daily + silver.order_status_log + silver.customer_addresses | Pending | — | TBD | Trailing-edge work. Inventory branch is the only non-trivial item (1.89M rows, partition discipline). |
 | 9.4 | Bronze → Silver → Gold full run | In progress | — | Databricks Job | End-to-end Phase 2 exit. Bronze 12/12; Silver 7/10; Gold 11/12 (3 SCD-2 dims + 5 static + 1 synthesized + `fact_order_line` + `fact_daily_channel_revenue`). Remaining: 3 Silver + `fact_inventory_daily` per CLAUDE.md "Medallion chunk plan" chunk 4. |
 | 9.5 | Inject each of 6 failure classes → verify incident row in PostgreSQL | Pending | — | `python generator/main.py --failure <class>` per class | Phase 3 exit. Requires Phase 3 infra (ADF diagnostic settings → Log Analytics → FastAPI poller → incident_store). |
+| 9.6 | Medallion catch-up after S14 inventory migration | Pending | — | `scripts/export_velora_to_landing.py --start 2026-05-14 --end <latest>` then bronze/silver/gold smoke per entity | 11 days lag (5/14 → 5/24) from the silent inventory partial-deaths + downstream lag. Idempotent MERGE everywhere — safe to re-run. Should land before Tier 6.1 so ADF starts from a synced state. |
+| 9.7 | 2026-05-26 00:30 UTC + 00:35 UTC autonomous pair | Pending | — | Passive observation + `scripts/audit_fires.py` | First canonical end-to-end fire under the new two-writer architecture (Function for transactions, Databricks Job for snapshot). Proves S14 migration. |
+| 9.8 | Phase 4 verification — IaC commit triggers chunker → embedding visible in pgvector | Pending | — | Make a trivial commit to `PipelineIQ-IaC/main`, then `SELECT COUNT(*) FROM pipelineiq.iac_embeddings WHERE ingested_at > now() - interval '5 minutes'` | Phase 4 exit. |
+| 9.9 | Phase 5 verification — FastAPI `/v1/incidents` returns the 6 injected scenarios | Pending | — | `curl https://pipelineiq-fastapi-dev.../v1/incidents` | Phase 5 exit. |
+| 9.10 | Phase 6 verification — incident timeline UI renders + Slack alert fires | Pending | — | Browser + Slack channel | Phase 6 exit / project demo-ready. |
 
 ---
 
