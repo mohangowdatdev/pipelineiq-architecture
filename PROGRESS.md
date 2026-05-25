@@ -10,12 +10,13 @@
 - [Notes and blockers](#notes-and-blockers) — open items
 - [Session Log](#session-log) — newest-first journal of every session
 
-## At a glance (2026-05-12)
+## At a glance (2026-05-25)
 
 | Layer | Status | Detail |
 |---|---|---|
-| Source generator | ✅ Live + autonomous | Logic App fires daily 00:30 UTC, writes `today_utc - 1`. Idempotent. **Telemetry now flowing on Flex (S12)**. |
-| Source DB (`velora_oms`) | ✅ 15 days continuous | 2026-04-27 → 2026-05-11. Inventory 189,225 rows/day from 5/2 onward (189,000 on Apr 27–May 1, pre-catalogue-growth). |
+| Source generator (Function) | ✅ Live + autonomous, **inventory write removed (S14, DECISIONS #71)** | Logic App fires daily 00:30 UTC. Function now writes orders/lines/status_log/dim-changes only — small high-frequency writes, ~2 min wall. Idempotent. Telemetry flows via OTel SDK → LA `AppTraces`. |
+| **Inventory writer (Databricks Job)** | ✅ **Live (S14)** | New `pipelineiq-inventory-dev` Databricks Job, scheduled 00:35 UTC daily, single-node DBR 14.3, runs `notebooks/source_sim/write_inventory_snapshot.py`. Spark JDBC bulk insert with numPartitions=8. ~3-4 min wall. Replaces the Function inventory write that died 11 consecutive fires under S13's mitigations. |
+| Source DB (`velora_oms`) | ✅ 24 days continuous | 2026-04-27 → 2026-05-24. 11-day inventory recovery wave in S14 brought all dates to 189,225 rows each (was partial 5K-20K from the failed Flex fires). |
 | Landing (ADLS Parquet) | ✅ Up to date | 5 by-date partitions for orders + inventory; full snapshot per other entity through 2026-05-11. |
 | Bronze (Delta) | ✅ 12/12 tables | Append-only. Entity-agnostic ingest. Re-ingested 8 entities for 5/11 in S12. |
 | Silver (Delta) | ✅ 10/10 tables | 100% DQ pass everywhere. `inventory_snapshot` at 2,837,250 rows; `order_lines` 19,352; `orders` 5,758. |
@@ -493,6 +494,43 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-25 (Session 14 — Inventory migration to Databricks scheduled Job + 11-day recovery)
+**Objective:** Audit auto-fires since S13 wrap (5/15 → 5/25 UTC, writing 5/14 → 5/24 — 11 days), determine whether S13's 3-pronged Flex worker-kill mitigation worked, and if not, migrate the inventory write off the Function App.
+
+**Built:**
+- **`notebooks/source_sim/write_inventory_snapshot.py`** — new Spark notebook. Reads `velora_pim.products` + `velora_pim.stores` via JDBC (KV-backed secret scope), synthesizes 189,225 rows deterministically via `xxhash64(product_id, store_id, snapshot_date, salt)` per measure, writes `velora_pim.inventory_snapshot` via JDBC mode=append + numPartitions=8 + batchsize=10000. Three widgets: `snapshot_date` (default `yesterday_utc`), `force` (default false — idempotency guard via DELETE+INSERT), `verify_order_landed` (default true — two-writer race guard: refuses if `velora_oms.orders` has 0 rows for the date). DECISIONS #71.
+- **`scripts/run_inventory_smoke.py`** — Databricks SDK driver to upload notebook + submit one-time job. Same pattern as bronze/silver/gold smoke scripts.
+- **`scripts/audit_fires.py`** — read-only audit script for `velora_oms.orders` / `inventory_snapshot` / `order_status_log` / `order_lines` over a date window. AAD-token auth with 40613/HYT00 retry. Used to confirm 11 consecutive partial-inventory days.
+- **`scripts/recover_inventory_batch.sh`** — loops `scripts/inventory_only.py --force` over a date range. Used to recover 5/14 → 5/24 inventory (11 days × ~5 min each = ~55 min total wall time).
+- **`PipelineIQ-IaC/core/inventory_workflow/`** — new TF module: `databricks_job` with Quartz schedule `0 35 0 ? * *` (00:35 UTC daily, 5 min after Function fire), single-node Standard_DS3_v2 DBR 14.3 cluster, timeout 1800s, max_retries=2. Wired into `clients/velora/main.tf`.
+- **`PipelineIQ-IaC/core/databricks_uc/main.tf`** — added `azurerm_role_assignment.databricks_kv_secrets_user` granting `Key Vault Secrets User` to the AzureDatabricks first-party SP (`ee589af4-a29c-4ed9-9108-b64d579f4f42` in this tenant). KV-backed secret scopes call KV via this SP, not via the access connector MSI. Surfaced when the inventory notebook tried to pull `sql-admin-password`. New `azure_databricks_sp_object_id` variable in `databricks_uc` + root velora client + `terraform.tfvars`.
+- **`generator/main.py::run()`** — removed call to `_write_inventory_snapshot`. Function `run()` ends after `conn.commit()` of the main batch; `counts["inventory_snapshot_rows"] = 0` (kept for back-compat). `_write_inventory_snapshot` definition stays so `scripts/inventory_only.py` recovery path still works. DECISIONS #71.
+- **DECISIONS #71** — supersedes #62 + #69. Migration rationale, scope, and observed evidence (telemetry from 11 partial fires).
+- **CLAUDE.md** — topology diagram updated with two-writer model; module stability rows updated for `generator/`, `notebooks/source_sim/`, `functions/`, new `inventory_workflow/` row.
+
+**Worked:**
+- **Audit (11 dates 5/12 → 5/24) ran clean** in ~3 min via AAD-token auth + 40613 retry. Found orders/lines/status_log perfect every day (DECISIONS #61 cold-start retry doing its job 11 fires running); inventory partial on every fire 5/14 → 5/24 (zero rows for 5/14, then 5K–20K rows for each subsequent day — multiples of 5000 = the deployed chunk size).
+- **AppTraces deep-dive on 5/15 fire** (writing 5/14) showed the exact death pattern: connect retry succeeded at 00:31:35 (after 2 attempts with 40613), main batch committed at 00:31:39, inventory started at 00:31:42 with the new `chunk_size=5000 sub_batch=1000` banner (S13 code IS deployed), 3 sub-batches at 00:31:56 / 00:32:06 / 00:32:14, then silence. Worker reaped before chunk-1's commit. 5/14 inventory_snapshot got zero rows.
+- **Recovery wave** caught up all 11 days to 189,225 rows each. 5/19 hit a transient TCP error mid-write at 180K/189K rows — recovery script restart picked it up cleanly. Source DB now at 24 days continuous (Apr 27 → May 24).
+- **Terraform plan + apply** went green on second try. First apply hit two cluster-validation errors (jobs policy enforces autoscale; automated clusters reject `autotermination_minutes`); resolved by setting `num_workers=1` directly and dropping `policy_id`. KV role grant completed in ~27s; the role assignment is now propagated by Azure RBAC.
+- **Smoke test confirmed the JDBC write path** — 189,225 rows landed in `velora_pim.inventory_snapshot` for 5/14 in ~2-3 min wall (force=true wiped existing, then bulk insert with 8 partitions). First attempt errored at the post-write verify step on a `SUM(stockout_flag)` over a BIT column (SQL Server rejects); fixed with `SUM(CAST(stockout_flag AS INT))`. Final clean run pending.
+- **Two-writer race guard validated** by design: notebook's `verify_order_landed` queries `velora_oms.orders WHERE order_date=?` before attempting the write. If Function fire fails (no orders for date), notebook refuses to paper over by writing inventory.
+
+**Broke:**
+- **`.env` was stale** pointing at `pipelineiq-sql-dev` (a server that no longer exists). The actual SQL server is `pipelineiq-sql-velora-dev`. Worked around with inline env override (`AZURE_SQL_SERVER=... AZURE_SQL_DATABASE=...`); needs proper fix in `.env` next session.
+- **First smoke test failed on KV permission** — KV-backed secret scopes call KV via the well-known AzureDatabricks first-party SP, not the workspace's access connector MSI. The SP had no role on the vault. Resolved via IaC (`azurerm_role_assignment` for `Key Vault Secrets User`). Lesson: when adopting a new auth path (KV from notebooks), trace the principal end-to-end before assuming the existing access connector pattern covers it.
+- **First Terraform apply failed** on jobs-policy enforcement of autoscale; second attempt failed on automated-cluster rejection of `autotermination_minutes`. Both signaled that the existing `${name_prefix}-jobs-policy` cluster policy is shaped for interactive clusters, not automated job clusters. Dropped the policy binding on the inventory job; it now declares its cluster directly. Future cleanup: consider a separate `${name_prefix}-job-cluster-policy` without `autotermination_minutes`.
+- **5/19 recovery batch TCP'd at 180K/189K rows** — Azure SQL serverless throttle / network blip. Recovery script restart picked it up clean. Reminds us that even from a stable laptop, pyodbc + 189K rows in a single date isn't durable — further evidence for the Databricks migration.
+
+**Uncertainty:**
+- **2026-05-26 00:30 UTC + 00:35 UTC pair is the canonical end-to-end proof** of the new architecture. Function should fire and commit orders/lines/status_log only (~2 min wall); Databricks Job should fire 5 min later and bulk-insert inventory (~3-4 min wall). If both green, S14 closes the inventory reliability saga for good. If Databricks Job fails (e.g., the `verify_order_landed` query times out on SQL serverless cold start), the inventory write skips and the day stays half-empty — visibly broken, recoverable via `scripts/run_inventory_smoke.py --date YYYY-MM-DD --force` from laptop.
+- **`scripts/inventory_only.py` is now legacy** — recovery path of last resort. Could be deleted in favor of `scripts/run_inventory_smoke.py` as the universal recovery tool. Defer to next session.
+- **Function timeout 30m → 5m** is a sensible follow-up since inventory is out. Defer to next deploy round-trip.
+
+**Next:** Session 15 = (1) verify 2026-05-26 00:30 + 00:35 UTC end-to-end pair; (2) Tier 6 ADF (Bicep) + `pipeline.*` control-plane activation — the long-standing "architecture vs reality" gap closer (CLAUDE.md `## Architecture vs reality`); (3) catch up bronze/silver/gold for 11 new dates (5/14 → 5/24) before Tier 6 or alongside it. Phase 3 (failure injection) still needs Tier 6 signals before it can land.
+
+**Summary:** S14 was meant to be a status-check + nudge into Tier 6 / Phase 3 / Phase 4. Turned into a full architectural migration — inventory write moved off the Function App and into a Databricks scheduled Job (DECISIONS #71, supersedes #62 + #69). The audit showed S13's 3-pronged worker-kill mitigation FAILED in the wild: 11 consecutive autonomous fires landed orders/lines/status_log clean but partial-died on inventory at 1-4 chunks of 5K rows. AppTraces confirmed the new code IS deployed; the host reaper still kills the worker. The structural answer was the one DECISIONS #69 already documented as the fallback: move inventory writing to where there's no Flex reaper. Cost change: +Rs.500-900/mo for the daily Jobs Compute run. Architectural integrity preserved by naming the notebook under `source_sim/` (not `bronze/silver/gold/`) — Databricks is still a *consumer* of `velora_oms` at the medallion layer; the inventory writer is "Velora's nightly warehouse snapshot job", which is exactly what enterprise retailers run on Spark anyway. Source DB recovered to 24 days continuous (Apr 27 → May 24); first canonical end-to-end pair tomorrow 00:30 + 00:35 UTC. Repos to push: architecture (`generator/main.py`, `notebooks/source_sim/write_inventory_snapshot.py`, `scripts/{audit_fires,run_inventory_smoke,recover_inventory_batch}`, CLAUDE.md, DECISIONS.md, PROGRESS.md) + IaC (`core/inventory_workflow/`, `core/databricks_uc/{main,variables}.tf`, `clients/velora/{main,variables,terraform.tfvars}.tf`).
 
 ### 2026-05-14 (Session 13 — Flex worker-kill structural fix + dim_customer SCD-2 lazy-eval bug + 5/12+5/13 catch-up)
 **Objective:** Verify S12's deferred carry-overs end-to-end (5/13 + 5/14 fires under all S11 + S12 fixes), apply structural fix for the Flex worker-kill on inventory writes, fix the dim_customer SCD-2 surrogate-key collision bug found in S12, recover damaged inventory rows, catch up bronze/silver/gold for 5/12 + 5/13.

@@ -347,9 +347,16 @@ def run(
         conn.commit()
         logger.info("Transaction committed successfully")
 
-        # ── 8. Inventory snapshot (separate transaction — full refresh) ───────
-        inv_count = _write_inventory_snapshot(conn, products_df, run_date, rng)
-        counts["inventory_snapshot_rows"] = inv_count
+        # ── 8. Inventory snapshot — migrated OUT of the Function (DECISIONS #71).
+        # Flex Consumption + pyodbc executemany can't move 189K rows reliably;
+        # every fire 5/14-5/24 partial-died despite the DECISIONS #62/#69
+        # mitigations. The daily inventory write is now owned by a Databricks
+        # scheduled job (`notebooks/source_sim/write_inventory_snapshot.py`)
+        # which fires at 00:35 UTC, 5 min after this Function. Spark JDBC bulk
+        # insert is 30-50x faster than pyodbc and has no Flex worker reaper.
+        # `_write_inventory_snapshot` stays defined below for the one-off
+        # `scripts/inventory_only.py` recovery path.
+        counts["inventory_snapshot_rows"] = 0  # not written here anymore
 
         return counts
 
