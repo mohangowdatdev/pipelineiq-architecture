@@ -63,15 +63,17 @@ Roughly 7 sessions to "demo-ready end-to-end" from S14 wrap. Times are
 rough — each block can stretch or compress by half a session based on
 how much yak-shaving comes up.
 
-### S15 — Catch-up + canonical proof
+### S15 — Catch-up + canonical proof  ✅ DONE 2026-05-25 (in same session as S14 — split for clarity)
 **Objective:** sync medallion to source DB; verify the autonomous two-writer pair works under the new architecture.
 
-1. Verify 2026-05-26 00:30 + 00:35 UTC autonomous fire — `scripts/audit_fires.py` shows 2026-05-25 with ~400 orders + 189,225 inventory.
-2. **Medallion catch-up for 11 days (5/14 → 5/24)** — `export_velora_to_landing.py --start 2026-05-14 --end 2026-05-24` then bronze/silver/gold smoke per entity. ~45-60 min wall.
-3. Validate dim_customer SCD-2 holds at 0 collisions after the catch-up wave.
-4. Pre-flight for S16: confirm Azure OpenAI quota + KV permissions + DevOps service principal exists.
+1. ✅ Verify 2026-05-26 00:30 + 00:35 UTC autonomous fire — **deferred to S16** (didn't happen yet at S15 wrap).
+2. ✅ **Medallion catch-up for 11 days (5/14 → 5/24)** — landing re-export + multi-task bronze/silver/gold Job. Built new `scripts/catchup_medallion.py` driver to do this with one shared cluster per layer (much cheaper than per-entity smoke runs). ~30 min wall, ~Rs.40 cost.
+3. ✅ Validate dim_customer SCD-2 holds at 0 collisions — **723/723/0 collisions confirmed**. S13 bulletproof fix held.
+4. ✅ Pre-flight for S16: confirmed in PROGRESS.md S15 log.
 
-Exit: medallion at 24 days; autonomous fire proven; dim_customer clean.
+Exit: medallion at 28 days (Apr 27 → May 24) through gold. silver.inventory_snapshot 5,297,175; fact_inventory_daily 5,297,175 (1:1). dim_customer 723 / 0 collisions. All FK orphans 0.
+
+**Carry to S16:** verify 2026-05-26 autonomous fire pair (didn't happen during S15) + catch up the medallion for 2026-05-25 once the fire lands.
 
 ### S16 — Tier 6 ADF + Function REST endpoints (chunk 1 of 2)
 **Objective:** stand up ADF + the Function REST endpoints that ADF will consume.

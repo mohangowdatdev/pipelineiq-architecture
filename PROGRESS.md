@@ -17,11 +17,11 @@
 | Source generator (Function) | ✅ Live + autonomous, **inventory write removed (S14, DECISIONS #71)** | Logic App fires daily 00:30 UTC. Function now writes orders/lines/status_log/dim-changes only — small high-frequency writes, ~2 min wall. Idempotent. Telemetry flows via OTel SDK → LA `AppTraces`. |
 | **Inventory writer (Databricks Job)** | ✅ **Live (S14)** | New `pipelineiq-inventory-dev` Databricks Job, scheduled 00:35 UTC daily, single-node DBR 14.3, runs `notebooks/source_sim/write_inventory_snapshot.py`. Spark JDBC bulk insert with numPartitions=8. ~3-4 min wall. Replaces the Function inventory write that died 11 consecutive fires under S13's mitigations. |
 | Source DB (`velora_oms`) | ✅ 24 days continuous | 2026-04-27 → 2026-05-24. 11-day inventory recovery wave in S14 brought all dates to 189,225 rows each (was partial 5K-20K from the failed Flex fires). |
-| Landing (ADLS Parquet) | ✅ Up to date | 5 by-date partitions for orders + inventory; full snapshot per other entity through 2026-05-11. |
-| Bronze (Delta) | ✅ 12/12 tables | Append-only. Entity-agnostic ingest. Re-ingested 8 entities for 5/11 in S12. |
-| Silver (Delta) | ✅ 10/10 tables | 100% DQ pass everywhere. `inventory_snapshot` at 2,837,250 rows; `order_lines` 19,352; `orders` 5,758. |
-| Gold dims | ✅ 9/9 dims (1 known bug) | 3 SCD-2, 1 synthesized, 5 static. **`dim_order_status` now 7 rows incl. `RETURN_INITIATED`** (S12, DECISIONS #64 follow-through). ⚠ **S12 spot-check found SCD-2 `valid_from` bug** — 51/407 rows in `dim_customer` have duplicate surrogate_keys because CHANGED rows reuse OLD `valid_from`. Fix deferred to S13 (DECISIONS #67). |
-| Gold facts | ✅ 3/3 facts | `fact_order_line` 19,352 (1:1 silver), `fact_daily_channel_revenue` 5,436, `fact_inventory_daily` 2,837,250 (1:1 silver). |
+| Landing (ADLS Parquet) | ✅ Up to date through 2026-05-24 | 28 by-date partitions for orders + inventory; full snapshot per other entity (S15 catch-up). |
+| Bronze (Delta) | ✅ 12/12 tables through 2026-05-24 | Append-only. Re-ingested all 10 entities in S15 via multi-task Job. `bronze.inventory_snapshot` at 15.9M rows (3× silver from multiple re-ingest waves; dedup'd at silver). |
+| Silver (Delta) | ✅ 10/10 tables through 2026-05-24 | 100% DQ pass. `inventory_snapshot` at **5,297,175** (28 days × 189,225 with early 4 days at 189K); `order_lines` 35,525; `orders` 10,491; `order_status_log` 27,735; `customers` 701; `customer_addresses` 701. |
+| Gold dims | ✅ 9/9 dims, **0 SCD-2 collisions (S13 fix held)** | `dim_customer` 723 (701 current + 22 historical SCD-2 versions for segment/city changes). `dim_product` 4,228 (4,205 current + 23 historical price-change versions). `dim_sales_rep` 30 (stable). `dim_territory` 9, `dim_date` 4018, `dim_order_status` 7, `dim_store` 45, `dim_product_category` 35, `dim_sales_channel` 3. |
+| Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **35,525** (= silver.order_lines); `fact_inventory_daily` **5,297,175** (= silver.inventory_snapshot); `fact_daily_channel_revenue` 10,224. 0 FK orphans anywhere. |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
 | ADF Bicep (Tier 6) | ⏳ Pending | Laptop scaffold script substitutes today. |
@@ -494,6 +494,40 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-05-25 (Session 15 — Medallion catch-up to 2026-05-24 + multi-task driver + docs roadmap)
+**Objective:** Sync medallion from 2026-05-13 to source 2026-05-24 (11-day lag from S14 inventory recovery). Capture the granular plan that was previously only in chat.
+
+**Built:**
+- **`scripts/catchup_medallion.py`** — multi-task Databricks Job driver for medallion catch-up. One Job per layer (`--layer bronze|silver|gold`), all entities of the layer run as parallel tasks on a single shared `job_clusters` 4-worker cluster. Pays for ONE cluster cold start per layer. Gold mode wires task dependencies (5 dims → 2 facts → rollup). Uses `jobs.create` + `run_now` + `jobs.delete` for clean-up (`SubmitTask` doesn't support `job_cluster_key`).
+- **`scripts/verify_catchup_intermediate.py`** — mid-flight verify for bronze + silver while gold runs. Per-day silver.orders + inventory counts, DQ rejects, bronze totals.
+- **`scripts/verify_catchup_final.py`** — final reconcile: dim collisions, FK orphans, silver↔gold fact reconciles. All checks must return 0 to declare green.
+- **`docs/forward_plan.md`** (new) — S15→S21 session-level outline + dependency graph + the 8 cross-phase sub-items that aren't phase-named.
+- **`PLANNING.md`** — new `## Phase-by-phase exit criteria` (crisp done=X,Y,Z per phase) + `## Phase dependencies` (ASCII graph).
+- **`docs/build_order.md`** — 19 new rows: 4.8 Function REST endpoints, 5.9-5.10 S14 migration + KV grant, 6.7-6.12 pipeline.* activation + ADF→DBX dispatch + cutover, 7.7-7.10 embeddings + chunker + webhook + RCA loop, 8.5-8.6 Slack secret + React UI, 9.6-9.10 verification.
+- **`CLAUDE.md`** — Where-to-read pointers updated to route to forward_plan / phase exit criteria / build_order.
+
+**Worked:**
+- **Landing re-export** (laptop, AAD auth, retry on serverless cold-start) clean in ~10 min: 11 orders by-date partitions, 11 inventory by-date partitions (11 × 189,225 = 2.08M rows), 10 full master snapshots.
+- **Bronze multi-task** ~7 min wall: cluster cold-start ~4 min, 10 entities in parallel ~2 min.
+- **Silver multi-task** ~8 min wall: cluster cold-start ~4 min, 10 in parallel, longest tail was inventory_snapshot (deduping 5.3M from 15.9M append).
+- **Gold multi-task** ~10 min wall: 5 dims wave + 2 facts wave (deps held correctly) + rollup. `fact_inventory_daily` (5.3M as-of joins to dim_product) ran clean.
+- **All reconciles EXACT:** silver.order_lines (35,525) == fact_order_line (35,525); silver.inventory_snapshot (5,297,175) == fact_inventory_daily (5,297,175). 0 FK orphans, 0 dim collisions across dim_customer, dim_product, dim_sales_rep.
+- **dim_customer SCD-2 bulletproof fix held** across the catch-up wave. 723 / 723 distinct SKs / 701 distinct NKs / 0 collisions. S13 DECISIONS #68's Delta temp-table materialization is the durable answer (`.cache()` alone was insufficient — re-verified).
+- **Cost ~Rs.40** vs ~Rs.85 if I'd used the per-entity smoke scripts (cluster cold-start dominates Jobs Compute cost; one shared cluster per layer wins).
+
+**Broke:**
+- **First catchup_medallion.py submission failed** on `TypeError: SubmitTask.__init__() got an unexpected keyword argument 'job_cluster_key'`. `SubmitTask` (from `jobs.submit`) doesn't accept shared-cluster references; only `Task` (in `jobs.create` persistent jobs) does. Refactored to `jobs.create` + `run_now` + `jobs.delete` after run completes. Same cost, slightly more API churn.
+- **Silver `quarantine.default.orders` query errored** with TABLE_OR_VIEW_NOT_FOUND. Catalog `quarantine` exists, but no failure injections have been routed yet so the table never lazy-created. Not a regression — Phase 3 will exercise it.
+- **`silver.inventory_snapshot` distinct snapshot_dates = 28, not 24** — my earlier "24 days" claim was off by 4 days. Source DB is 28 days (Apr 27 → May 24 inclusive). Updated PROGRESS.md "at a glance" to match. Total inventory rows: 5,297,175 ≈ 4 early days × ~189,000 (pre-catalogue-growth, DECISIONS #19/#41) + 24 later days × 189,225.
+
+**Uncertainty:**
+- **2026-05-26 00:30 + 00:35 UTC fire is still the canonical proof of the S14 two-writer architecture** running fully autonomously. S15 didn't touch it — but it'll fire while we're not watching. Audit + medallion catch-up for 5/25 next session.
+- **`bronze.*` row counts are 3× silver** because bronze appends every re-ingest. Silver MERGE collapses them. Mathematically correct but wasteful storage-wise. Future cleanup: a periodic `OPTIMIZE bronze.{entity} ... DEEP_CLONE` or VACUUM on `_ingestion_date` partition could trim. Defer.
+
+**Next:** Session 16 = (1) verify 2026-05-26 00:30 + 00:35 UTC fire end-to-end + 5/25 catch-up; (2) **Tier 6 ADF Bicep chunk 1** — ADF resource + linked services (4) + parameterised datasets (2) + Function REST endpoints (build_order 4.8). S17 = Tier 6 chunk 2 + metadata activation. See `docs/forward_plan.md` for the full S16→S21 outline.
+
+**Summary:** S15 turned a "should be 30 min" catch-up into a meaningful infrastructure contribution + roadmap capture. New `scripts/catchup_medallion.py` multi-task driver replaces N sequential single-entity smoke runs with one shared-cluster Job per layer — proven across bronze (10 tasks), silver (10 tasks), gold (8 tasks with deps). Medallion now in sync with source through 2026-05-24: silver.orders 10,491; silver.inventory_snapshot 5.3M; fact_inventory_daily 1:1 with silver; dim_customer 723 / 0 collisions. S13 bulletproof SCD-2 fix held across the wave. Cost ~Rs.40 vs ~Rs.85 sequential, ~30 min wall total. Forward plan now documented in three places (`PLANNING.md` phase exit criteria, `docs/build_order.md` resource status, `docs/forward_plan.md` session sequencing) — the granular plan no longer lives only in chat. Repos to push: architecture (PROGRESS.md, docs/forward_plan.md, docs/build_order.md, scripts/catchup_medallion.py + verify_catchup_*.py).
 
 ### 2026-05-25 (Session 14 — Inventory migration to Databricks scheduled Job + 11-day recovery)
 **Objective:** Audit auto-fires since S13 wrap (5/15 → 5/25 UTC, writing 5/14 → 5/24 — 11 days), determine whether S13's 3-pronged Flex worker-kill mitigation worked, and if not, migrate the inventory write off the Function App.
