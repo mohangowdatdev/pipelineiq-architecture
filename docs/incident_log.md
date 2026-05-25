@@ -41,6 +41,12 @@ non-obvious or took disproportionate time relative to the fix.
 
 | # | Date | Title | Severity | Category | Effort | Hardest? |
 |---|------|-------|----------|----------|--------|----------|
+| 23 | 2026-05-25 | `jobs.submit` SubmitTask doesn't accept `job_cluster_key` — needs persistent Job | minor | tooling | ~10 min | no |
+| 22 | 2026-05-25 | SQL Server `SUM(bit)` rejects in Spark JDBC schema probe | minor | code | ~5 min | no |
+| 21 | 2026-05-25 | Databricks KV-backed secret scope: AzureDatabricks first-party SP missing KV `Secrets User` role | major | auth | ~15 min | no |
+| 20 | 2026-05-14 | `dim_customer` SCD-2 surrogate-key collisions — Spark lazy-eval across write boundary | major | data | ~4 hrs across S12 (misdiag) + S13 (real fix) | **yes** |
+| 19 | 2026-05-11 → 2026-05-25 | **Flex Function App worker reaper kills pyodbc inventory write — 11 days of silent partial fires** | blocker | infra | ~10 hrs across S11.1 + S12 + S13 + S14 | **yes** |
+| 18 | 2026-05-09 | Flex Consumption timer trigger ALSO silently no-ops (DECISIONS #50 didn't fully solve it) | major | infra | ~30 min | **yes** |
 | 17 | 2026-05-06 | Daily Function timer fired exactly once on Y1 Linux Consumption | major | infra | ~90 min (diag + Flex migration + re-grant + redeploy) | **yes** |
 | 16 | 2026-05-01 | Cluster-policy autotermination invalid for job clusters | minor | infra | ~5 min | no |
 | 15 | 2026-05-01 | `partitionBy()` rejects Column expressions, requires names | minor | code | ~3 min | no |
@@ -62,6 +68,81 @@ non-obvious or took disproportionate time relative to the fix.
 ---
 
 ## Entries
+
+### #23 — 2026-05-25 — `jobs.submit` SubmitTask doesn't accept `job_cluster_key`
+- **Phase / Session:** Phase 2 catch-up, Session 15
+- **Category:** tooling
+- **Severity:** minor
+- **Effort:** ~10 min
+- **Status:** resolved 2026-05-25
+- **Symptom:** First run of `scripts/catchup_medallion.py --layer bronze` errored with `TypeError: SubmitTask.__init__() got an unexpected keyword argument 'job_cluster_key'`. The intent was to share one cluster across 10 parallel bronze tasks via `job_clusters` + `job_cluster_key`.
+- **Root cause:** The Databricks Python SDK splits Jobs API into two paths: `jobs.submit` (one-time runs, uses `SubmitTask`) and `jobs.create` + `jobs.run_now` (persistent jobs, uses `Task`). Only the persistent-Job path accepts `job_cluster_key`. `SubmitTask` requires each task to define its own `new_cluster` (cluster-per-task) or reference an `existing_cluster_id`.
+- **Fix:** Refactored `catchup_medallion.py` to use `jobs.create` (with `job_clusters` array) + `jobs.run_now` to trigger. After the run completes, `jobs.delete(job_id)` cleans up the workspace. Same cost as the original intent (one shared cluster); just a different API path.
+- **Prevention / first-check:** When building multi-task Jobs with shared cluster compute, use `jobs.create` (persistent) + `run_now`, not `jobs.submit` (one-time). The SDK's `SubmitTask` is for the lighter "fire one notebook on one cluster" pattern.
+- **References:** `scripts/catchup_medallion.py`, PROGRESS S15.
+
+### #22 — 2026-05-25 — SQL Server `SUM(bit)` rejects in Spark JDBC schema probe
+- **Phase / Session:** S14, inventory notebook smoke test
+- **Category:** code
+- **Severity:** minor
+- **Effort:** ~5 min
+- **Status:** resolved 2026-05-25
+- **Symptom:** Smoke test of `notebooks/source_sim/write_inventory_snapshot.py` errored at the final verify step: `com.microsoft.sqlserver.jdbc.SQLServerException: Operand data type bit is invalid for sum operator.` The actual JDBC write had succeeded (189,225 rows landed), but the verify SELECT failed.
+- **Root cause:** The verify query had `SUM(stockout_flag)`. `stockout_flag` is `BIT` in SQL Server's `velora_pim.inventory_snapshot` schema. SQL Server rejects `SUM` on `BIT`. Spark's `spark.read.format("jdbc").option("query", ...).load()` triggers a schema probe (`SELECT * FROM (<query>) WHERE 1=0`) which propagates SQL Server's rejection up.
+- **Fix:** `SUM(stockout_flag)` → `SUM(CAST(stockout_flag AS INT))`. One-line patch.
+- **Prevention / first-check:** SQL Server has stricter type rules than ANSI SQL — `BIT` can't be aggregated except with `MIN`/`MAX`. When writing portable SQL that touches Spark JDBC + SQL Server, cast BIT/BOOLEAN to INT before aggregating.
+- **References:** `notebooks/source_sim/write_inventory_snapshot.py`, PROGRESS S14.
+
+### #21 — 2026-05-25 — Databricks KV-backed secret scope: AzureDatabricks SP missing KV `Secrets User` role
+- **Phase / Session:** S14, inventory notebook smoke test
+- **Category:** auth
+- **Severity:** major
+- **Effort:** ~15 min (diag + IaC + apply)
+- **Status:** resolved 2026-05-25
+- **Symptom:** First smoke test of the inventory notebook errored with `PERMISSION_DENIED: Invalid permissions on the specified KeyVault https://pipelineiq-kv-dev.vault.azure.net/. Caller: AzureDatabricks (oid=ee589af4-a29c-4ed9-9108-b64d579f4f42); Action: Microsoft.KeyVault/vaults/secrets/getSecret/action; Assignment: (not found)`. The notebook was trying to read `sql-admin-password` from KV via `dbutils.secrets.get(scope="pipelineiq-dev-kv", key=...)`.
+- **Root cause:** KV-backed secret scopes (Databricks `databricks_secret_scope` with `keyvault_metadata`) call Key Vault on the workspace's behalf via the **AzureDatabricks first-party Service Principal** (well-known app id `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d`; tenant-scoped object_id `ee589af4-a29c-4ed9-9108-b64d579f4f42` in our tenant) — NOT via the workspace access connector MSI. The SP had no role on the vault because no prior notebook had ever read a secret (bronze/silver/gold read from Delta Lake, not KV). The KV is in RBAC mode (not access-policy), so the SP needed `Key Vault Secrets User` role.
+- **Fix:** Added `azurerm_role_assignment.databricks_kv_secrets_user` to `core/databricks_uc/main.tf` granting `Key Vault Secrets User` to `var.azure_databricks_sp_object_id`. New var wired through to `clients/velora/terraform.tfvars` with the tenant-scoped object_id. `terraform apply` completed in 27s. Re-ran smoke test: clean. DECISIONS #71.
+- **Prevention / first-check:** When introducing the FIRST notebook that uses a KV-backed secret scope, also grant the AzureDatabricks first-party SP `Key Vault Secrets User` on the vault. Get the object_id via `az ad sp show --id 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d --query id -o tsv`. This is NOT documented prominently in Databricks docs; the error message at least names the SP clearly so you can grep for it.
+- **References:** DECISIONS #71, `PipelineIQ-IaC/core/databricks_uc/main.tf`, S14 PROGRESS log.
+
+### #20 — 2026-05-14 — `dim_customer` SCD-2 surrogate-key collisions from Spark lazy-eval
+- **Phase / Session:** S12 (mis-diagnosis) → S13 (real fix)
+- **Category:** data
+- **Severity:** major
+- **Effort:** ~4 hrs total across two sessions
+- **Status:** resolved 2026-05-14 (S13, DECISIONS #68)
+- **Symptom:** S12 health check on `gold.default.dim_customer` found 51/407 rows with duplicate `surrogate_key`. Surrogate key formula is `xxhash64(customer_id, valid_from)`. Both the closed-out OLD version and the inserted NEW version of each CHANGED customer shared the same `valid_from`, producing identical sk. Fact joins via `xxhash64(NK, valid_from)` would attribute facts to the wrong dim version for those 51 customers.
+- **Root cause:** Initially (DECISIONS #67) believed to be a formula bug — that the NEW-version rows for SCD-2 CHANGE customers reused the OLD `valid_from` instead of the change-detection date. Closer inspection in S13: the formula in `build_gold_dim_customer.py` was CORRECT (`F.when(_action == "NEW", first_activity_date).otherwise(current_date())`). Real root cause was **Spark lazy DataFrame re-evaluation across a write boundary.** `df_actioned` (lazy) was computed in step 3, then step 4's MERGE flipped `is_current=false` on SCD2_CHANGE rows. When step 6 evaluated `df_actioned.filter(_action.isin("NEW","SCD2_CHANGE"))`, Spark re-evaluated upstream `df_dim_current` — which now no longer found the just-closed customers, so the join produced NULLs, so `_action` flipped from `SCD2_CHANGE` to `NEW`, so `valid_from` defaulted to `first_activity_date` instead of `current_date()`. Identical sk to the closed row.
+- **Fix:** First attempt was `.cache()` on `df_actioned` — FAILED. Re-running on fresh data produced 13 NEW collisions. `.cache()` is a hint, not a contract: Spark may evict cached partitions under memory pressure or skip caching for `groupBy.count` shapes. **Real fix** (DECISIONS #68): bulletproof Delta temp-table materialization — `df_actioned.write.format("delta").saveAsTable(_tmp)` + `df_actioned = spark.table(_tmp)` immediately after step 3. Temp table dropped at end of step 8. Pinned to physical storage, immune to Spark's caching decisions. Verified on S15 catch-up wave: 723/723/0 collisions. Bug does NOT affect `dim_product` or `dim_sales_rep` (they derive `valid_from` from immutable source-effective dates, not from a join against the dim's own current state).
+- **Prevention / first-check:** **When a Spark notebook does (1) lazy DataFrame computation, (2) a write that mutates a table that DataFrame references, and (3) a later read of the same DataFrame — persist to a Delta temp table, don't rely on `.cache()`.** This pattern is common in SCD-2 close-then-insert flows. The SCD-2 health-check query that surfaces collisions is: `SELECT COUNT(*) FROM (SELECT surrogate_key, COUNT(*) c FROM gold.{dim} GROUP BY surrogate_key HAVING c>1)` — must return 0. Run it after every SCD-2 notebook deploy + after every multi-day catch-up wave.
+- **References:** DECISIONS #67 (misdiagnosis), DECISIONS #68 (real fix), `notebooks/gold/build_gold_dim_customer.py`, S12/S13 PROGRESS logs.
+
+### #19 — 2026-05-11 → 2026-05-25 — **Flex Function App worker reaper kills pyodbc inventory write — 11 days of silent partial fires**
+- **Phase / Session:** S11.1 → S11.2 → S12 → S13 → S14 (architectural migration)
+- **Category:** infra
+- **Severity:** blocker
+- **Effort:** ~10 hrs across 4 sessions (3 mitigation attempts + final migration)
+- **Status:** resolved 2026-05-25 (S14, DECISIONS #71 — supersedes #62 + #69)
+- **Symptom:** Daily Function fire at 00:30 UTC. Main batch (orders/lines/status_log/dim_changes) commits cleanly in ~1 min. Then `_write_inventory_snapshot` runs, writes 1-4 chunks of 5K rows each, then silently dies. Worker exits with no exception, no signal back to Python. AppTraces shows the last successful sub-batch trace then silence; App Insights shows no exception. Every fire from 2026-05-14 to 2026-05-24 lost inventory at 1-4 chunks (5K, 10K, 15K, 20K rows out of 189,225) — discovered by `scripts/audit_fires.py` at S14 start.
+- **Root cause:** Flex Consumption host runs Python in a separate worker process, communicating via gRPC. Worker reaper kills the worker when it shows no host-visible activity for >~30s, regardless of CPU usage. pyodbc's `cursor.executemany()` blocks the Python thread in C extension code with no callbacks; with 1000-row sub-batches at ~10s each, gRPC keepalive between host and worker silently expires. Plus: each 1000-row sub-batch takes ~10s on Flex's 2GB worker → full 189K rows needs ~31 min, OVER the 30-min function timeout. **The Function App is structurally unfit for 189K-row pyodbc writes regardless of any tuning.**
+- **Fix (history of attempts):**
+  - **S11.1 (DECISIONS #62):** chunked inventory write 1× → N chunks with per-chunk commit + progress logging. **Partial fix** — durable partial-commit, visible failure point, but didn't address worker-kill.
+  - **S13 (DECISIONS #69):** 3-pronged structural fix — (a) timer trigger disabled (Logic App sole fire path, no race), (b) `chunk_size` 10K → 5K (more frequent commits), (c) per-sub-batch `logger.info` for gRPC keepalive. **FAILED in the wild** — 11 consecutive fires all partial.
+  - **S14 (DECISIONS #71):** migrated the inventory write OUT of the Function App entirely. New `notebooks/source_sim/write_inventory_snapshot.py` Spark notebook + `core/inventory_workflow/` IaC module (Databricks scheduled Job at 00:35 UTC daily). Spark JDBC bulk insert with numPartitions=8 + batchsize=10000. No Flex reaper, no 30-min function timeout. ~3-4 min wall vs theoretical 30+ min. **Confirmed green** by smoke test on 2026-05-14: 189,225 rows / 4,205 distinct products / 45 distinct stores.
+- **Prevention / first-check:** **Function App on Flex Consumption (2GB worker) is unfit for synchronous bulk writes that exceed ~10K rows or ~30s wall time per executable batch.** If a workload looks like "daily snapshot of 100K+ rows via JDBC/pyodbc/executemany," move it to Databricks (Spark JDBC, no host reaper, designed for bulk) or upgrade to EP1 Premium (always-on instance, no idle reaper, +~Rs.8K/mo). EP1 is faster to implement but more expensive; Databricks is the architecturally correct answer when the workload is already medallion-shaped. Telemetry signal: AppTraces shows "last successful sub-batch" then silence (no exception); App Insights memory peaks under 1GB then drops to 0; Function App reports the run as a success (return value present) even though work was incomplete.
+- **References:** DECISIONS #62, #66, #69, #71. `generator/main.py::_write_inventory_snapshot`, `notebooks/source_sim/write_inventory_snapshot.py`, `core/inventory_workflow/`. S11.1, S12, S13, S14 PROGRESS logs.
+
+### #18 — 2026-05-09 — Flex Consumption timer trigger ALSO silently no-ops
+- **Phase / Session:** S9
+- **Category:** infra
+- **Severity:** major
+- **Effort:** ~30 min (diag + Logic App provisioning)
+- **Status:** resolved 2026-05-09 (DECISIONS #59)
+- **Symptom:** 2 consecutive scheduled timer fires on the Flex Consumption Function App (May 7 + May 8 windows that should have written 2026-05-07 + 2026-05-08 data) **silently no-op'd**. App Insights showed 0 host-startup traces for those windows — host wasn't waking at all. Function App was healthy on the management plane: `state: Running`, function `enabled: true`, schedule `0 30 0 * * *` unchanged. Manual HTTP invoke via `/admin/functions/generator` worked instantly, proving function code was fine.
+- **Root cause:** DECISIONS #50 thought the Y1 → Flex migration fixed timer-from-zero. **It didn't.** Flex's `runOnStartup` semantics only fire on fresh deploys or host wakes; for a Function App that's been idle (no HTTP traffic) for hours, the timer trigger gets the same scale-controller-misses-it problem as Y1 Linux Consumption. The Y1 → Flex migration only fixed manual HTTP invocation reliability, not scheduled-from-zero. We thought Flex was the fix because we kept manually invoking after deploys, which masked the from-zero failure.
+- **Fix:** Provisioned `pipelineiq-scheduler-dev` Logic App (Consumption tier, recurrence trigger at 00:30 UTC daily). Logic App POSTs to `/admin/functions/generator` with `x-functions-key` from `azurerm_function_app_host_keys.primary_key` data source. Logic App is Microsoft's managed cron with 99.9% SLA, no scale-to-zero concern, free at our cadence (1 fire/day << 4,000-action free grant). `core/scheduler/` IaC module. DECISIONS #59. Function timer trigger left in place as no-op fallback (idempotency guard makes a double-fire safe). Later in S13 (DECISIONS #69) the timer trigger was disabled entirely (schedule set to Feb 31 = never fires) to eliminate a timer/Logic-App race that contributed to incident #19.
+- **Prevention / first-check:** **For ANY daily Function App fire, use Logic App Consumption recurrence trigger as the source of truth, not the Function's built-in timer.** Cost is effectively zero at any reasonable cadence. The Function's timer trigger should only be used when (a) the function is HTTP-hot (frequent invocations keep the host warm) or (b) the cadence is >1/hr (frequent enough that scale-to-zero doesn't kick in). For < hourly cadences, Logic App + admin-endpoint POST is the right pattern.
+- **References:** DECISIONS #50 (supersedes the assumption that Flex fixed timer-from-zero), DECISIONS #59 (Logic App provisioning), DECISIONS #69 (timer disabled), `core/scheduler/`, S9 PROGRESS log.
 
 ### #17 — 2026-05-06 — Daily Function timer fired exactly once on Y1 Linux Consumption
 - **Phase / Session:** Phase 0 carry-over surfaced in S6

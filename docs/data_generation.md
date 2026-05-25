@@ -1,20 +1,42 @@
 # PipelineIQ — Data Generation
 
-*Written end of Phase 1. Generator fully built and verified.*
+*Written end of Phase 1. Updated S14 (2026-05-25) to reflect the two-writer
+architecture — see "Two writers" section below.*
 
 ---
 
 ## What the generator does
 
-The generator is a Python application that runs at 6am every day as an Azure Function.
-It produces realistic synthetic operational data for Velora Retail Group and writes it
-into Azure SQL Database across 10 source tables in 4 schemas. ADF picks up that data
-at the next pipeline run and moves it through the medallion layers.
+The synthetic data generator runs daily at 06:00 IST (00:30 UTC) and produces
+realistic operational data for Velora Retail Group across 10 source tables in
+4 schemas of `velora_oms`. ADF picks up that data at the next pipeline run and
+moves it through the medallion layers.
 
 The generator serves a specific purpose in PipelineIQ's architecture: it gives us a
 data source we fully control. Every column, every relationship, every edge case is
 deterministic and intentional. We can inject specific failure scenarios on demand and
 know exactly what they should look like downstream.
+
+---
+
+## Two writers (S14 architectural change, DECISIONS #71)
+
+As of 2026-05-25, the daily fire is split across **two coordinated writers**:
+
+| Writer | Cadence | Owns | Wall time | Why split |
+|---|---|---|---|---|
+| **Function App** `pipelineiq-functions-dev` | 00:30 UTC (Logic App fire) | orders, order_lines, order_status_log, customers, customer_addresses, dimension changes (price/launch/rep reassignment) | ~2 min | Small high-frequency writes — pyodbc + Flex Consumption is the right tool |
+| **Databricks Job** `pipelineiq-inventory-dev` | 00:35 UTC (Quartz cron) | inventory_snapshot (189,225 rows = 4,205 SKUs × 45 stores, daily full refresh) | ~3-4 min | Spark JDBC bulk insert with `numPartitions=8` — pyodbc on Flex couldn't push this volume reliably (11 consecutive partial fires under DECISIONS #69's mitigations; see incident_log.md #19) |
+
+**Two-writer race protection:** The Databricks notebook (`notebooks/source_sim/write_inventory_snapshot.py`) has a `verify_order_landed=true` widget that queries `velora_oms.orders WHERE order_date=?` before writing inventory — refuses if 0 orders, meaning the Function fire failed. The 5-minute gap (00:30 → 00:35) gives the Function time to commit; if it didn't, the day stays half-empty (visibly broken, not silently corrupted).
+
+**Source/ETL boundary preserved:** The Databricks notebook is filed under `notebooks/source_sim/`, NOT `notebooks/bronze/silver/gold/`. It's labeled as a source-system simulator (Velora's "nightly warehouse snapshot job") — the medallion ETL still consumes velora_oms downstream. This mirrors how real retailers actually run inventory snapshots on Spark/Snowflake/Synapse rather than the OLTP itself.
+
+Manual recovery for either writer:
+- Function-side: `cd generator && python main.py --date YYYY-MM-DD`
+- Databricks-side: `.venv/bin/python scripts/run_inventory_smoke.py --date YYYY-MM-DD --force`
+
+Both writers idempotent — Function has guard on `orders` existing for the date; Databricks notebook does DELETE+INSERT under `force=true`.
 
 ---
 
@@ -51,7 +73,8 @@ The business context explains every modelling decision in the schema.
 | status_updates.py | Advances existing orders through PENDING → PROCESSING → SHIPPED → DELIVERED. 2% of DELIVERED orders generate RETURN_INITIATED. |
 | dimension_changes.py | Weekly price changes (every Monday, 3-8 products). Monthly product launches (1st of month, 5-10 SKUs). Quarterly rep reassignments (quarter start, 1-2 reps). |
 | failure_injector.py | Controlled bad data injection. Accepts a failure_type flag. Implements all 6 failure scenarios. Operates on the in-memory batch before any DB writes. |
-| main.py | Orchestrator. Calls all modules in order. Writes everything in a single transaction. Supports --dry-run, --date, --failure, --seed CLI flags. Azure Function entry point. |
+| main.py | Orchestrator. Calls all modules in order. Writes orders/lines/status/dim-changes in a single transaction. **Inventory write removed S14 (DECISIONS #71)** — `_write_inventory_snapshot` function definition stays for `scripts/inventory_only.py` recovery path, but `run()` no longer calls it. Supports --dry-run, --date, --failure, --seed CLI flags. Azure Function entry point. |
+| **notebooks/source_sim/write_inventory_snapshot.py** | **S14 addition.** Spark notebook that owns the daily 189,225-row inventory_snapshot write. Reads `velora_pim.products` + `velora_pim.stores` via JDBC, synthesizes (product × store) grid deterministically via xxhash64, writes via JDBC bulk insert. Widgets: `snapshot_date`, `force`, `verify_order_landed`. Scheduled via `core/inventory_workflow/` Databricks Job at 00:35 UTC daily. |
 
 ---
 
