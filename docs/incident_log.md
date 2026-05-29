@@ -41,6 +41,7 @@ non-obvious or took disproportionate time relative to the fix.
 
 | # | Date | Title | Severity | Category | Effort | Hardest? |
 |---|------|-------|----------|----------|--------|----------|
+| 24 | 2026-05-29 | Stale `.env` (wrong SQL hostname) misread as DB cold-start — `HYT00 Login timeout` retry loop swallowed the real error | major | ops | ~90 min | **yes** |
 | 23 | 2026-05-25 | `jobs.submit` SubmitTask doesn't accept `job_cluster_key` — needs persistent Job | minor | tooling | ~10 min | no |
 | 22 | 2026-05-25 | SQL Server `SUM(bit)` rejects in Spark JDBC schema probe | minor | code | ~5 min | no |
 | 21 | 2026-05-25 | Databricks KV-backed secret scope: AzureDatabricks first-party SP missing KV `Secrets User` role | major | auth | ~15 min | no |
@@ -68,6 +69,25 @@ non-obvious or took disproportionate time relative to the fix.
 ---
 
 ## Entries
+
+### #24 — 2026-05-29 — Stale `.env` misread as DB cold-start
+- **Phase / Session:** Phase 2 / Session 16
+- **Category:** ops
+- **Severity:** major
+- **Effort:** ~90 min (4 wrong hypotheses chased before checking env vars)
+- **Status:** resolved 2026-05-29
+- **Symptom:** `scripts/audit_fires.py` against `velora_oms` failed three times in a row with the same trace: 12 cold-start retry attempts, each printing `[attempt N] cold-start: sleeping Xs …`, then `RuntimeError: Failed to wake Azure SQL after 12 attempts`. Direct `python -c "config.connect_aad(timeout=60)"` returned `OperationalError: ('HYT00', '[HYT00] [Microsoft][ODBC Driver 18 for SQL Server]Login timeout expired (0) (SQLDriverConnect)')`. Even a 300-second timeout connect failed with the same HYT00. Azure portal said the DB was paused (last paused 03:05 UTC).
+- **Wrong hypotheses chased (in order):**
+  1. *Firewall stale* — ran `scripts/update_sql_firewall_ip.sh`, "already points at 223.185.131.196 — nothing to do." Cross-checked rules table: our IP present, VPN IP present, Azure-services rule present. Not firewall.
+  2. *DB stuck paused* — bumped `auto-pause-delay 60 → 120` via `az sql db update`. Status flipped Paused → Online with a real `resumedDate`. Connect still HYT00.
+  3. *Token refresh / AAD cache* — verified `az account show` was on Sponsorship sub. Reissued `az login`. Same HYT00.
+  4. *Network path* — ruled out by the fact that `az sql db show` (management plane, same hostname) responded fast. Only the data plane was dead.
+- **Root cause:** `.env` was stale from S14 — `AZURE_SQL_SERVER=pipelineiq-sql-dev.database.windows.net` (server renamed away in S6 to `pipelineiq-sql-velora-dev`) and `AZURE_SQL_DATABASE=velora` (correct name is `velora_oms`). Every connect attempt resolved DNS to a non-existent hostname and timed out. The audit script's `connect_with_retry` catches `40613` / `HYT00` / `is not currently available` and silently retries — same UX for "DB is paused, wake in progress" vs "hostname doesn't exist." The wake-state hypothesis was reinforced by the genuine paused-DB state (true but coincidentally true).
+- **Fix:** Two lines in `.env`: `AZURE_SQL_SERVER=pipelineiq-sql-velora-dev.database.windows.net` + `AZURE_SQL_DATABASE=velora_oms`. Re-ran the audit — succeeded in ~10s with full 7-day output.
+- **Prevention / first-check:** When `audit_fires.py` (or any retry-wrapped connection script) hits its retry budget, INSTRUMENT the actual `pyodbc` error string before chasing new hypotheses. Two minutes of `print(str(e))` would have surfaced the wrong-hostname state on attempt 1. The blanket `HYT00 → retry` pattern is a symptom-level catch — for a tool that should diagnose, error strings need to be preserved + visible. Secondary lesson: every session-start should grep `.env` against the current resource names — the S14 carry-over had been documented as a follow-up and never executed; documentation alone wasn't enough.
+- **References:** PROGRESS.md 2026-05-29 (S16 session log → "Broke" → "First 90 minutes burned chasing the wrong root cause"). Commit `fc9b104`.
+
+---
 
 ### #23 — 2026-05-25 — `jobs.submit` SubmitTask doesn't accept `job_cluster_key`
 - **Phase / Session:** Phase 2 catch-up, Session 15
