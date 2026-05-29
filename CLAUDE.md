@@ -366,8 +366,9 @@ regardless. It's safe to run at the start of any session.
   explicit instruction and reason
 - `_delta_log/` directories in ADLS — never modify manually
 - Key Vault secrets — never read or print secret values in code or logs
-- PostgreSQL `pipeline_exec_log` and `pipelineiq.incident_store` — append-only,
-  never UPDATE or DELETE
+- PostgreSQL `pipelineiq.incident_store` — append-only, never UPDATE or DELETE
+- PostgreSQL `pipeline.pipeline_exec_log` — one INSERT (log_run_start) +
+  one UPDATE to close the row (log_run_end). No re-opens, no deletes.
 - Unity Catalog metastore — managed by Terraform only
 
 ---

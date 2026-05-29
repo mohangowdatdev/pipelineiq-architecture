@@ -90,8 +90,9 @@ CREATE INDEX IF NOT EXISTS idx_file_registry_entity_processed
     ON pipeline.file_registry (source_entity, processed_flag);
 
 -- ── pipeline.pipeline_exec_log ────────────────────────────────────────────────
--- Append-only execution log. Every pipeline run creates a row.
--- NEVER UPDATE or DELETE rows in this table.
+-- One row per pipeline run, opened on start, closed on end.
+-- Mutation policy: log_run_start INSERTs; log_run_end UPDATEs the matching
+-- open row (end_time IS NULL) once. No re-opens, no deletes.
 
 CREATE TABLE IF NOT EXISTS pipeline.pipeline_exec_log (
     log_id              SERIAL          PRIMARY KEY,
@@ -106,7 +107,6 @@ CREATE TABLE IF NOT EXISTS pipeline.pipeline_exec_log (
     rows_rejected       INT             NULL,
     error_message       TEXT            NULL,
     created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
-    -- Append-only. Never UPDATE or DELETE.
 );
 
 CREATE INDEX IF NOT EXISTS idx_exec_log_entity_time

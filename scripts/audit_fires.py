@@ -8,6 +8,7 @@ Retries 40613 (SQL serverless cold-start) up to 12 times with backoff.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -20,8 +21,9 @@ os.environ["AZURE_SQL_AUTH_MODE"] = "aad"
 import config  # noqa: E402
 import pyodbc  # noqa: E402
 
-START = date(2026, 5, 12)
-END = date(2026, 5, 24)
+
+def _parse_date(s: str) -> date:
+    return date.fromisoformat(s)
 
 
 def connect_with_retry():
@@ -41,6 +43,12 @@ def connect_with_retry():
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", type=_parse_date, default=date(2026, 5, 12))
+    ap.add_argument("--end", type=_parse_date, default=date(2026, 5, 24))
+    args = ap.parse_args()
+    START, END = args.start, args.end
+
     conn = connect_with_retry()
     cur = conn.cursor()
 

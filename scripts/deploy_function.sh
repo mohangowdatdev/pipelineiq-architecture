@@ -36,6 +36,8 @@ azure-functions>=1.18.0
 azure-identity>=1.15.0
 azure-monitor-opentelemetry>=1.6.0
 pyodbc>=5.0.0
+psycopg[binary]>=3.1
+psycopg-pool>=3.2
 numpy>=1.26.0
 pandas>=2.2.0
 faker>=24.0.0
@@ -50,6 +52,10 @@ rsync -a \
   --exclude='*.pyc' \
   --exclude='requirements.txt' \
   "$REPO_ROOT/generator/" "$STAGE_DIR/generator/"
+
+# V2 model: function_app.py at deploy root for the control-plane HTTP endpoints.
+# Coexists with the V1 generator/ timer function.
+cp "$REPO_ROOT/functions/function_app.py" "$STAGE_DIR/function_app.py"
 
 echo "Stage contents:"
 (cd "$STAGE_DIR" && find . -type f | sort)

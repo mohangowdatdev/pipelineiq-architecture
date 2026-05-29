@@ -13,25 +13,25 @@ can pick up cleanly without re-deriving the order.
 
 ---
 
-## Where we are (S14 wrap, 2026-05-25)
+## Where we are (S16 wrap, 2026-05-29)
 
 | Layer | State |
 |---|---|
-| Source generator (Function) | ✅ Live, autonomous, **inventory write removed** |
-| Inventory writer (Databricks Job) | ✅ Live, autonomous, 00:35 UTC daily |
-| Source DB `velora_oms` | ✅ 24 days continuous (2026-04-27 → 2026-05-24) |
-| Medallion (bronze + silver + gold) | ⚠️ **11 days behind source** (through 2026-05-13) — needs catch-up |
-| Postgres `pipeline.*` schema | ⚠️ Provisioned + seeded, **architecturally orphaned** (no consumer) |
+| Source generator (Function) | ✅ Live, autonomous, **migrated V1 → V2 (S16)** |
+| Inventory writer (Databricks Job) | ✅ Live, autonomous, 00:35 UTC daily; **4 nights validated** |
+| Source DB `velora_oms` | ✅ 32 days continuous (2026-04-27 → 2026-05-28) |
+| Medallion (bronze + silver + gold) | ✅ Through 2026-05-28 (S16 catch-up) |
+| Postgres `pipeline.*` schema | ✅ **Consumer live (S16 Function REST endpoints) — `pipeline_exec_log` + `file_registry` have first-ever rows** |
 | Postgres `pipelineiq.*` schema (incident_store + iac_embeddings) | ⚠️ Tables exist, 0 rows |
-| Function REST endpoints | ❌ Architected, never written |
-| ADF (Tier 6) | ❌ Not started |
+| Function REST endpoints | ✅ **Live (S16)** — 5 endpoints in `functions/function_app.py`, smoke green |
+| ADF (Tier 6) | ⚠️ Resource + linked services + datasets queued for S17 |
 | pgvector chunker + IaC webhook | ❌ Not started (Phase 4) |
 | Failure injection + RCA loop | ❌ Not started (Phase 3) |
 | FastAPI backend | ❌ Not started (Phase 5) |
 | React dashboard | ❌ Not started (Phase 6) |
 
-The Function App + Databricks Job pair is the only thing running
-autonomously today. Everything downstream is still manual.
+The Function App (with the new control-plane API) + Databricks Job pair is the
+autonomous core. ADF is the next consumer to wire in.
 
 ---
 
