@@ -34,7 +34,8 @@
       "Bash(terraform -chdir=/Users/mohangowdat/Documents/Projects/PipelineIQ/PipelineIQ-IaC/clients/velora plan -out=tfplan)",
       "Bash(ps -p 14226 -o pid,state,etime)",
       "Bash(kill 15352 14226 13926)",
-      "Bash(.venv/bin/python -c ' *)"
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(git *)"
     ]
   }
 }
