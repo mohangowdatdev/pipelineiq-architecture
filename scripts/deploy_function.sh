@@ -4,7 +4,9 @@
 # Builds a deployment ZIP with:
 #   - host.json at root (moved from generator/host.json)
 #   - requirements.txt at root (slim — only generator deps)
-#   - generator/ directory with function.json + main.py + all generator modules
+#   - function_app.py at root (V2 model: generator timer + 5 control-plane endpoints)
+#   - generator/ directory with main.py + all generator modules (V1 function.json
+#     removed in S17 — dead under the V2 host)
 #
 # Then ZIP-deploys via `az functionapp deployment source config-zip`.
 # Azure Oryx builds the Python deps server-side (SCM_DO_BUILD_DURING_DEPLOYMENT=true).

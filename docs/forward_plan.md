@@ -13,18 +13,18 @@ can pick up cleanly without re-deriving the order.
 
 ---
 
-## Where we are (S16 wrap, 2026-05-29)
+## Where we are (S17 wrap, 2026-06-03)
 
 | Layer | State |
 |---|---|
-| Source generator (Function) | ✅ Live, autonomous, **migrated V1 → V2 (S16)** |
-| Inventory writer (Databricks Job) | ✅ Live, autonomous, 00:35 UTC daily; **4 nights validated** |
-| Source DB `velora_oms` | ✅ 32 days continuous (2026-04-27 → 2026-05-28) |
-| Medallion (bronze + silver + gold) | ✅ Through 2026-05-28 (S16 catch-up) |
-| Postgres `pipeline.*` schema | ✅ **Consumer live (S16 Function REST endpoints) — `pipeline_exec_log` + `file_registry` have first-ever rows** |
+| Source generator (Function) | ✅ Live, autonomous, V2 (S16); generator wrapper fires confirmed across 5 nights (S17) |
+| Inventory writer (Databricks Job) | ✅ Live, autonomous, 00:35 UTC daily; **9 nights validated** (5/25→6/02) |
+| Source DB `velora_oms` | ✅ 33 days continuous (2026-04-27 → 2026-06-02); catalogue grew 4,205 → 4,214 SKUs on 6/01 |
+| Medallion (bronze + silver + gold) | ✅ Through 2026-06-02 (S17 catch-up, verify all green) |
+| Postgres `pipeline.*` schema | ✅ **Consumer live (S16 Function REST endpoints); `POSTGRES_URL` reconciled into IaC (S17)** |
 | Postgres `pipelineiq.*` schema (incident_store + iac_embeddings) | ⚠️ Tables exist, 0 rows |
-| Function REST endpoints | ✅ **Live (S16)** — 5 endpoints in `functions/function_app.py`, smoke green |
-| ADF (Tier 6) | ⚠️ Resource + linked services + datasets queued for S17 |
+| Function REST endpoints | ✅ **Live (S16), redeployed healthy (S17)** — 5 endpoints in `functions/function_app.py` |
+| ADF (Tier 6) | ⚠️ Resource + linked services + datasets queued for S18 |
 | pgvector chunker + IaC webhook | ❌ Not started (Phase 4) |
 | Failure injection + RCA loop | ❌ Not started (Phase 3) |
 | FastAPI backend | ❌ Not started (Phase 5) |

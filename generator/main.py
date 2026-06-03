@@ -73,6 +73,11 @@ if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
         from azure.monitor.opentelemetry import configure_azure_monitor
 
         configure_azure_monitor(logger_name="generator")
+        # Stop "generator" records from also propagating to the Functions
+        # runtime root handler — without this every user log lands twice in
+        # AppTraces (OT handler + root handler both forward). Cosmetic but
+        # noisy. S17.
+        logging.getLogger("generator").propagate = False
         logger.info("Azure Monitor OpenTelemetry configured")
     except Exception as _e:  # pragma: no cover — telemetry must never break runs
         logging.getLogger().warning("Azure Monitor init failed: %s", _e)

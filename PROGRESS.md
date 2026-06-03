@@ -10,19 +10,19 @@
 - [Notes and blockers](#notes-and-blockers) — open items
 - [Session Log](#session-log) — newest-first journal of every session
 
-## At a glance (2026-05-29)
+## At a glance (2026-06-03)
 
 | Layer | Status | Detail |
 |---|---|---|
 | Source generator (Function) | ✅ Live + autonomous, **migrated V1 → V2 (S16, DECISIONS #72)** | Logic App fires daily 00:30 UTC via admin endpoint. Generator now lives as a V2 timer-trigger wrapper in `functions/function_app.py` that delegates to `generator.main:main`. Schedule `0 0 0 31 2 *` (Feb 31, never auto-fires). ~2 min wall, idempotent. |
 | **Pipeline control-plane API (S16)** | ✅ **Live** | 5 HTTP endpoints in `functions/function_app.py` (V2 decorators, psycopg3 + pool, function-key auth): `GET/POST watermarks/{entity}`, `POST files/register`, `POST runs/start`, `POST runs/{run_id}/end`. First consumer of `pipeline.*` — `pipeline_exec_log` and `file_registry` have their first-ever rows (log_id=1, file_id=1). |
 | **Inventory writer (Databricks Job)** | ✅ **Live (S14), 4 consecutive nights validated (S16)** | New `pipelineiq-inventory-dev` Databricks Job, 00:35 UTC daily. 5/25→5/28 each wrote exactly 189,225 rows — S14 two-writer architecture canonically proven. |
-| Source DB (`velora_oms`) | ✅ **32 days continuous** | 2026-04-27 → 2026-05-28. Auto-pause delay bumped 60 → 120 min as a side-effect of management-plane resume early in S16. |
-| Landing (ADLS Parquet) | ✅ Up to date through 2026-05-28 | 32 by-date partitions for orders + inventory; full snapshot per other entity. |
-| Bronze (Delta) | ✅ 12/12 tables through 2026-05-28 | Re-ingested 4 new days in S16 via multi-task Job. |
-| Silver (Delta) | ✅ 10/10 tables through 2026-05-28 | 100% DQ pass. `inventory_snapshot` **6,054,075**; `order_lines` 40,973; `orders` 12,079; `order_status_log` 31,956; `customers` 805; `customer_addresses` 805. |
-| Gold dims | ✅ 9/9 dims, **0 SCD-2 collisions** | `dim_customer` 884 (805 current + 79 SCD-2 versions). `dim_product` 4,234 (4,205 current + 29 historical versions). `dim_sales_rep` 30. S13 bulletproof fix held through another +161 SK wave. |
-| Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **40,973**; `fact_inventory_daily` **6,054,075**; `fact_daily_channel_revenue` 11,753. 0 FK orphans. |
+| Source DB (`velora_oms`) | ✅ **33 days continuous** | 2026-04-27 → 2026-06-02. Product catalogue grew 4,205 → 4,214 SKUs on 2026-06-01 (inventory snapshots correctly 189,630/day after). Auto-pause delay 120 min (IaC says 60 — next apply realigns). |
+| Landing (ADLS Parquet) | ✅ Up to date through 2026-06-02 | by-date partitions for orders + inventory; full snapshot per other entity. |
+| Bronze (Delta) | ✅ 12/12 tables through 2026-06-02 | Re-ingested 5 new days (5/29→6/02) in S17 via multi-task Job. |
+| Silver (Delta) | ✅ 10/10 tables through 2026-06-02 | 100% DQ pass. `inventory_snapshot` **7,001,010**; `order_lines` 47,162; `order_status_log` 37,571; `customers` 916; `customer_addresses` 916; `product_pricing` 4,249. |
+| Gold dims | ✅ 9/9 dims, **0 SCD-2 collisions** | `dim_customer` 995 (916 current + 79 SCD-2 versions). `dim_product` 4,249 (4,214 current + 35 historical versions). `dim_sales_rep` 30. S13 bulletproof fix held through the S17 wave (incl. the 9 new SKUs). |
+| Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **47,162**; `fact_inventory_daily` **7,001,010**; `fact_daily_channel_revenue` 13,555. 0 FK orphans. |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
 | ADF Bicep (Tier 6) | ⏳ Pending — chunk 1 partial | Function REST endpoints done (S16). ADF resource + linked services + datasets queued for next session. |
@@ -34,7 +34,7 @@
 ## Current phase
 
 **Phase 0 — Done. Phase 1 — Done. Phase 2 — MEDALLION FULLY COMPLETE
-THROUGH 2026-05-28 (S16 catch-up).** Bronze 12/12, Silver 10/10, Gold 12/12.
+THROUGH 2026-06-02 (S17 catch-up, verify all green).** Bronze 12/12, Silver 10/10, Gold 12/12.
 All reconciles exact, 0 SCD-2 collisions, 0 FK orphans. **S16 closed the
 "architecturally orphaned `pipeline.*` schema" gap** — Function App migrated
 V1 → V2 (DECISIONS #72), 5 new HTTP endpoints (`functions/function_app.py`)
@@ -47,37 +47,37 @@ schedule pattern + Logic App admin-invoke unchanged. **DECISIONS #73:
 UPDATEs the same row's end_time + status + rows_* + error_message;
 `incident_store` remains append-only). **Two-writer architecture (S14)
 canonically validated** — 4 consecutive autonomous nights 5/25-5/28 each
-landed exactly 189,225 inventory rows + on-time Function fires. Remaining
-for Phase 2: ADF resource + linked services + parameterised datasets (S17,
-Tier 6 chunk 1.5). Next phases: see `docs/forward_plan.md`.
+landed exactly 189,225 inventory rows + on-time Function fires. **S17 (0.5
+session) caught the medallion up 5 more nights (5/29→6/02) — all 5 Function
+fires + Databricks inventory writes green, verify all checks passed.**
+Remaining for Phase 2: ADF resource + linked services + parameterised
+datasets (S18, Tier 6 chunk 1). Next phases: see `docs/forward_plan.md`.
 
 46 Azure resources live. Function App on FC1 Flex Consumption + Logic App
 `pipelineiq-scheduler-dev` (00:30 UTC fire). New `pipelineiq-inventory-dev`
 Databricks Job (00:35 UTC fire). KV `Secrets User` role granted to
 AzureDatabricks first-party SP for KV-backed secret scope access.
 
-**Source DB:** **28 days of real-dated activity, 2026-04-27 → 2026-05-24**,
-in `velora_oms`. 11 days recovered in S14 via laptop AAD-token script
-(`scripts/inventory_only.py` × 11). 5/26 00:30+00:35 UTC autonomous fire
-pair is the first canonical end-to-end test of the new two-writer
-architecture — verify next session via `scripts/audit_fires.py`.
+**Source DB:** **33 days of real-dated activity, 2026-04-27 → 2026-06-02**,
+in `velora_oms`. The 5 newest nights (5/29→6/02) landed fully autonomously
+(no recovery needed). Product catalogue grew 4,205 → 4,214 SKUs on 2026-06-01
+— inventory snapshots correctly switched to 189,630/day (4,214 × 45 stores).
 
-**Silver (through 2026-05-24):**
-- `orders` (10,491), `customers` (701), `order_lines` (35,525)
-- `products` (4,205), `product_pricing` (4,228), `sales_reps` (30), `territory_assignments` (30)
-- `inventory_snapshot` (**5,297,175** — 28 days × ~189K, partitioned by `snapshot_date`)
-- `order_status_log` (27,735 — allows 7 states incl. RETURN_INITIATED)
-- `customer_addresses` (701 — every customer has exactly 1 primary)
+**Silver (through 2026-06-02):**
+- `order_lines` (47,162), `customers` (916), `customer_addresses` (916)
+- `products` (4,214), `product_pricing` (4,249), `sales_reps` (30), `territory_assignments` (30)
+- `inventory_snapshot` (**7,001,010** — 33 days, partitioned by `snapshot_date`)
+- `order_status_log` (37,571 — allows 7 states incl. RETURN_INITIATED)
 
-**Gold (through 2026-05-24, S15 verify all green):**
-- `dim_customer` (**723** = 701 current + 22 SCD-2 versions for segment/city changes, **0 collisions** — S13 bulletproof fix held)
-- `dim_product` (**4,228** = 4,205 current + 23 historical price-change versions, **0 collisions**)
-- `dim_sales_rep` (30, no SCD changes in window, **0 collisions**)
+**Gold (through 2026-06-02, S17 verify all green):**
+- `dim_customer` (**995** = 916 current + 79 SCD-2 versions, **0 collisions** — S13 bulletproof fix held)
+- `dim_product` (**4,249** = 4,214 current + 35 historical price-change versions, **0 collisions** — absorbed the 9 new SKUs cleanly)
+- `dim_sales_rep` (30, **0 collisions**)
 - `dim_territory` (9 = 8 real + `D2C_NATIONAL` sentinel)
 - `dim_date` (4,018), `dim_sales_channel` (3), `dim_product_category` (35), `dim_store` (45), `dim_order_status` (7)
-- `fact_order_line` (**35,525 == silver.order_lines exactly**)
-- `fact_inventory_daily` (**5,297,175 == silver.inventory_snapshot exactly**)
-- `fact_daily_channel_revenue` (10,224 at (date, channel, category, territory) grain)
+- `fact_order_line` (**47,162 == silver.order_lines exactly**)
+- `fact_inventory_daily` (**7,001,010 == silver.inventory_snapshot exactly**)
+- `fact_daily_channel_revenue` (13,555 at (date, channel, category, territory) grain)
 - **0 FK orphans** on every fact
 
 **Quarantine:** All Silver notebooks wire the routing path; no rows
@@ -94,239 +94,51 @@ S15 (architecture migration only, no new columns/tables).
 
 ## Next task
 
-**Session 17 priority order (confirmed at S16 wrap). See `docs/forward_plan.md` for full S17→S21 outline.**
+**Session 18 — Tier 6 ADF chunk 1.** Medallion is current through 2026-06-02
+(S17). The Postgres control-plane API is live (S16) and now reconciled into
+IaC (S17). ADF is the next consumer to wire in. See `docs/forward_plan.md`
+for the full S18→S21 outline.
 
-1. **Catch up medallion for any nights since S16** — 2026-05-29 autonomous
-   fire writes 5/28 (already audited + caught up in S16), but 5/30, 5/31, etc.
-   will need rolling catch-up. Same drill: `scripts/audit_fires.py --start
-   {last_caught_up+1} --end {today-1}`, then `scripts/export_velora_to_landing.py
-   --start --end`, then `scripts/catchup_medallion.py --layer bronze|silver|gold`,
-   then `scripts/verify_catchup_final.py`. ~30 min wall per session if 1-3 days.
+1. **Catch up medallion for any nights since S17** (rolling — usually 1–5 days):
+   ```
+   python scripts/audit_fires.py --start <last+1> --end <today-1>
+   .venv/bin/python scripts/export_velora_to_landing.py --start <last+1> --end <today-1>
+   .venv/bin/python scripts/catchup_medallion.py --layer bronze   # then silver, then gold
+   .venv/bin/python scripts/verify_catchup_final.py
+   ```
+   ~25–30 min wall if 1–5 days. (Firewall: `bash scripts/update_sql_firewall_ip.sh`
+   first if off VPN — current laptop IP rotates.)
 
-2. **Tier 6 ADF Bicep chunks (continue S16 work):**
+2. **Tier 6 ADF Bicep chunk 1:**
    - **ADF resource** (build_order 6.1) — Terraform `pipelineiq-adf-dev` in
      `PipelineIQ-IaC/core/adf/`.
-   - **Linked services** (6.2) — 4 Bicep files: Azure SQL (`velora_oms`),
-     ADLS Gen2, Key Vault, Databricks. Use Key Vault references for secrets,
-     Databricks PAT or MSI for the DBX linked service.
+   - **Linked services** (6.2) — 4 Bicep: Azure SQL (`velora_oms`), ADLS Gen2,
+     Key Vault, Databricks. KV references for secrets. **Open decision: DBX
+     linked-service auth — MSI (recommended) vs PAT.**
    - **Parameterised datasets** (6.3) — Bicep, parameterised by
-     `(schema, table, watermark_column, load_type)` driven from
-     `pipeline.entity_registry` (12 rows already seeded).
-   - **Smoke** — manually run one ForEach iteration against `velora_oms.orders`
-     for a single date, confirm landing/orders/date=YYYY-MM-DD/ shows the file
-     and the Function endpoints get hit (`pipeline_exec_log` should grow).
+     `(schema, table, watermark_column, load_type)` from `pipeline.entity_registry`
+     (12 rows seeded).
+   - **Smoke** — run one ForEach iteration against `velora_oms.orders` for one
+     date; confirm `landing/orders/date=YYYY-MM-DD/` shows the file and the
+     Function endpoints get hit (`pipeline_exec_log` grows).
 
-3. **Tier 6 chunk 2 (S18 main):** master parameterised copy pipeline
-   (build_order 6.4) + Databricks notebook activities (6.5) + diagnostic
-   settings (6.6) + cutover (6.11). After this, "metadata-driven" is fully
-   real — the laptop scaffold script can be decommissioned.
+3. **Tier 6 chunk 2 (S19):** master parameterised copy pipeline (6.4) +
+   Databricks notebook activities (6.5) + diagnostic settings (6.6) +
+   cutover (6.11). After this, "metadata-driven" is fully real — the laptop
+   scaffold script can be decommissioned.
 
-4. **Phase 4 (pgvector)** can interleave with Tier 6 — independent.
-   See `docs/forward_plan.md` S18 row.
-
-5. **Phase 3 (failure injection + RCA)** — needs Tier 6 signals first.
+4. **Phase 4 (pgvector)** can interleave — independent. **Phase 3 (failure
+   injection + RCA)** needs Tier 6 signals first.
 
 ### Operational follow-ups (small, interleave anywhere)
 
-- **POSTGRES_URL app setting added to Function App via `az` CLI in S16
-  (`@Microsoft.KeyVault(VaultName=pipelineiq-kv-dev;SecretName=postgres-connection-string)`)
-  — needs to be reflected in IaC** (`PipelineIQ-IaC/core/functions/main.tf`
-  `app_settings` block). Drift today; the next `terraform apply` would remove
-  it. ~5 min IaC edit.
-- Function timeout 30m → 5m (inventory write is out of the FA). Fold into next
-  deploy round-trip.
-- `propagate=False` on OT logger (dedupe AppTraces). Fold into next deploy.
 - Retire `scripts/inventory_only.py` in favour of `scripts/run_inventory_smoke.py`.
-- `velora_oms.auto_pause_delay` left at 120 min (bumped from 60 in S16 to
-  resume the DB via management plane). Revert to 60 if you want — harmless.
-- The V1 `generator/function.json` is now dead code (V2 host ignores it).
-  Delete it to clean source, or leave as a historical marker. Defer.
-
-2. **Catch up medallion for 2026-05-25** once the fire lands — same
-   `scripts/catchup_medallion.py` pattern but for 1 day. Should take ~25
-   min wall (bronze + silver + gold sequential layers, multi-task within).
-
-3. **Tier 6 ADF Bicep chunk 1** (S16 main work):
-   - **Function REST endpoints** (build_order 4.8): `get_watermark`,
-     `commit_watermark`, `register_file`, `log_run_start`, `log_run_end`
-     as a new function group `functions/api/` under the existing Function
-     App. Unit-test against Postgres locally. Deploy. Smoke each via
-     `curl` with function key.
-   - **ADF resource** (6.1) — Terraform.
-   - **Linked services** (6.2) — 4 Bicep files: Azure SQL, ADLS, KV, DBX.
-   - **Parameterised datasets** (6.3) — Bicep, parameterised by
-     `(schema, table, watermark_column, load_type)` from `entity_registry`.
-
-4. **Tier 6 chunk 2 (S17)** — master parameterised copy pipeline +
-   `pipeline.*` activation + cutover. See `docs/forward_plan.md` S17.
-
-5. **Phase 4 (pgvector)** can interleave with Tier 6 — independent.
-   See `docs/forward_plan.md` S18.
-
-6. **Phase 3 (failure injection + RCA)** — S19. Blocked on Tier 6 signals.
-
-### Operational follow-ups (small, interleave anywhere)
-
-- Stale `.env` (`pipelineiq-sql-dev` → `pipelineiq-sql-velora-dev`) — 1 min
-- Function timeout 30m → 5m (inventory write is out) — 1 deploy cycle, fold into S16
-- Retire `scripts/inventory_only.py` in favour of `scripts/run_inventory_smoke.py` — 5 min
-- `propagate=False` for OT logger to fix duplicate AppTraces — 1 deploy cycle
-
-### Verification queries for the 5/15 00:30 UTC fire
-
-```sql
--- on velora_oms (use AAD token / az login auth — laptop)
-SELECT order_date, COUNT(*) AS n FROM velora_oms.orders
-WHERE order_date='2026-05-14' GROUP BY order_date;
-
-SELECT COUNT(*) FROM velora_pim.inventory_snapshot
-WHERE snapshot_date='2026-05-14';
-
-SELECT COUNT(*) FROM velora_oms.order_status_log
-WHERE created_at >= '2026-05-15T00:25:00';
-```
-
-```kusto
-// LA workspace pipelineiq-logs-dev (NOT az monitor app-insights query)
-AppTraces
-| where TimeGenerated between (datetime(2026-05-15T00:25:00Z)..datetime(2026-05-15T01:00:00Z))
-| where Message has_any ('Inventory','generator','committed','sub-batch','chunk_size','Function fire','completed')
-| where Message !startswith 'LoggerFilterOptions' and Message !startswith '{' and Message !contains 'pandas only supports'
-| project TimeGenerated, SeverityLevel, Message
-| order by TimeGenerated asc
-```
-
-Expected (S13-fix happy path): single fire (no timer race),
-`chunk_size=5000 sub_batch=1000` in startup log, then ~190 sub-batch
-traces (38 chunks × 5 sub-batches each), 38 chunk-commit traces ending
-at `189225 / 189225`, then `Azure Function completed for 2026-05-14`
-with non-`_skipped` payload.
-
-### Carry-over: 2026-05-13 autonomous-fire checklist
-
-After the 00:30 UTC fire, verify:
-
-```sql
--- on velora_oms
-SELECT order_date, COUNT(*) AS n FROM velora_oms.orders
-WHERE order_date='2026-05-12' GROUP BY order_date;
-
-SELECT COUNT(*) FROM velora_pim.inventory_snapshot
-WHERE snapshot_date='2026-05-12';
-
-SELECT COUNT(*) FROM velora_oms.order_status_log
-WHERE created_at >= '2026-05-13T00:25:00';
-```
-
-Then in LA workspace (NOT `az monitor app-insights query`):
-
-```kusto
-AppTraces
-| where TimeGenerated between (datetime(2026-05-13T00:25:00Z)..datetime(2026-05-13T01:00:00Z))
-| where Message has 'Inventory' or Message has 'generator' or Message has 'committed'
-| project TimeGenerated, SeverityLevel, Message
-| order by TimeGenerated asc
-```
-
-Expected: `Azure Monitor OpenTelemetry configured`, then `Azure Function fire — writing for 2026-05-12`, then 19 chunk-commit traces ending at `189225 / 189225`, then `Azure Function completed for 2026-05-12`.
-
-If inventory comes up partial, the last chunk-commit trace pinpoints the
-death point exactly — that's the diagnostic gain from S12.
-
-### Old next-task block (kept for reference):
-
-**Pre-work to do at the start of S11 (in this order):**
-
-1. **Verify the Logic-App-driven autonomous fire(s) since S10 landed.**
-   S10 ran on 2026-05-09 evening before the 2026-05-10 00:30 UTC fire.
-   By S11, at least one fire should have landed:
-   ```sql
-   SELECT order_date, COUNT(*) AS orders_count,
-          MIN(created_at) AS first_insert_utc
-   FROM velora_oms.orders
-   WHERE order_date >= '2026-05-09'
-   GROUP BY order_date ORDER BY order_date;
-   ```
-   Each row should have `first_insert_utc` between 00:30–00:40 UTC and
-   270–550 orders. Also verify `velora_oms.order_status_log` and
-   `velora_pim.inventory_snapshot` for the same dates.
-
-2. **Catch up bronze + silver + gold for any new dates** (idempotent
-   MERGE everywhere — safe to re-run). Re-export landing, re-ingest
-   bronze, re-run silver + gold:
-   ```
-   .venv/bin/python scripts/export_velora_to_landing.py --start 2026-05-07 --end <latest>
-   # bronze ingest for each entity that grew
-   .venv/bin/python scripts/run_silver_smoke.py --entity {orders,customers,order_lines,products,product_pricing,sales_reps,territory_assignments}
-   .venv/bin/python scripts/run_gold_smoke.py --entity {dim_customer,dim_product,dim_sales_rep,dim_territory,static_dims,fact_order_line,fact_daily_channel_revenue}
-   ```
-
-3. **Then start chunk 4.** Four notebooks (one is the only remaining
-   meaningful Gold work; the other three Silvers are trailing-edge with
-   no current Gold consumer):
-
-   a. **`notebooks/silver/build_silver_inventory_snapshot.py`** —
-      1.89M rows, partition discipline matters. Dedup on
-      `(product_id, store_id, snapshot_date)`. DQ rules:
-      `NULL_SNAPSHOT_ID`, `NULL_PRODUCT_ID`, `NULL_STORE_ID`,
-      `NULL_SNAPSHOT_DATE`, `NEGATIVE_STOCK`. Partition by
-      `_silver_date` plus consider partitioning by `snapshot_date` for
-      the fact's downstream as-of join. Most join-heavy Silver build
-      to date.
-
-   b. **`notebooks/gold/build_gold_fact_inventory_daily.py`** — grain
-      `(snapshot_date_id, product_surrogate_key, store_id)`. As-of
-      join `dim_product` on `snapshot_date` (use the same
-      `asof_attach()` helper from `fact_order_line` — it's
-      copy-paste-able). 7-day trailing-avg `days_of_stock_remaining`
-      formula per SCHEMA.md.
-
-   c. **`notebooks/silver/build_silver_order_status_log.py`** — no
-      current Gold consumer. Trailing-edge cleanup. Dedup on
-      `log_id`. DQ rules: `NULL_LOG_ID`, `NULL_ORDER_ID`,
-      `NULL_FROM_STATUS`, `NULL_TO_STATUS`, `NULL_CHANGED_AT`,
-      `INVALID_STATUS_TRANSITION` (from→to must match a known graph).
-
-   d. **`notebooks/silver/build_silver_customer_addresses.py`** — no
-      current Gold consumer. Trailing-edge. Dedup on `address_id`. DQ
-      rules: `NULL_ADDRESS_ID`, `NULL_CUSTOMER_ID`,
-      `UNKNOWN_CUSTOMER_ID` (FK to `silver.customers`),
-      `NULL_ADDRESS_LINE`, `NULL_PINCODE`, `INVALID_PINCODE` (6-digit
-      Indian PIN format).
-
-4. **Verify + delete the chunk plan section.** After chunk 4's
-   `verify_gold_chunk4.py` is green, delete the `## Medallion chunk
-   plan (S10 → S13)` section from CLAUDE.md — its job is done.
-
-After chunk 4: Phase 2 medallion fully complete. Next phase work is
-ADF Bicep replacement for the manual landing-export script (Tier 6),
-then Phase 3 failure-injection.
-
-### Phase 0 loose ends (interleave when convenient)
-
-1. ~~Tier 4.6 Azure Functions app module~~ **Done (S5 add. → migrated to FC1
-   Flex in S6, DECISIONS #50).** Cron `0 0 6 * * *` UTC; first reliability
-   proof is the May 7 06:00 UTC fire.
-2. **Tier 6 ADF (Bicep).** Linked services (SQL, ADLS, KV, Databricks) + parameterised
-   datasets + copy pipeline `velora_oms.*` → `landing/`. Will eventually replace
-   `scripts/export_velora_to_landing.py`.
-3. ~~Move generator to Azure Function~~ **Done.**
-4. **Fix generator `--dry-run` mode** (item 9.1, low priority).
-5. **App Insights telemetry on Flex.** Function executes (proven via DB
-   side-effects) but `requests` / `traces` / `exceptions` tables stay empty.
-   Likely a Flex instrumentation tweak. Investigate when Phase 4+ needs
-   structured RCA traces.
-
-### Phase 2 → 8 (rough order)
-
-1. Bronze → Silver → Gold notebooks (Phase 2)
-2. ADF orchestration binds it all (Phase 2 end)
-3. Failure injection + incident capture pipeline (Phase 3)
-4. pgvector IaC ingestion + RCA prompt chain (Phase 4)
-5. FastAPI + Slack webhook (Phase 5)
-6. React dashboard merged with Portal code (Phase 6)
-7. Pattern memory + drift detection (Phase 7)
-8. End-to-end demo polish (Phase 8)
+- `velora_oms.auto_pause_delay` is 120 min live (IaC says 60) — next
+  `terraform apply` on the SQL module realigns it. Harmless drift.
+- Two App Insights app-settings keys show as a benign `+` add on the next FA
+  `terraform apply` (live FA wires them via `site_config` instead) — pre-existing,
+  not introduced in S17. No action needed.
+- Generator `--dry-run` bug (build_order 9.1) — low priority.
 
 ## Commands (copy-paste reference)
 
@@ -511,6 +323,25 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-06-03 (Session 17 — 0.5 session: medallion catch-up 5/29→6/02 + clear the pre-ADF backlog)
+**Objective:** Audit the 5 autonomous nights since S16, roll the medallion forward, verify, and clear the small backlog blocking ADF (POSTGRES_URL IaC drift + Function hygiene). Half session — no new feature work.
+**Built/changed:**
+- `PipelineIQ-IaC/core/functions/main.tf` — added `POSTGRES_URL` KV-reference to the static `app_settings` map (F1, was set via `az` CLI in S16, not IaC). Targeted `terraform plan` confirms the key now shows as *unchanged* (zero diff) — no longer at risk of being wiped on the next apply.
+- `scripts/audit_fires.py` — replaced the hardcoded `189225` partial-check with a self-validating product×store grid check (immune to catalogue growth). Re-run confirms no false PARTIAL flags (F3).
+- `generator/host.json` — `functionTimeout` 30m → 5m (inventory is out of the FA). `generator/main.py` — `logging.getLogger("generator").propagate = False` after `configure_azure_monitor` (dedupe AppTraces). Deleted dead V1 `generator/function.json`. `scripts/deploy_function.sh` — comment refresh. All deployed in one round-trip (F4).
+**Worked:**
+- **Audit 5/29→6/02 all green:** 5 Function fires on time (~00:30 UTC), orders/lines/status_log clean — first confirmation the V2-hosted generator wrapper (S16) fires correctly. Inventory: 3 days × 189,225 + 2 days × 189,630. The 189,630 days are *complete* (not partial) — product catalogue grew 4,205 → 4,214 SKUs on 6/01; verified 0 duplicate (product_id, store_id) pairs, grid = 4,214 × 45 = 189,630.
+- **Medallion catch-up clean:** landing re-export 1,043,897 rows (1 transient 08S01 auto-retried), bronze 10/10, silver 10/10, gold 8/8 — all multi-task Jobs green. `verify_catchup_final.py` **ALL CHECKS PASSED**: order_lines 47,162 == fact_order_line; inventory 7,001,010 == fact_inventory_daily; dim_customer 995 (0 collisions); dim_product 4,249 (0 collisions, absorbed the 9 new SKUs); 0 FK orphans on all 3 facts.
+- **Function deploy healthy:** all 6 functions registered (generator timer intact — no S16-style clobber); `get_watermark` smoke returned a clean 404 JSON from a live Postgres query (ttfb 23.5s cold-start, in line with S16).
+**Broke:**
+- Source firewall blocked the laptop IP at session start (40615) — `scripts/update_sql_firewall_ip.sh` fixed it (rule `MG-Office-Laptop-Dynamic` → 223.185.131.69). Routine.
+- First endpoint smoke `HTTP 000` was a post-deploy cold-start timeout (worker re-index + Postgres wake) — resolved on retry with a longer timeout. Also hit a CLI quirk: `defaultHostName` returns null on this `az` version; the value lives under `properties.defaultHostName`.
+**Uncertainty:**
+- `velora_oms.auto_pause_delay` is 120 min live vs 60 in IaC — left as harmless drift (next SQL-module apply realigns). Two App Insights app-settings also show a benign `+` on the next FA apply (wired via `site_config` instead) — pre-existing, not from S17.
+- The new 5-min `functionTimeout` ships in the deployed `host.json` but isn't trivially queryable via `az`; trusting the artifact.
+**Next:** Session 18 = Tier 6 ADF chunk 1 (ADF resource TF + 4 linked services Bicep + parameterised datasets from `entity_registry`). Open decision: DBX linked-service auth MSI vs PAT. Roll the medallion forward for any nights since 6/02 first.
+**Summary:** Tight 0.5 session that cleared the runway to ADF. Medallion now in sync with source through 2026-06-02 (33 days), every reconcile exact and 0 collisions — including a clean SCD-2 absorption of the first product-catalogue growth (4,205 → 4,214) in the live data. The one real ADF blocker (POSTGRES_URL IaC drift) is closed and plan-verified, and the Function App hygiene batch (5-min timeout, log dedupe, dead-file removal) deployed and smoke-healthy. `audit_fires.py` is now growth-proof. No new architectural decisions (all fixes/hygiene), so DECISIONS.md untouched. Repos pushed to main: architecture + IaC.
 
 ### 2026-05-29 (Session 16 — Audit S14 two-writer architecture + medallion catch-up + Function REST endpoints (Tier 6 chunk 1))
 **Objective:** Verify the autonomous two-writer pair (S14) across the 4 nights since S15 wrap, catch up medallion to source, and start Tier 6 chunk 1 by writing the 5 Function REST endpoints that activate the orphaned `pipeline.*` schema.

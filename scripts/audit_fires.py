@@ -75,8 +75,10 @@ def main() -> None:
         """
         SELECT CAST(snapshot_date AS DATE) AS d,
                COUNT(*) AS n,
-               MIN(created_at) AS first_insert_utc,
-               MAX(created_at) AS last_insert_utc
+               COUNT(DISTINCT product_id) AS n_products,
+               COUNT(DISTINCT store_id) AS n_stores,
+               COUNT(DISTINCT CONCAT(product_id, '|', store_id)) AS n_pairs,
+               MIN(created_at) AS first_insert_utc
         FROM velora_pim.inventory_snapshot
         WHERE snapshot_date BETWEEN ? AND ?
         GROUP BY CAST(snapshot_date AS DATE)
@@ -84,10 +86,24 @@ def main() -> None:
         """,
         START, END,
     )
-    print(f"{'date':<12} {'rows':>10} {'first_insert_utc':<28} {'last_insert_utc':<28}")
-    for d, n, fi, li in cur.fetchall():
-        flag = "" if n == 189225 else "  <-- PARTIAL" if n > 0 else "  <-- MISSING"
-        print(f"{str(d):<12} {n:>10} {str(fi):<28} {str(li):<28}{flag}")
+    # A snapshot is COMPLETE when it's a full product x store grid with no
+    # duplicate (product_id, store_id) pairs. Deriving the expected count from
+    # the snapshot's own distinct products/stores makes this immune to
+    # catalogue growth: products grew 4205 -> 4214 on 2026-06-01, so a
+    # hardcoded 189225 falsely flagged 6/01 + 6/02 as PARTIAL (S17 fix).
+    print(f"{'date':<12} {'rows':>10} {'grid':>10} {'dupes':>7} {'first_insert_utc':<28}")
+    for d, n, n_products, n_stores, n_pairs, fi in cur.fetchall():
+        grid = n_products * n_stores
+        dupes = n - n_pairs
+        if n == 0:
+            flag = "  <-- MISSING"
+        elif dupes != 0:
+            flag = f"  <-- DUPES ({dupes})"
+        elif n != grid:
+            flag = f"  <-- PARTIAL (grid={grid})"
+        else:
+            flag = ""
+        print(f"{str(d):<12} {n:>10} {grid:>10} {dupes:>7} {str(fi):<28}{flag}")
 
     print(f"\n== order_status_log by created_at date ({START} → {END}) ==")
     cur.execute(
