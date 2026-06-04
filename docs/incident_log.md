@@ -41,6 +41,7 @@ non-obvious or took disproportionate time relative to the fix.
 
 | # | Date | Title | Severity | Category | Effort | Hardest? |
 |---|------|-------|----------|----------|--------|----------|
+| 25 | 2026-06-04 | Cafe/hotspot WiFi stalls `az` token-refresh POST to `login.microsoftonline.com` — looked like a Terraform-backend / storage-firewall failure | major | network | ~60 min (then self-resolved on reconnect) | **yes** |
 | 24 | 2026-05-29 | Stale `.env` (wrong SQL hostname) misread as DB cold-start — `HYT00 Login timeout` retry loop swallowed the real error | major | ops | ~90 min | **yes** |
 | 23 | 2026-05-25 | `jobs.submit` SubmitTask doesn't accept `job_cluster_key` — needs persistent Job | minor | tooling | ~10 min | no |
 | 22 | 2026-05-25 | SQL Server `SUM(bit)` rejects in Spark JDBC schema probe | minor | code | ~5 min | no |
@@ -69,6 +70,22 @@ non-obvious or took disproportionate time relative to the fix.
 ---
 
 ## Entries
+
+### #25 — 2026-06-04 — Cafe WiFi stalls `az` token refresh, masquerading as a Terraform-backend failure
+- **Phase / Session:** Tier 6 (ADF chunk 1) / Session 18
+- **Category:** network
+- **Severity:** major
+- **Effort:** ~60 min diagnosis; not "fixed" — self-resolved next sitting on a stable network
+- **Status:** resolved 2026-06-05 (environmental — moved off cafe/hotspot WiFi to stable home WiFi)
+- **Symptom:** `terraform plan` (clients/velora) failed at backend init: `Error: retrieving Storage Account (...pipelineiqtfstate...): ... context deadline exceeded`. Direct `az storage account show -n pipelineiqtfstate` hung indefinitely; `az account get-access-token` hung indefinitely (no error, no prompt). A 15-attempt retry-prime loop got **15/15 timeouts** on the ARM token. Yet raw `curl --max-time 8 https://login.microsoftonline.com/` returned 302 in ~0.6s, `https://management.azure.com/` returned 400 in ~2.6s, and the blob endpoint returned 400 in ~0.35s — all fast.
+- **Wrong hypotheses chased (in order):**
+  1. *Wrong subscription* — `az` active sub had drifted to "SSE BI Subscription" (client's, wrong tenant). Switched back to Sponsorship. Still hung. (Real issue, but not the cause of the hang.)
+  2. *Storage-account firewall (data-plane Deny) blocking the laptop IP* — the user's framing ("update firewall to let it in"). Ruled out: the stall is on the client→AAD hop, and ARM/blob endpoints answer whenever a connection establishes. No Azure-side firewall is in the path of a token-refresh POST.
+  3. *`az` keychain/token-cache prompt hanging* — ruled out by `--debug`: token cache is `encrypt=False` plaintext (`msal_token_cache.json`), no keychain access.
+- **Root cause:** flaky/lossy WiFi (cafe / phone hotspot). `az account get-access-token --debug` pinned the exact hang: MSAL found a **valid cached refresh token**, loaded the openid-config fine, then stalled at `urllib3.connectionpool: Starting new HTTPS connection (1): login.microsoftonline.com:443` while POSTing the RT→AT exchange. Quick GETs to that same host sometimes landed; the token-POST's *new* TCP/TLS connection consistently didn't — the signature of a lossy/asymmetric NAT path. Terraform's azurerm backend shells out to `az` for tokens, so the hung token exchange surfaced as a "storage account retrieval / context deadline exceeded" backend error — three layers removed from the real cause.
+- **Fix:** none applied. On resume the next morning the laptop had slept/woken and reconnected to **stable home WiFi** (egress IP changed `106.202.108.101` → `223.185.131.69`); the identical `az account get-access-token` returned in ~2s and `terraform apply` + the Bicep deploy went through clean, first try. Same sub, same cached refresh token — only the network path changed.
+- **Prevention / first-check:** when an Azure CLI/Terraform op hangs or throws `context deadline exceeded` reaching ARM/state, **before** touching firewalls or re-auth, run `curl --max-time 8 https://login.microsoftonline.com/` AND `az account get-access-token --query expiresOn -o tsv`. If curl is fast but the token call hangs → it's a flaky-network token-refresh stall (cafe/hotspot WiFi), not a firewall and not auth config. Move to a stable network (home WiFi / VPN) rather than chasing Azure-side config. Mirror image of #24 (there, a network/firewall hypothesis was wrong and the cause was config; here, a config/firewall hypothesis was wrong and the cause was network) — in both, the one-line first-check is "instrument/curl the actual failing hop before theorising."
+- **References:** PROGRESS.md 2026-06-04→06-05 (S18 session log → "Broke" + "Resolution"). Commits `1796230` (IaC code), `c43174a` (apply + docs). No DECISIONS entry (environmental, no design change).
 
 ### #24 — 2026-05-29 — Stale `.env` misread as DB cold-start
 - **Phase / Session:** Phase 2 / Session 16
