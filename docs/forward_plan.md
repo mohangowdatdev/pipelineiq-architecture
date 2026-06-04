@@ -24,7 +24,7 @@ can pick up cleanly without re-deriving the order.
 | Postgres `pipeline.*` schema | ✅ **Consumer live (S16 Function REST endpoints); `POSTGRES_URL` reconciled into IaC (S17)** |
 | Postgres `pipelineiq.*` schema (incident_store + iac_embeddings) | ⚠️ Tables exist, 0 rows |
 | Function REST endpoints | ✅ **Live (S16), redeployed healthy (S17)** — 5 endpoints in `functions/function_app.py` |
-| ADF (Tier 6) | ⚠️ **Chunk 1 code-complete (S18), apply pending** — `core/adf/` TF module + 4 linked-service Bicep + 2 dataset Bicep written + validated (`terraform validate` + `az bicep build` green), pushed (IaC `1796230`). Not applied — S18 apply blocked on off-VPN Azure auth. Resume = prime token → plan → apply → `deploy_adf.sh`. |
+| ADF (Tier 6) | ✅ **Chunk 1 LIVE (S18, 2026-06-05)** — `pipelineiq-adf-dev` factory (MI + 3 RBAC) applied; 4 linked services (`ls_keyvault`/`ls_azuresql_velora`/`ls_adls`/`ls_databricks` MSI) + 2 parameterised datasets (`ds_sql_source`/`ds_adls_sink`) published. Chunk 2 (master copy pipeline 6.4 + notebook activities 6.5 + diagnostics 6.6 + cutover) is next. |
 | pgvector chunker + IaC webhook | ❌ Not started (Phase 4) |
 | Failure injection + RCA loop | ❌ Not started (Phase 3) |
 | FastAPI backend | ❌ Not started (Phase 5) |

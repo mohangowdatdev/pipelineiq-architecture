@@ -181,7 +181,7 @@ The diagram above is the **architected** topology, not the **built** one. Honest
 | Generator on Function App (Flex) → source DB | ✅ | Writes orders/lines/status_log/dim changes (its sweet spot). Inventory write **REMOVED** in S14 (DECISIONS #71) — see next row. |
 | **Databricks Job → inventory_snapshot** (S14, DECISIONS #71) | ✅ | Daily 00:35 UTC scheduled Job runs `notebooks/source_sim/write_inventory_snapshot.py`. Spark JDBC bulk insert, ~3-4 min wall. Replaces the Function App inventory write — S13's 3-pronged mitigation failed (11 consecutive partial fires 5/14-5/24). |
 | Logic App schedule | ✅ | Fires Function at 00:30 UTC; Databricks Workflow has its own cron trigger at 00:35 UTC. |
-| **ADF Copy Activity** landing extract | ❌ | **Tier 6 deferred.** Replaced today by `scripts/export_velora_to_landing.py` (laptop scaffold, hardcoded entity list). |
+| **ADF Copy Activity** landing extract | ⚠️ **Chunk 1 live (S18), copy pipeline pending** | ADF factory + 4 linked services + 2 `entity_registry`-parameterised datasets are deployed (`pipelineiq-adf-dev`). The actual master copy pipeline (ForEach → copy → Function watermark/file/run writes) is **chunk 2** — not built yet. Until chunk-2 cutover, `scripts/export_velora_to_landing.py` (laptop scaffold, hardcoded entity list) is still the prod landing-extract path. |
 | ADLS Gen2 medallion (landing/bronze/silver/gold) | ✅ | Phase 2 fully complete |
 | Bronze/Silver/Gold Databricks notebooks | ✅ | Entity-agnostic ingestion, all 12 entities through gold |
 | Databricks SQL Warehouse | ✅ | Used for verification + future Power BI / VS Code |
@@ -240,6 +240,7 @@ managed_by  = "terraform"
 | IaC core modules (keyvault, log_analytics, adls, postgres, databricks, openai) | Stable | Phase 0 — all applied |
 | IaC source_connectors/azure_sql | Stable | Phase 0 — applied |
 | IaC core/databricks_uc | **Stable (S8)** | Adopted system metastore + **4 catalogs** (`bronze/silver/gold/quarantine`) + 5 external locations + storage credential + cluster policy + SQL warehouse + secret scope. DECISIONS #46. `quarantine` catalog added in S8 (variable default updated 3→4). |
+| IaC core/adf (+ `bicep/adf/`) | **Chunk 1 live (S18)** | `core/adf/` owns the `pipelineiq-adf-dev` factory + system MI + 3 RBAC grants only (ADLS Blob Contributor, KV Secrets User, Databricks Contributor). ADF-internal objects (4 linked services + 2 parameterised datasets) are Bicep in `PipelineIQ-IaC/bicep/adf/`, published via `scripts/deploy_adf.sh` (`az deployment group create`, params from `terraform output`) — same TF-owns-compute / script-deploys-artifacts split as bronze/silver/gold notebooks. DBX linked service = MSI (DECISIONS #74). Chunk 2 (copy pipeline + notebook activities + diagnostics) pending. |
 | scripts/export_velora_to_landing.py | Stable (scaffold) | Phase 2 — substitutes for ADF until Tier 6 lands. DECISIONS #47. |
 | scripts/run_bronze_smoke.py | Stable (scaffold) | Phase 2 — driver for one-off Bronze ingestion. Replaced by ADF + scheduled Job in Tier 6. |
 
@@ -516,20 +517,21 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   inventory writing OUT of the Function to a Databricks scheduled job, OR
   (b) upgrade Function App to EP1 Premium (always-on instance, no idle reaper).
   Verification SQL + KQL queued in PROGRESS.md `## Next task`.
-- **Tier 6 ADF — chunk 1 CODE-COMPLETE but NOT APPLIED (S18).** `PipelineIQ-IaC`
-  now has `core/adf/` (factory TF module + MI + RBAC, wired into `clients/velora`),
+- **Tier 6 ADF — chunk 1 LIVE (S18, 2026-06-05); chunk 2 pending.** `PipelineIQ-IaC`
+  has `core/adf/` (factory TF module + MI + RBAC, wired into `clients/velora`),
   4 linked-service Bicep + 2 parameterised dataset Bicep under `bicep/adf/`, and
-  `scripts/deploy_adf.sh`. Both `terraform validate` and `az bicep build` pass;
-  pushed (IaC commit `1796230`). **The apply never ran** — S18's off-VPN laptop
-  couldn't refresh an Azure token (token POST to `login.microsoftonline.com`
-  timing out; valid refresh token IS cached, so it's a network stall, not a
-  re-login). **No factory/RBAC created, state untouched.** Resume = on a stable
-  network/VPN: `az account get-access-token` to confirm auth, then
-  `terraform plan -out=tfplan -target=module.adf` → apply → `bash scripts/deploy_adf.sh`
-  → list linked services/datasets. DBX linked service = MSI (DECISIONS #74).
-  Chunk 2 (master copy pipeline 6.4 + notebook activities 6.5 + diagnostics 6.6)
-  still pending. `scripts/export_velora_to_landing.py` remains the prod fire path
-  until chunk-2 cutover.
+  `scripts/deploy_adf.sh`. **Applied:** `pipelineiq-adf-dev` factory (MI
+  `18e622b2-acdb-4fac-9d16-059d9aa14861`, +3 RBAC: ADLS Blob Contributor, KV
+  Secrets User, Databricks Contributor); 4 linked services (`ls_keyvault`,
+  `ls_azuresql_velora`, `ls_adls`, `ls_databricks` = MSI per DECISIONS #74) + 2
+  datasets (`ds_sql_source`, `ds_adls_sink`) published + listable. To redeploy
+  the Bicep objects: `bash scripts/deploy_adf.sh` (sources params from
+  `terraform output`). **Chunk 2 still pending:** master copy pipeline (6.4,
+  ForEach over `entity_registry` + Function Web Activities) + notebook activities
+  (6.5, first MSI-linked-service exercise — ADF MI registers as workspace user on
+  first call) + diagnostic settings (6.6) + cutover (6.11). The full copy smoke
+  (orders → `landing/`) is a chunk-2 deliverable. `scripts/export_velora_to_landing.py`
+  remains the prod fire path until chunk-2 cutover.
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
 - ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Done (S13, DECISIONS #70).**
   `generator/config.py` now exposes `aad` mode + `connect_aad()` helper that uses
