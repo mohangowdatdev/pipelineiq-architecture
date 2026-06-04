@@ -167,7 +167,7 @@ they don't have a phase name attached. Each is captured in
 |---|---|---|
 | Stale `.env` (`pipelineiq-sql-dev` → `pipelineiq-sql-velora-dev`) | 1 min | next session start |
 | Function timeout 30m → 5m (inventory write is out) | 1 deploy cycle | S16 (when Function REST endpoints deploy anyway) |
-| Retire `scripts/inventory_only.py` in favour of `run_inventory_smoke.py` | 5 min | after S15 catch-up settles |
+| ~~Retire `scripts/inventory_only.py` in favour of `run_inventory_smoke.py`~~ **Done (S18)** — deleted `inventory_only.py` + `recover_inventory_batch.sh` + `_write_inventory_snapshot`; recovery is now `run_inventory_smoke.py --date D --force` | — | done |
 | `propagate=False` for OT logger to fix duplicate AppTraces | 1 deploy cycle | S16 |
 | Generator `--dry-run` mode is broken (item 9.1) | 30 min | any time |
 | Repos eventually push to `mohangowdat-sail` for company handoff | — | future one-time event |

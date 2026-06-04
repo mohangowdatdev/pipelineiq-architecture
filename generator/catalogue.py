@@ -372,6 +372,56 @@ def load_from_db(conn) -> Dict:
     }
 
 
+def to_live_shape(catalogue: Dict) -> Dict:
+    """Adapt a freshly built catalogue (``build_catalogue`` output) to the same
+    shape ``load_from_db`` returns: ``{products, pricing, stores, reps}``.
+
+    Used by the ``--dry-run`` path on an UNSEEDED database (build_order 9.1).
+    There the catalogue is built in memory but deliberately not written, so
+    ``load_from_db`` would return empty DataFrames and orders generation would
+    fail with ``ValueError: product_pool is empty``. This re-projects the
+    in-memory catalogue into the live shape instead, applying the same filters
+    ``load_from_db`` applies (active products, current pricing, active reps with
+    a current territory assignment).
+    """
+    products = catalogue["products"]
+    products_df = products[products["is_active"]][
+        ["product_id", "sku", "product_name", "category_id", "division",
+         "brand", "is_active", "launched_date"]
+    ].reset_index(drop=True)
+
+    pricing = catalogue["product_pricing"]
+    pricing_df = pricing[pricing["effective_to"].isna()][
+        ["product_id", "list_price", "cost_price"]
+    ].reset_index(drop=True)
+
+    reps = catalogue["sales_reps"]
+    assignments = catalogue["territory_assignments"]
+    current_assignments = assignments[assignments["is_current"]]
+    reps_df = (
+        reps[reps["is_active"]]
+        .merge(current_assignments[["rep_id", "territory_id"]],
+               on="rep_id", how="inner")
+        [["rep_id", "full_name", "territory_id"]]
+        .reset_index(drop=True)
+    )
+
+    stores = catalogue["stores"]
+    store_cols = ["store_id", "store_name", "city", "state",
+                  "territory_id", "store_tier", "is_active"]
+    stores_df = stores[[c for c in store_cols if c in stores.columns]].copy()
+    if "is_active" not in stores_df.columns:
+        stores_df["is_active"] = True
+    stores_df = stores_df.reset_index(drop=True)
+
+    return {
+        "products": products_df,
+        "pricing":  pricing_df,
+        "stores":   stores_df,
+        "reps":     reps_df,
+    }
+
+
 def _bulk_insert(cursor, table: str, columns: List[str],
                  df: pd.DataFrame) -> None:
     """Insert a DataFrame into an Azure SQL table in batches."""

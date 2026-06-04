@@ -138,13 +138,13 @@ first copy. RBAC can take a few minutes to propagate after a fresh apply.
 
 ### Operational follow-ups (small, interleave anywhere)
 
-- Retire `scripts/inventory_only.py` in favour of `scripts/run_inventory_smoke.py`.
+- ~~Retire `scripts/inventory_only.py`~~ **Done (S18)** — deleted it + `recover_inventory_batch.sh` + `_write_inventory_snapshot`; recovery is now `.venv/bin/python scripts/run_inventory_smoke.py --date D --force`.
 - `velora_oms.auto_pause_delay` is 120 min live (IaC says 60) — next
   `terraform apply` on the SQL module realigns it. Harmless drift.
 - Two App Insights app-settings keys show as a benign `+` add on the next FA
   `terraform apply` (live FA wires them via `site_config` instead) — pre-existing,
   not introduced in S17. No action needed.
-- Generator `--dry-run` bug (build_order 9.1) — low priority.
+- ~~Generator `--dry-run` bug (build_order 9.1)~~ **Fixed (S18)** — `catalogue.to_live_shape()` feeds the in-memory catalogue to orders on the unseeded dry-run path.
 
 ## Commands (copy-paste reference)
 

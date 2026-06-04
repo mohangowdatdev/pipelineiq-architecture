@@ -63,8 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("generator.main")
 
-# Wire Python user-code logs (including chunk-progress traces in
-# `_write_inventory_snapshot`) into Application Insights when running under
+# Wire Python user-code logs into Application Insights when running under
 # Azure Functions. Without this, `logger.info(...)` calls never reach the AI
 # `traces` table on Flex Consumption — verified empty across the 2026-05-10
 # / 5-11 / 5-12 fires. CLI runs skip init because the env var is unset.
@@ -188,6 +187,7 @@ def run(
             return {"_skipped": True, "existing_orders": existing}
 
         # ── 1. Seed catalogue on first run ────────────────────────────────────
+        catalogue = None
         if not cat_module.is_catalogue_seeded(conn):
             logger.info("Catalogue not seeded — generating and seeding now")
             catalogue = cat_module.build_catalogue(seed=seed)
@@ -195,11 +195,22 @@ def run(
                 cat_module.seed_to_db(catalogue, conn)
                 conn.commit()
                 logger.info("Catalogue seeded successfully")
-        else:
-            catalogue = None  # loaded from DB below
 
-        # ── 2. Load catalogue from DB ─────────────────────────────────────────
-        live_catalogue = cat_module.load_from_db(conn)
+        # ── 2. Load catalogue ─────────────────────────────────────────────────
+        # Normal path: read the live catalogue from the DB. But on a --dry-run
+        # against an UNSEEDED DB, the catalogue was built in memory above and
+        # deliberately not written — so load_from_db would return empty and
+        # orders generation would fail with "product_pool is empty". Use the
+        # in-memory catalogue (re-projected to the live shape) instead.
+        # build_order 9.1.
+        if dry_run and catalogue is not None:
+            logger.info(
+                "DRY RUN on unseeded DB — using in-memory catalogue "
+                "(skipping load_from_db, which would be empty)"
+            )
+            live_catalogue = cat_module.to_live_shape(catalogue)
+        else:
+            live_catalogue = cat_module.load_from_db(conn)
         products_df = live_catalogue["products"]
         pricing_df  = live_catalogue["pricing"]
         stores_list = config.STORES
@@ -359,8 +370,10 @@ def run(
         # scheduled job (`notebooks/source_sim/write_inventory_snapshot.py`)
         # which fires at 00:35 UTC, 5 min after this Function. Spark JDBC bulk
         # insert is 30-50x faster than pyodbc and has no Flex worker reaper.
-        # `_write_inventory_snapshot` stays defined below for the one-off
-        # `scripts/inventory_only.py` recovery path.
+        # The old laptop pyodbc writer (`_write_inventory_snapshot` +
+        # `scripts/inventory_only.py`) was retired in S18 — recovery is now
+        # `scripts/run_inventory_smoke.py --date <D> --force` (same Databricks
+        # notebook, ad-hoc one-shot run).
         counts["inventory_snapshot_rows"] = 0  # not written here anymore
 
         return counts
@@ -371,120 +384,6 @@ def run(
         raise
     finally:
         conn.close()
-
-
-def _write_inventory_snapshot(
-    conn,
-    products_df,
-    run_date: date,
-    rng: np.random.Generator,
-) -> int:
-    """
-    Full refresh daily inventory snapshot for all 4,200 products × 45 stores.
-
-    Written in a separate transaction from the main batch because:
-    - It's 189,000 rows — too large to combine with the main transaction
-    - It's idempotent by snapshot_date: running it twice for the same date
-      just inserts duplicate rows (handled by UNIQUE constraint in bootstrap_sql.sql)
-    """
-    import uuid as _uuid
-    from datetime import timezone as _tz
-
-    now = datetime.now(timezone.utc)
-    stores = config.STORES
-    rows = []
-
-    for _, prod in products_df.iterrows():
-        for store in stores:
-            opening = int(rng.integers(0, 150))
-            units_sold = int(rng.integers(0, min(opening + 1, 50)))
-            units_returned = int(rng.integers(0, max(1, units_sold // 10)))
-            closing = max(0, opening - units_sold + units_returned)
-            reorder_point = int(rng.integers(10, 40))
-
-            rows.append((
-                str(_uuid.UUID(int=int(rng.integers(0, 2**31)) + (int(rng.integers(0, 2**31)) << 32))),
-                str(prod["product_id"]),
-                store["store_id"],
-                run_date,
-                opening,
-                units_sold,
-                units_returned,
-                closing,
-                1 if closing <= 0 else 0,
-                reorder_point,
-                now,
-                "VELORA_PIM",
-            ))
-
-    sql = (
-        "INSERT INTO velora_pim.inventory_snapshot "
-        "(snapshot_id, product_id, store_id, snapshot_date, opening_stock, "
-        "units_sold, units_returned, closing_stock, stockout_flag, reorder_point, "
-        "created_at, source_system) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-
-    # Chunked write with per-chunk commits + sub-batch progress logs.
-    #
-    # S11 (#62): split into 10K-row committed chunks so partial failures don't
-    # lose the whole day. Worked, but inventory still died mid-3rd-chunk on
-    # 5/11, 5/12, 5/13 fires — 100% reproducible at ~85-130s into the write.
-    #
-    # S13 root cause (telemetry from #66 made this visible): silent worker
-    # kill, no exception. Most likely the Flex Consumption host's gRPC
-    # keepalive between host and Python worker times out when pyodbc's
-    # `executemany` blocks the Python thread for ≥ ~25s with no host-side
-    # callbacks. The 3 dies happened all happened within ~25s of the second
-    # successful chunk-commit log.
-    #
-    # S13 mitigation:
-    #   1. Halve `chunk_size` (10K → 5K) so each `cursor.commit()` fires
-    #      twice as often — keeps host-side bookkeeping warm.
-    #   2. Log a trace after EACH sub-batch executemany so gRPC traffic
-    #      flows every 2-3 seconds, not every 25 seconds.
-    #   3. Keep per-chunk commit semantics for durability on partial fail.
-    chunk_size = 5_000
-    logger.info(
-        "Inventory snapshot: starting write of %d rows for date %s "
-        "(chunk_size=%d sub_batch=%d)",
-        len(rows), run_date, chunk_size, config.SQL_INSERT_BATCH_SIZE,
-    )
-    conn.autocommit = False
-    written = 0
-    try:
-        for i in range(0, len(rows), chunk_size):
-            cursor = conn.cursor()
-            cursor.fast_executemany = True
-            sub_batch = config.SQL_INSERT_BATCH_SIZE
-            chunk_rows = rows[i: i + chunk_size]
-            for j in range(0, len(chunk_rows), sub_batch):
-                cursor.executemany(sql, chunk_rows[j: j + sub_batch])
-                logger.info(
-                    "Inventory snapshot: sub-batch %d/%d in chunk starting at %d "
-                    "for %s",
-                    (j // sub_batch) + 1,
-                    (len(chunk_rows) + sub_batch - 1) // sub_batch,
-                    i, run_date,
-                )
-            conn.commit()
-            written += len(chunk_rows)
-            logger.info(
-                "Inventory snapshot: committed %d / %d rows for %s",
-                written, len(rows), run_date,
-            )
-    except Exception:
-        conn.rollback()
-        logger.exception(
-            "Inventory snapshot failed after %d / %d rows committed for %s",
-            written, len(rows), run_date,
-        )
-        raise
-    finally:
-        conn.autocommit = True
-
-    logger.info("Inventory snapshot: completed %d rows for date %s", len(rows), run_date)
-    return len(rows)
 
 
 def _write_dependency_violation_flag(cursor, run_date: date) -> None:

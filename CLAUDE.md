@@ -227,7 +227,7 @@ managed_by  = "terraform"
 | core/ | Stable once deployed | Do not modify without explicit instruction |
 | source_connectors/azure_sql/ | Stable | Velora-specific connector |
 | clients/velora/ | Config only | Safe to update variables |
-| generator/ | **Inventory write removed (S14, DECISIONS #71); orders/lines/status_log only.** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. **DECISIONS #71 (S14): `run()` no longer calls `_write_inventory_snapshot` — inventory moved to Databricks Job (`notebooks/source_sim/`). The function definition stays for `scripts/inventory_only.py` recovery path. Supersedes #62 + #69 (chunked inventory + worker-kill mitigation — both failed in the wild; 11 consecutive partial fires 5/14-5/24).** DECISIONS #70 (S13): `aad` mode in `config.py` so `scripts/inventory_only.py` works on laptop without password. Source DB has **24 real-dated days Apr 27 → May 24, 2026** (S14 recovered 5/14-5/24 inventory via laptop). Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. `AZURE_SQL_AUTH_MODE=aad ... python scripts/inventory_only.py --date YYYY-MM-DD` is the laptop fallback for inventory-only writes when the autonomous Databricks Job missed a date. |
+| generator/ | **Inventory write removed (S14, DECISIONS #71); orders/lines/status_log only.** | DECISIONS #51: `yesterday_utc()` + idempotency guard. DECISIONS #61 (S11): `_connect_with_resume_retry` retries Azure SQL serverless wake-up errors. **DECISIONS #71 (S14): `run()` no longer calls `_write_inventory_snapshot` — inventory moved to Databricks Job (`notebooks/source_sim/`). Supersedes #62 + #69 (chunked inventory + worker-kill mitigation — both failed in the wild; 11 consecutive partial fires 5/14-5/24). S18: the old laptop pyodbc inventory writer was fully retired — `_write_inventory_snapshot` (was in `generator/main.py`) + `scripts/inventory_only.py` + `scripts/recover_inventory_batch.sh` all deleted.** Source DB has real-dated days from Apr 27, 2026 onward. Manual backfills must stop at `today-1`; re-seed of an already-populated date requires explicit wipe. **Inventory recovery (when the autonomous Databricks Job missed a date) is now `.venv/bin/python scripts/run_inventory_smoke.py --date YYYY-MM-DD --force`** (same Spark notebook as the scheduled Job, ad-hoc one-shot run). |
 | notebooks/source_sim/ | **Live (S14)** | `write_inventory_snapshot.py` — Spark notebook, deterministic 189,225-row synthesis per `snapshot_date` via xxhash64 on (product_id, store_id, date, salt). Reads `velora_pim.products`/`stores` via JDBC, writes `velora_pim.inventory_snapshot` via JDBC mode=append + numPartitions=8 + batchsize=10000. `verify_order_landed` widget refuses to write if `velora_oms.orders` has 0 rows for the date (two-writer race protection). `force=true` wipes + rewrites for idempotency. Scheduled via `core/inventory_workflow/` IaC at 00:35 UTC daily. DECISIONS #71. |
 | notebooks/bronze/ | **All 12 entities hydrated (S7 + S9.5)** | `ingest_to_bronze.py` is entity-agnostic (DECISIONS #48). 10 main entities (~1.9M rows) + 2 static seeds added in S9.5: `bronze.default.product_categories` (35 rows) + `bronze.default.stores` (45 rows). DECISIONS #60. |
 | notebooks/silver/ | **All 10 tables done (S8 + S9.5 + S11.2).** | All 10 silvers live with 100% DQ pass on real-dated source through 2026-05-10. Counts: `orders` (~4.5K), `customers` (~340), `order_lines` (~18K), `products` (4,205), `product_pricing` (4,218), `sales_reps` (30), `territory_assignments` (30), `inventory_snapshot` (2,648,025 — partitioned by `snapshot_date` per DECISIONS #63), `order_status_log` (11,694, allows `RETURN_INITIATED` per DECISIONS #64), `customer_addresses` (339, every customer has 1 primary). |
@@ -481,13 +481,12 @@ Claude needs that cannot be derived from reading the project files directly.
 Active items that cross session boundaries. Remove a row once resolved — do
 not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`.
 
-- **Generator `--dry-run` mode is broken (known).** Skips catalogue INSERT then
-  later calls `pd.read_sql` to load products; gets empty DF and fails in orders
-  module with `ValueError: product_pool is empty`. Workaround: skip dry-run and go
-  straight to real seed (catalogue is idempotent via UUID5 per DECISIONS #19).
-  Proper fix: have dry-run keep the generated catalogue DataFrame in memory and
-  short-circuit `pd.read_sql`. Low priority — real seed works end-to-end. Build_order
-  item 9.1.
+- ~~Generator `--dry-run` mode is broken~~ **Fixed (S18, build_order 9.1).** On an
+  unseeded DB, dry-run built the catalogue in memory, skipped the INSERT, then
+  `load_from_db` returned empty → `ValueError: product_pool is empty` in orders.
+  Fix: new `catalogue.to_live_shape()` re-projects the in-memory built catalogue
+  into the `load_from_db` shape; `main.run()` uses it on the `dry_run + unseeded`
+  path instead of reading the DB. Unit-tested (4,200 products, all priced).
 - ~~Tier 4.6 Azure Functions app~~ **Done (S5 addendum, 2026-05-01; migrated to FC1
   Flex Consumption in S6, 2026-05-06).** Function App `pipelineiq-functions-dev`
   live on FC1. See DECISIONS #50 + #51 + `core/functions/` IaC module.
@@ -533,10 +532,11 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   (orders → `landing/`) is a chunk-2 deliverable. `scripts/export_velora_to_landing.py`
   remains the prod fire path until chunk-2 cutover.
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
-- ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Done (S13, DECISIONS #70).**
-  `generator/config.py` now exposes `aad` mode + `connect_aad()` helper that uses
-  `DefaultAzureCredential` + ODBC token attr (`SQL_COPT_SS_ACCESS_TOKEN=1256`).
-  Usage: `AZURE_SQL_AUTH_MODE=aad ... python scripts/inventory_only.py --date 2026-05-12`.
+- ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Superseded (S18).**
+  `scripts/inventory_only.py` (and `recover_inventory_batch.sh`) were retired —
+  inventory recovery is now `.venv/bin/python scripts/run_inventory_smoke.py
+  --date YYYY-MM-DD --force` (Databricks Spark notebook). `config.connect_aad()`
+  (DECISIONS #70) stays in `generator/config.py` as a generic AAD-token helper.
 - ~~SCD-2 `valid_from` bug for CHANGED rows in `dim_customer`~~ **Done (S13, DECISIONS #68 — supersedes #67).**
   Real bug was Spark lazy-eval, NOT a `valid_from` formula bug as DECISIONS #67
   claimed. `df_actioned` was being recomputed in step 6 AFTER step 4 had flipped
