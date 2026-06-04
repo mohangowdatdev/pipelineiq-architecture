@@ -25,7 +25,7 @@
 | Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **47,162**; `fact_inventory_daily` **7,001,010**; `fact_daily_channel_revenue` 13,555. 0 FK orphans. |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
-| ADF Bicep (Tier 6) | ⏳ Pending — chunk 1 partial | Function REST endpoints done (S16). ADF resource + linked services + datasets queued for next session. |
+| ADF Bicep (Tier 6) | ⏳ Chunk 1 **code-complete, apply pending (S18)** | Function REST endpoints done (S16). **S18 wrote all chunk-1 code** — `core/adf/` TF module (factory + MI + RBAC) + 4 linked-service Bicep + 2 parameterised dataset Bicep + `scripts/deploy_adf.sh`. `terraform validate` + `az bicep build` both green. **Not applied** — blocked on off-VPN Azure auth (token refresh to login.microsoftonline.com timing out). Resume = prime token → plan → apply → deploy bicep. |
 | Phase 3 (failure injection + incident store) | ⏳ Not started | `failure_injector.py` written, end-to-end unverified. |
 | Phase 4 (pgvector RCA) | ⏳ Not started | |
 | Phase 5 (FastAPI + Slack) | ⏳ Not started | |
@@ -94,40 +94,49 @@ S15 (architecture migration only, no new columns/tables).
 
 ## Next task
 
-**Session 18 — Tier 6 ADF chunk 1.** Medallion is current through 2026-06-02
-(S17). The Postgres control-plane API is live (S16) and now reconciled into
-IaC (S17). ADF is the next consumer to wire in. See `docs/forward_plan.md`
-for the full S18→S21 outline.
+**Resume S18 — APPLY the ADF chunk-1 code (already written + validated).**
+The chunk-1 code is done and pushed (IaC commit `1796230`); it could not be
+applied because the off-VPN laptop connection couldn't refresh an Azure auth
+token (token POST to `login.microsoftonline.com` timed out 15/15 — `az`/MSAL
+has a valid cached refresh token, the network just couldn't complete the
+exchange; **not** a firewall, **not** the code). **Nothing was applied — no
+factory, no RBAC, state untouched.** See `docs/forward_plan.md` for S18→S21.
 
-1. **Catch up medallion for any nights since S17** (rolling — usually 1–5 days):
+**Resume steps (when on a stable network / VPN):**
+0. `az account set --subscription "Microsoft Azure Sponsorship"` (CLI had
+   drifted to "SSE BI Subscription" — verify before anything). Then confirm
+   auth works: `az account get-access-token --query expiresOn -o tsv` returns
+   a timestamp fast.
+1. **Catch up medallion for any nights since 6/02** (rolling — usually 1–5 days):
    ```
    python scripts/audit_fires.py --start <last+1> --end <today-1>
    .venv/bin/python scripts/export_velora_to_landing.py --start <last+1> --end <today-1>
    .venv/bin/python scripts/catchup_medallion.py --layer bronze   # then silver, then gold
    .venv/bin/python scripts/verify_catchup_final.py
    ```
-   ~25–30 min wall if 1–5 days. (Firewall: `bash scripts/update_sql_firewall_ip.sh`
-   first if off VPN — current laptop IP rotates.)
+   (Firewall: `bash scripts/update_sql_firewall_ip.sh` first if off VPN.)
+2. **Apply ADF chunk 1** (code already in `PipelineIQ-IaC`):
+   ```
+   cd PipelineIQ-IaC/clients/velora
+   terraform init -reconfigure
+   terraform plan -out=tfplan -target=module.adf
+   terraform apply tfplan            # creates pipelineiq-adf-dev + MI RBAC
+   cd ../.. && bash scripts/deploy_adf.sh   # publishes 4 linked services + 2 datasets
+   az datafactory linked-service list --factory-name pipelineiq-adf-dev -g pipelineiq-rg-dev -o table
+   az datafactory dataset list --factory-name pipelineiq-adf-dev -g pipelineiq-rg-dev -o table
+   ```
+   Chunk-1 exit = factory exists + 4 linked services + 2 datasets visible.
+   (Decision settled: DBX linked service uses **MSI**, DECISIONS #74.)
+3. **NB:** a *full copy* smoke (orders → `landing/orders/date=.../`) needs the
+   master ForEach pipeline, which is **6.4 = chunk 2 (S19)** — not part of
+   chunk 1. Chunk-1 smoke is just "objects published + listable."
 
-2. **Tier 6 ADF Bicep chunk 1:**
-   - **ADF resource** (build_order 6.1) — Terraform `pipelineiq-adf-dev` in
-     `PipelineIQ-IaC/core/adf/`.
-   - **Linked services** (6.2) — 4 Bicep: Azure SQL (`velora_oms`), ADLS Gen2,
-     Key Vault, Databricks. KV references for secrets. **Open decision: DBX
-     linked-service auth — MSI (recommended) vs PAT.**
-   - **Parameterised datasets** (6.3) — Bicep, parameterised by
-     `(schema, table, watermark_column, load_type)` from `pipeline.entity_registry`
-     (12 rows seeded).
-   - **Smoke** — run one ForEach iteration against `velora_oms.orders` for one
-     date; confirm `landing/orders/date=YYYY-MM-DD/` shows the file and the
-     Function endpoints get hit (`pipeline_exec_log` grows).
-
-3. **Tier 6 chunk 2 (S19):** master parameterised copy pipeline (6.4) +
+4. **Tier 6 chunk 2 (S19):** master parameterised copy pipeline (6.4) +
    Databricks notebook activities (6.5) + diagnostic settings (6.6) +
    cutover (6.11). After this, "metadata-driven" is fully real — the laptop
    scaffold script can be decommissioned.
 
-4. **Phase 4 (pgvector)** can interleave — independent. **Phase 3 (failure
+5. **Phase 4 (pgvector)** can interleave — independent. **Phase 3 (failure
    injection + RCA)** needs Tier 6 signals first.
 
 ### Operational follow-ups (small, interleave anywhere)
@@ -323,6 +332,24 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-06-04 (Session 18 — 0.5 session: Tier 6 ADF chunk 1 — code written + validated, apply blocked on network)
+**Objective:** Write Tier 6 ADF chunk 1 (build_order 6.1–6.3): the ADF factory Terraform module + 4 linked-service Bicep + 2 parameterised dataset Bicep, and apply/deploy + smoke. Half session.
+**Built (all in `PipelineIQ-IaC`, pushed as commit `1796230`):**
+- `core/adf/{versions,variables,main,outputs}.tf` — `pipelineiq-adf-dev` factory, system-assigned MI, Git disabled (Bicep-first), + 3 RBAC grants: Storage Blob Data Contributor (ADLS), Key Vault Secrets User (KV), Contributor (Databricks workspace). Wired into `clients/velora/main.tf` (`module.adf`) + 3 new outputs (`adf_name`, `adf_principal_id`, `databricks_workspace_arm_id`).
+- `bicep/adf/` — `main.bicep` orchestrator + 4 linked services (`linkedservice_{keyvault,azuresql,adls,databricks}.bicep`) + 2 datasets (`dataset_{sql_source,adls_sink}.bicep`). KV LS = MI; SQL LS = KV-referenced `sql-connection-string`; ADLS LS = MI; Databricks LS = **MSI** (DECISIONS #74). Datasets parameterised by `{schema, table, watermark_column, load_type}` (sink adds computed `folder_path`) — one pair for all 12 `entity_registry` rows.
+- `scripts/deploy_adf.sh` — `az deployment group create`, params sourced from `terraform output`.
+- DECISIONS #74 (ADF→Databricks MSI auth, no PAT).
+**Worked:**
+- `terraform validate` => **Success**. `az bicep build` => **valid ARM, 6 module deployments, no errors**. Both validators green before any apply attempt.
+- MSI-vs-PAT decision settled up front (MSI) so the linked-service Bicep + RBAC were written once, correctly.
+**Broke (the blocker):**
+- **Apply could not run — Azure auth unreachable from the off-VPN laptop.** `terraform plan` failed at backend init: ARM GET on the `pipelineiqtfstate` storage account → `context deadline exceeded`. Root-caused via `az ... --debug`: `az`/MSAL has a **valid cached refresh token**, but the token-refresh POST to `login.microsoftonline.com:443` stalls on the new HTTPS connection. Raw `curl` to that host sometimes answers (login 302, tenant config 200, blob 400 — all fast), but the multi-roundtrip token exchange consistently times out. A 15-attempt retry-prime loop got **15/15 timeouts** → not intermittent, the path is down right now. **Not a firewall, not auth config, not the ADF code.** No Azure-side firewall rule can fix a client↔login-endpoint stall.
+- Also caught: the `az` CLI active subscription had drifted to **"SSE BI Subscription"** (the client's, wrong tenant) at session start — switched back to **Microsoft Azure Sponsorship** per the CLAUDE.md guard before any state access. (Only read-only ops ran while it was wrong; nothing touched on SSE BI.)
+**Uncertainty:**
+- Whether the network stall is local-ISP-specific or a broader conditional-access/named-location thing. The cached refresh token is valid, so resuming just needs one good token exchange (stable network or VPN). User chose to pause and resume ~1hr later.
+**Next:** **Apply the already-written chunk-1 code** — `terraform plan -out=tfplan -target=module.adf` → apply → `bash scripts/deploy_adf.sh` → list linked services + datasets. Then chunk 2 (6.4 master pipeline). See `## Next task`.
+**Summary:** Clean half-session on the build side — all of ADF chunk 1 (factory module + 4 linked services + 2 parameterised datasets + deploy script) written and validated against both `terraform validate` and `az bicep build`, MSI auth decided and logged (#74), code committed + pushed. The apply is the only thing outstanding and it's blocked purely on off-VPN Azure-login reachability — **zero infrastructure was created or modified, state is untouched**, so this is a safe pause point. Resume = prime a token on a stable network, then plan/apply/deploy (~20–30 min mechanical). Docs (this log, DECISIONS #74, build_order 6.1–6.3, At-a-glance, Next task) all updated; both repos pushed.
 
 ### 2026-06-03 (Session 17 — 0.5 session: medallion catch-up 5/29→6/02 + clear the pre-ADF backlog)
 **Objective:** Audit the 5 autonomous nights since S16, roll the medallion forward, verify, and clear the small backlog blocking ADF (POSTGRES_URL IaC drift + Function hygiene). Half session — no new feature work.

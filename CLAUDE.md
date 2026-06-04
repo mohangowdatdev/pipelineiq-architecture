@@ -516,10 +516,20 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   inventory writing OUT of the Function to a Databricks scheduled job, OR
   (b) upgrade Function App to EP1 Premium (always-on instance, no idle reaper).
   Verification SQL + KQL queued in PROGRESS.md `## Next task`.
-- **Tier 6 ADF (Bicep) not yet written.** Linked services (SQL, ADLS, KV, Databricks)
-  + parameterised datasets + copy pipeline `velora_oms.*` → `landing/`. Replaces
-  `scripts/export_velora_to_landing.py` in production. Not blocking Phase 2 dev —
-  the scaffold script is a reasonable substitute until Tier 6 lands.
+- **Tier 6 ADF — chunk 1 CODE-COMPLETE but NOT APPLIED (S18).** `PipelineIQ-IaC`
+  now has `core/adf/` (factory TF module + MI + RBAC, wired into `clients/velora`),
+  4 linked-service Bicep + 2 parameterised dataset Bicep under `bicep/adf/`, and
+  `scripts/deploy_adf.sh`. Both `terraform validate` and `az bicep build` pass;
+  pushed (IaC commit `1796230`). **The apply never ran** — S18's off-VPN laptop
+  couldn't refresh an Azure token (token POST to `login.microsoftonline.com`
+  timing out; valid refresh token IS cached, so it's a network stall, not a
+  re-login). **No factory/RBAC created, state untouched.** Resume = on a stable
+  network/VPN: `az account get-access-token` to confirm auth, then
+  `terraform plan -out=tfplan -target=module.adf` → apply → `bash scripts/deploy_adf.sh`
+  → list linked services/datasets. DBX linked service = MSI (DECISIONS #74).
+  Chunk 2 (master copy pipeline 6.4 + notebook activities 6.5 + diagnostics 6.6)
+  still pending. `scripts/export_velora_to_landing.py` remains the prod fire path
+  until chunk-2 cutover.
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
 - ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Done (S13, DECISIONS #70).**
   `generator/config.py` now exposes `aad` mode + `connect_aad()` helper that uses
