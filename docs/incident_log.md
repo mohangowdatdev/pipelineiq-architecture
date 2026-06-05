@@ -41,6 +41,7 @@ non-obvious or took disproportionate time relative to the fix.
 
 | # | Date | Title | Severity | Category | Effort | Hardest? |
 |---|------|-------|----------|----------|--------|----------|
+| 26 | 2026-06-05 | `verify_catchup_final.py` reports `❌ CHECK(S) FAILED` from 2X-Small SQL-warehouse per-query 5-min timeouts, not real data mismatches | minor | tooling | ~2 min (re-run) | no |
 | 25 | 2026-06-04 | Cafe/hotspot WiFi stalls `az` token-refresh POST to `login.microsoftonline.com` — looked like a Terraform-backend / storage-firewall failure | major | network | ~60 min (then self-resolved on reconnect) | **yes** |
 | 24 | 2026-05-29 | Stale `.env` (wrong SQL hostname) misread as DB cold-start — `HYT00 Login timeout` retry loop swallowed the real error | major | ops | ~90 min | **yes** |
 | 23 | 2026-05-25 | `jobs.submit` SubmitTask doesn't accept `job_cluster_key` — needs persistent Job | minor | tooling | ~10 min | no |
@@ -70,6 +71,18 @@ non-obvious or took disproportionate time relative to the fix.
 ---
 
 ## Entries
+
+### #26 — 2026-06-05 — `verify_catchup_final.py` false `CHECK(S) FAILED` from warehouse query timeouts
+- **Phase / Session:** Phase 2 (medallion catch-up) / Session 18
+- **Category:** tooling
+- **Severity:** minor
+- **Effort:** ~2 min (recognised + re-ran)
+- **Status:** ongoing (workaround = re-run; proper fix = make the script resilient or size up the warehouse for verify)
+- **Symptom:** `scripts/verify_catchup_final.py` printed `❌ 2 CHECK(S) FAILED` (then `❌ 1 CHECK(S) FAILED` on the next run) right after a fully successful bronze/silver/gold catch-up. The "failures" were lines like `dim_customer total rows: ERROR — Timed out after 0:05:00` and `fact_daily_channel_revenue rows: ERROR — Timed out after 0:05:00`, plus a derived check (`total == distinct surrogate_key`) failing because the timed-out count came back as a `-1` sentinel.
+- **Root cause:** the SQL warehouse (`pipelineiq-dev-sqlwh`) is a 2X-Small Classic with a 5-min per-query timeout. On a cold start, and on the heaviest aggregations (e.g. a `COUNT` over the 7.19M-row `fact_inventory_daily`, or the channel-revenue rollup), individual queries exceed 5 min and return an ERROR sentinel. The script counts any ERROR'd query as a failed check, so a healthy warehouse produces a scary red summary. Which query times out varies run-to-run (cold-start luck) — run 1 lost `dim_customer total`, run 2 lost `fact_daily_channel_revenue`. Across the two runs every value resolved and every real reconciliation passed (order_lines 48,392 == fact; inventory 7,190,640 == fact; dim_customer 1,047 == distinct SK; 0 collisions; 0 FK orphans).
+- **Fix:** none needed for the data — re-run `verify_catchup_final.py` once the warehouse is warm; values that timed out on the cold run complete on the warm run. Across runs, confirm each check passed at least once.
+- **Prevention / first-check:** a red `CHECK(S) FAILED` whose failing lines are `ERROR — Timed out after 0:05:00` is a warehouse-perf artifact, NOT a data mismatch — re-run before investigating. Proper fixes (pick one, low priority): (a) have `verify_catchup_final.py` retry timed-out queries / treat a timeout distinctly from a real FAIL; (b) temporarily resize the warehouse to Small for verify; (c) add `OPTIMIZE`/stats so the big `COUNT`s finish under 5 min. Worth doing before this script becomes a CI gate.
+- **References:** PROGRESS.md 2026-06-05 (S18 backlog batch → medallion catch-up). Commit `315419f`.
 
 ### #25 — 2026-06-04 — Cafe WiFi stalls `az` token refresh, masquerading as a Terraform-backend failure
 - **Phase / Session:** Tier 6 (ADF chunk 1) / Session 18
