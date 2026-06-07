@@ -25,7 +25,7 @@
 | Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **48,392**; `fact_inventory_daily` **7,190,640**; `fact_daily_channel_revenue` 13,978. 0 FK orphans. |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
-| ADF Bicep (Tier 6) | ✅ **Chunk 1 LIVE (S18)**; ⏳ **Chunk 2 code-side prep landed (S19)** | Chunk 1 (S18): factory + 4 linked services + 2 datasets, all published. **S19 (Architecture repo) authored the chunk-2 enablers:** `GET /entities` endpoint (DECISIONS #75), `entity_registry.partition_date_column` in `bootstrap_postgres.sql` + `SCHEMA.md` (#76), `notebooks/orchestrate_medallion.py` + `--upload-orchestrator` (#77). **Pending in PipelineIQ-IaC** (not in S19's checkout): `pipeline_master_copy.bicep` + `ls_function` + `trg_daily_0040` (Stopped) + diagnostic settings + KV `functions-host-key`. Then Function deploy + live `ALTER` + apply + copy smoke + cutover. |
+| ADF Bicep (Tier 6) | ✅ **Chunk 1 LIVE (S18)**; ✅ **Chunk 2 deployed (S19) — COPY+control-plane smoke GREEN**; ⚠️ **RunMedallion deferred** | Chunk 1 (S18): factory + 4 LS + 2 datasets. **S19:** Architecture enablers (`GET /entities` #75, `entity_registry.partition_date_column` #76, `orchestrate_medallion` #77) + IaC (`PipelineIQ-IaC` `45b56d7`: `pl_master_copy` + `ls_function` + `trg_daily_0040` Stopped + diagnostics + KV `functions-host-key`) applied & deployed. **Copy smoke green** (run `0e323e94`, 2026-06-04): metadata-driven `GetEntities→ForEach(12)→Copy→RegisterFile→CommitWatermark→LogEntityEnd`, landing + watermark advance proven. **`RunMedallion` failed** — ADF cluster lacks `data_security_mode=SINGLE_USER` (no UC access); fix is the UC-cluster follow-up (DECISIONS #78). Trigger Stopped, no cutover — `export_velora_to_landing.py` still prod path. |
 | Phase 3 (failure injection + incident store) | ⏳ Not started | `failure_injector.py` written, end-to-end unverified. |
 | Phase 4 (pgvector RCA) | ⏳ Not started | |
 | Phase 5 (FastAPI + Slack) | ⏳ Not started | |
@@ -121,25 +121,33 @@ container had no Azure/Postgres access.
    `partition_date_column`.
 2. ✅ **DONE (2026-06-07, live)** — **Orchestrator uploaded** to
    `/Shared/pipelineiq/orchestrate_medallion` (`catchup_medallion.py --upload-orchestrator`).
-3. **PipelineIQ-IaC (separate clone)** — author + deploy:
-   - `bicep/adf/linkedservice_function.bicep` (`ls_function`, KV `functions-host-key`).
-   - `bicep/adf/pipeline_master_copy.bicep` (`pl_master_copy`): `GetEntities` →
-     `LogRunStart` → ForEach(batchCount 4){ LogEntityStart, ClearTarget, CopyToLanding,
-     RegisterFile, CommitWatermark, LogEntityEnd / failure→LogEntityFailed } →
-     `RunMedallion` (DatabricksNotebookActivity → `/Shared/pipelineiq/orchestrate_medallion`,
-     base param `pipeline_run_id=@{pipeline().RunId}`) → `LogRunEnd`. Every `runs/start`
-     includes `pipeline_name`; per-entity run_id = `@{pipeline().RunId}:@{item().source_table}`.
-   - `bicep/adf/trigger_daily.bicep` (`trg_daily_0040`, 00:40 UTC, **Stopped**).
-   - `core/adf/main.tf` diagnostic settings → `pipelineiq-logs-dev`; `clients/velora/main.tf`
-     KV `functions-host-key` from `data.azurerm_function_app_host_keys`.
-   - `terraform apply` (KV secret + diagnostics) → `bash scripts/deploy_adf.sh` (pass `functionAppUrl`).
-4. **Smoke** — trigger `pl_master_copy` for one date (e.g. 2026-06-04) with `RunMedallion`
-   disabled first → confirm `landing/orders/date=.../` + `landing/customers/full/` +
-   `pipeline_exec_log`/`file_registry`/`watermarks` grow; then enable `RunMedallion`
-   (bronze→silver→gold; most likely cluster/MSI friction point).
-5. **Cutover** (6.11) — start `trg_daily_0040`; `export_velora_to_landing.py` → recovery-only.
-6. **Docs** — write `docs/pipeline.md` (deferred until smoke green — phase not "done" yet);
-   flip the CLAUDE.md architecture-vs-reality ADF row to built.
+3. ✅ **DONE (2026-06-07, `PipelineIQ-IaC` commit `45b56d7`)** — chunk-2 IaC authored,
+   applied + deployed: `ls_function`, `pl_master_copy`, `trg_daily_0040` (Stopped),
+   ADF diagnostics → `pipelineiq-logs-dev`, KV `functions-host-key`. `terraform apply`
+   + `deploy_adf.sh` both clean; all objects listable.
+4. ⚠️ **PARTIAL (2026-06-07, run `0e323e94-...`)** — **COPY + control-plane smoke is GREEN**:
+   `landing/orders/date=2026-06-04/` + `landing/customers/full/` landed; watermark
+   `velora_oms.orders` advanced to 2026-06-04 via the dotted-route `AzureFunctionActivity`;
+   `GetEntities`/`ForEach`(12)/`Copy`/`RegisterFile`/`CommitWatermark`/`LogEntityEnd` all
+   succeeded. **`RunMedallion` FAILED** — see next-task #1.
+
+   **▶ NEXT TASK #1 — fix `RunMedallion` (medallion UC-cluster access).** The ADF-spawned
+   cluster (via `ls_databricks`) has **no `data_security_mode=SINGLE_USER`**, so it lacks
+   Unity Catalog access and the bronze notebook's write to the `bronze` UC catalog fails
+   instantly. MSI auth itself worked (cluster spun, job ran). `catchup_medallion.py:187`
+   sets `DataSecurityMode.SINGLE_USER` — that's the gap. Fix options (DECISIONS #78):
+   (a) add `policyId` (the UC cluster policy `module.databricks_uc.cluster_policy_id`) to
+   `ls_databricks` and test whether it forces SINGLE_USER + a valid `single_user_name`;
+   (b) if ADF can't express it, restructure `RunMedallion` to trigger a Terraform-defined
+   UC job (pattern: `core/inventory_workflow`) via a Web Activity `jobs/run-now` + poll.
+   Re-run `pl_master_copy` for 2026-06-04 until medallion green.
+5. **Cutover** (6.11) — only after the full smoke (incl. medallion) is green: `az datafactory
+   trigger start ... -n trg_daily_0040`; `export_velora_to_landing.py` → recovery-only.
+6. **Docs** — write `docs/pipeline.md` + flip the CLAUDE.md architecture-vs-reality ADF row
+   to fully "built" only after the medallion smoke is green (copy-only is not "done").
+7. **Postgres verify (needs VPN — IPv6 networks can't be allowlisted):** confirm
+   `pipeline_exec_log` (1 master + 12 entity rows for run `0e323e94`, master = failed),
+   `file_registry` (12 rows), `watermarks` (12 advanced to 2026-06-04).
 
 ---
 
@@ -378,6 +386,21 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-06-07 (Session 19 cont. — local: applied Architecture enablers + authored/deployed IaC chunk 2; COPY smoke green, RunMedallion deferred)
+**Objective:** Land the cloud-authored Architecture patch + build the `PipelineIQ-IaC` half of ADF chunk 2 + smoke it.
+**Built / did:**
+- Applied the cloud `adfchunk2enablers.patch` to `main` (commits `555afe2` + `3dd889b`); live-smoked it: `entity_registry.partition_date_column` ALTER+backfill on dev Postgres, `deploy_function.sh` (`GET /entities` returns 12 rows), orchestrator uploaded.
+- `PipelineIQ-IaC` (commit `45b56d7`): `ls_function` + `pl_master_copy` + `trg_daily_0040` (Stopped) Bicep, ADF diagnostics → `pipelineiq-logs-dev`, KV `functions-host-key`, `deploy_adf.sh` functionAppUrl. `terraform validate` + `az bicep build` clean; `terraform apply` (2 add: KV secret + diagnostics; 2 benign drift realigns) + `deploy_adf.sh` both succeeded.
+**Worked:**
+- **COPY + control-plane smoke fully green** (run `0e323e94-...`, 2026-06-04): all 12 entities copied to `landing/` (orders by-date, others full), `RegisterFile`/`CommitWatermark`/`LogEntityEnd` succeeded, `velora_oms.orders` watermark advanced to 2026-06-04. The dotted-route `AzureFunctionActivity` (`watermarks/velora_oms.orders/commit`) — the biggest pre-build risk — **works**. `ClearTarget` "Completed" dependency correctly tolerated the first-run missing-folder fault.
+- Offline validation caught nothing post-fix; the `runtimeState` read-only Bicep warning was resolved by dropping the property (triggers deploy Stopped by default).
+**Broke / deferred:**
+- **`RunMedallion` FAILED** — the ADF-spawned cluster (via `ls_databricks`) has no `data_security_mode=SINGLE_USER` → no Unity Catalog access → bronze's UC-catalog write fails. MSI auth itself worked (cluster spun, job ran). Root cause confirmed against `catchup_medallion.py:187`. Deferred per user (commit the win). `trg_daily_0040` stays Stopped, no cutover — zero blast radius. DECISIONS #78.
+- IPv6 networks mid-session — couldn't allowlist laptop→Postgres (firewall is IPv4-only); verified watermarks via the Function `GET` instead. Direct `pipeline_exec_log`/`file_registry` row check deferred to a VPN session.
+**Uncertainty:** whether ADF's `ls_databricks` can express SINGLE_USER via `policyId`, or whether `RunMedallion` must become a TF-defined UC job (Next task #1).
+**Next:** fix `RunMedallion` UC cluster → re-run full smoke → cutover (6.11). See `## Next task`.
+**Summary:** ADF chunk 2 is deployed and the metadata-driven copy + control-plane is proven end-to-end live — "metadata-driven" is now fact, the architecture-vs-reality ADF gap is all but closed. The only remaining leg is the medallion orchestration, which fails on a known, bounded Databricks-cluster UC-access-mode gap (not a flaw in the new pipeline). Committed across both repos; medallion fix is the clean next pickup.
 
 ### 2026-06-07 (Session 19 — Tier 6 ADF chunk 2: Architecture-repo enablers authored; IaC + deploy + smoke handed off)
 **Objective:** Refine + execute the chunk-2 plan (metadata-driven master copy pipeline + medallion orchestration, build_order 6.4–6.11). Remote session; checkout was `PipelineIQ-Architecture` only, container had no `az`/`POSTGRES_URL` (no Azure/Postgres reach) — so this session landed every chunk-2 artifact that lives in this repo and handed off the IaC + Azure-side steps.

@@ -529,19 +529,22 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   `notebooks/orchestrate_medallion.py` + `catchup_medallion.py
   --upload-orchestrator` (#77 — one notebook chains bronze→silver→gold via
   `dbutils.notebook.run`, takes `pipeline_run_id` not `run_date`).
-  **Chunk-2 Architecture-repo enablers DONE + live-smoked (2026-06-07):** the live
-  `entity_registry` `ALTER`+back-fill is applied (orders=`order_date`,
-  inventory_snapshot=`snapshot_date`, other 10 NULL), the Function is deployed
-  (`GET /api/entities` returns 12 rows), and `orchestrate_medallion` is uploaded to
-  the workspace. **Chunk 2 STILL PENDING (next session, needs VPN/az + `PipelineIQ-IaC`
-  checkout):** the IaC Bicep/TF (`pipeline_master_copy.bicep`,
-  `ls_function`, `trg_daily_0040` Stopped, diagnostics → `pipelineiq-logs-dev`, KV
-  `functions-host-key`); apply + deploy; copy smoke (one date, `RunMedallion` off
-  then on); cutover (6.11). **Watermark is committed per-copy inside the ForEach**
-  (DECISIONS #75) — looser than build_order 6.8's end-to-end; deliberate under
-  faithful reproduction. `scripts/export_velora_to_landing.py` remains the prod
-  fire path until chunk-2 cutover. Do NOT write `docs/pipeline.md` or flip the
-  architecture-vs-reality ADF row to "built" until the copy smoke is green.
+  **Chunk 2 DEPLOYED; COPY+control-plane smoke GREEN; only `RunMedallion` + cutover
+  remain (2026-06-07).** Architecture enablers live (`GET /entities`, `partition_date_column`
+  ALTER, `orchestrate_medallion` uploaded). IaC deployed (`PipelineIQ-IaC` `45b56d7`:
+  `pl_master_copy` + `ls_function` + `trg_daily_0040` Stopped + diagnostics + KV
+  `functions-host-key`). Smoke run `0e323e94` (2026-06-04): metadata-driven copy of all
+  12 entities → `landing/`, watermark advance, `pipeline_exec_log`/`file_registry` writes
+  — all green; the dotted-route `AzureFunctionActivity` works. **`RunMedallion` FAILED
+  (DECISIONS #78): the ADF-spawned cluster lacks `data_security_mode=SINGLE_USER` → no
+  Unity Catalog access → bronze UC write faults.** ▶ NEXT: make the medallion cluster
+  UC-enabled (`policyId` on `ls_databricks`, or restructure `RunMedallion` as a TF-defined
+  UC job — `core/inventory_workflow` pattern), re-run full smoke, then cutover (6.11).
+  **Watermark is committed per-copy inside the ForEach** (DECISIONS #75) — looser than
+  build_order 6.8's end-to-end; deliberate under faithful reproduction. `trg_daily_0040`
+  is Stopped and `scripts/export_velora_to_landing.py` remains prod until cutover. Do NOT
+  write `docs/pipeline.md` or flip the architecture-vs-reality ADF row to fully "built"
+  until the **medallion** smoke is green (copy-only ≠ done).
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
 - ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Superseded (S18).**
   `scripts/inventory_only.py` (and `recover_inventory_batch.sh`) were retired —
