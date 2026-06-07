@@ -529,10 +529,12 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   `notebooks/orchestrate_medallion.py` + `catchup_medallion.py
   --upload-orchestrator` (#77 — one notebook chains bronze→silver→gold via
   `dbutils.notebook.run`, takes `pipeline_run_id` not `run_date`).
-  **Chunk 2 STILL PENDING (next session, needs VPN/az + `PipelineIQ-IaC` checkout):**
-  live `ALTER` of `entity_registry` (seed `ON CONFLICT DO NOTHING` won't back-fill
-  existing rows — see PROGRESS `## Next task` for the exact SQL); `bash
-  scripts/deploy_function.sh`; the IaC Bicep/TF (`pipeline_master_copy.bicep`,
+  **Chunk-2 Architecture-repo enablers DONE + live-smoked (2026-06-07):** the live
+  `entity_registry` `ALTER`+back-fill is applied (orders=`order_date`,
+  inventory_snapshot=`snapshot_date`, other 10 NULL), the Function is deployed
+  (`GET /api/entities` returns 12 rows), and `orchestrate_medallion` is uploaded to
+  the workspace. **Chunk 2 STILL PENDING (next session, needs VPN/az + `PipelineIQ-IaC`
+  checkout):** the IaC Bicep/TF (`pipeline_master_copy.bicep`,
   `ls_function`, `trg_daily_0040` Stopped, diagnostics → `pipelineiq-logs-dev`, KV
   `functions-host-key`); apply + deploy; copy smoke (one date, `RunMedallion` off
   then on); cutover (6.11). **Watermark is committed per-copy inside the ForEach**

@@ -107,16 +107,20 @@ container had no Azure/Postgres access.
   --upload-orchestrator` — DECISIONS #77.
 
 **S20 pick-up order (needs VPN/az login + IaC checkout):**
-0. **Live dev Postgres** — apply the new column to existing rows (the seed
-   `ON CONFLICT DO NOTHING` will NOT back-fill):
+0. ✅ **DONE (2026-06-07, live)** — **Live dev Postgres** `ALTER` + back-fill applied
+   (the seed `ON CONFLICT DO NOTHING` does NOT back-fill, so this was a separate
+   migration). Verified: 12 rows, `orders=order_date`, `inventory_snapshot=snapshot_date`,
+   other 10 NULL.
    ```sql
    ALTER TABLE pipeline.entity_registry ADD COLUMN IF NOT EXISTS partition_date_column VARCHAR(50);
    UPDATE pipeline.entity_registry SET partition_date_column='order_date'    WHERE source_table='orders';
    UPDATE pipeline.entity_registry SET partition_date_column='snapshot_date' WHERE source_table='inventory_snapshot';
    ```
-1. **Deploy Function** — `bash scripts/deploy_function.sh`; verify
-   `curl ".../api/entities?code=<host-key>"` → 12 rows incl. `partition_date_column`.
-2. **Upload orchestrator** — `.venv/bin/python scripts/catchup_medallion.py --upload-orchestrator`.
+1. ✅ **DONE (2026-06-07, live)** — **Function deployed** (`deploy_function.sh`, 7 funcs
+   registered incl. `get_entities`); `GET /api/entities` returns 12 rows incl.
+   `partition_date_column`.
+2. ✅ **DONE (2026-06-07, live)** — **Orchestrator uploaded** to
+   `/Shared/pipelineiq/orchestrate_medallion` (`catchup_medallion.py --upload-orchestrator`).
 3. **PipelineIQ-IaC (separate clone)** — author + deploy:
    - `bicep/adf/linkedservice_function.bicep` (`ls_function`, KV `functions-host-key`).
    - `bicep/adf/pipeline_master_copy.bicep` (`pl_master_copy`): `GetEntities` →
