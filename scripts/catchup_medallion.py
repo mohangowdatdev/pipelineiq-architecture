@@ -32,6 +32,10 @@ from databricks.sdk.service.workspace import ImportFormat, Language
 WORKSPACE_HOST = "https://adb-7405617631498102.2.azuredatabricks.net"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Orchestrator: single notebook ADF invokes to chain bronze→silver→gold.
+ORCHESTRATOR_LOCAL = REPO_ROOT / "notebooks/orchestrate_medallion.py"
+ORCHESTRATOR_WS = "/Shared/pipelineiq/orchestrate_medallion"
+
 # Bronze: one notebook handles every entity via widget; single upload, N tasks.
 BRONZE_NOTEBOOK_LOCAL = REPO_ROOT / "notebooks/bronze/ingest_to_bronze.py"
 BRONZE_NOTEBOOK_WS = "/Shared/pipelineiq/bronze/ingest_to_bronze"
@@ -232,11 +236,26 @@ def wait_for_run(w: WorkspaceClient, run_id: int) -> bool:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--layer", required=True, choices=["bronze", "silver", "gold"])
+    p.add_argument("--layer", choices=["bronze", "silver", "gold"])
+    p.add_argument(
+        "--upload-orchestrator",
+        action="store_true",
+        help="Upload notebooks/orchestrate_medallion.py to the workspace and exit "
+        "(no job run). The ADF master pipeline invokes this notebook.",
+    )
     p.add_argument("--keep-job", action="store_true", help="Don't delete the job after run (useful for debug)")
     args = p.parse_args()
 
     w = WorkspaceClient(host=WORKSPACE_HOST)
+
+    if args.upload_orchestrator:
+        print("=== Uploading medallion orchestrator ===")
+        upload(w, ORCHESTRATOR_LOCAL, ORCHESTRATOR_WS)
+        sys.exit(0)
+
+    if not args.layer:
+        p.error("one of --layer or --upload-orchestrator is required")
+
     job_id, run_id = submit_layer(w, args.layer)
     try:
         ok = wait_for_run(w, run_id)

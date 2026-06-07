@@ -25,7 +25,7 @@
 | Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **48,392**; `fact_inventory_daily` **7,190,640**; `fact_daily_channel_revenue` 13,978. 0 FK orphans. |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
-| ADF Bicep (Tier 6) | ✅ **Chunk 1 LIVE (S18)** — factory + 4 linked services + 2 datasets | Function REST endpoints done (S16). **S18 applied chunk 1:** `pipelineiq-adf-dev` factory (MI `18e622b2`, +3 RBAC) via `terraform apply` (4 added); 4 linked services (`ls_keyvault`/`ls_azuresql_velora`/`ls_adls`/`ls_databricks` MSI) + 2 parameterised datasets (`ds_sql_source`/`ds_adls_sink`) via `scripts/deploy_adf.sh`. All published + listable. **Chunk 2 (master copy pipeline 6.4 + notebook activities 6.5 + diagnostics 6.6)** is next. |
+| ADF Bicep (Tier 6) | ✅ **Chunk 1 LIVE (S18)**; ⏳ **Chunk 2 code-side prep landed (S19)** | Chunk 1 (S18): factory + 4 linked services + 2 datasets, all published. **S19 (Architecture repo) authored the chunk-2 enablers:** `GET /entities` endpoint (DECISIONS #75), `entity_registry.partition_date_column` in `bootstrap_postgres.sql` + `SCHEMA.md` (#76), `notebooks/orchestrate_medallion.py` + `--upload-orchestrator` (#77). **Pending in PipelineIQ-IaC** (not in S19's checkout): `pipeline_master_copy.bicep` + `ls_function` + `trg_daily_0040` (Stopped) + diagnostic settings + KV `functions-host-key`. Then Function deploy + live `ALTER` + apply + copy smoke + cutover. |
 | Phase 3 (failure injection + incident store) | ⏳ Not started | `failure_injector.py` written, end-to-end unverified. |
 | Phase 4 (pgvector RCA) | ⏳ Not started | |
 | Phase 5 (FastAPI + Slack) | ⏳ Not started | |
@@ -94,7 +94,52 @@ S15 (architecture migration only, no new columns/tables).
 
 ## Next task
 
-**Tier 6 ADF chunk 2** — chunk 1 is LIVE (S18, 2026-06-05): `pipelineiq-adf-dev`
+**Tier 6 ADF chunk 2 — finish the IaC + deploy + smoke.** S19 (this session,
+Architecture repo) authored the chunk-2 enablers; the IaC + Azure-side steps
+remain because the `PipelineIQ-IaC` repo was not in S19's checkout and the
+container had no Azure/Postgres access.
+
+**S19 already landed (Architecture repo, committed):**
+- `GET /entities` endpoint (`functions/function_app.py`) — DECISIONS #75.
+- `entity_registry.partition_date_column` in `scripts/bootstrap_postgres.sql`
+  + `SCHEMA.md` — DECISIONS #76.
+- `notebooks/orchestrate_medallion.py` + `scripts/catchup_medallion.py
+  --upload-orchestrator` — DECISIONS #77.
+
+**S20 pick-up order (needs VPN/az login + IaC checkout):**
+0. **Live dev Postgres** — apply the new column to existing rows (the seed
+   `ON CONFLICT DO NOTHING` will NOT back-fill):
+   ```sql
+   ALTER TABLE pipeline.entity_registry ADD COLUMN IF NOT EXISTS partition_date_column VARCHAR(50);
+   UPDATE pipeline.entity_registry SET partition_date_column='order_date'    WHERE source_table='orders';
+   UPDATE pipeline.entity_registry SET partition_date_column='snapshot_date' WHERE source_table='inventory_snapshot';
+   ```
+1. **Deploy Function** — `bash scripts/deploy_function.sh`; verify
+   `curl ".../api/entities?code=<host-key>"` → 12 rows incl. `partition_date_column`.
+2. **Upload orchestrator** — `.venv/bin/python scripts/catchup_medallion.py --upload-orchestrator`.
+3. **PipelineIQ-IaC (separate clone)** — author + deploy:
+   - `bicep/adf/linkedservice_function.bicep` (`ls_function`, KV `functions-host-key`).
+   - `bicep/adf/pipeline_master_copy.bicep` (`pl_master_copy`): `GetEntities` →
+     `LogRunStart` → ForEach(batchCount 4){ LogEntityStart, ClearTarget, CopyToLanding,
+     RegisterFile, CommitWatermark, LogEntityEnd / failure→LogEntityFailed } →
+     `RunMedallion` (DatabricksNotebookActivity → `/Shared/pipelineiq/orchestrate_medallion`,
+     base param `pipeline_run_id=@{pipeline().RunId}`) → `LogRunEnd`. Every `runs/start`
+     includes `pipeline_name`; per-entity run_id = `@{pipeline().RunId}:@{item().source_table}`.
+   - `bicep/adf/trigger_daily.bicep` (`trg_daily_0040`, 00:40 UTC, **Stopped**).
+   - `core/adf/main.tf` diagnostic settings → `pipelineiq-logs-dev`; `clients/velora/main.tf`
+     KV `functions-host-key` from `data.azurerm_function_app_host_keys`.
+   - `terraform apply` (KV secret + diagnostics) → `bash scripts/deploy_adf.sh` (pass `functionAppUrl`).
+4. **Smoke** — trigger `pl_master_copy` for one date (e.g. 2026-06-04) with `RunMedallion`
+   disabled first → confirm `landing/orders/date=.../` + `landing/customers/full/` +
+   `pipeline_exec_log`/`file_registry`/`watermarks` grow; then enable `RunMedallion`
+   (bronze→silver→gold; most likely cluster/MSI friction point).
+5. **Cutover** (6.11) — start `trg_daily_0040`; `export_velora_to_landing.py` → recovery-only.
+6. **Docs** — write `docs/pipeline.md` (deferred until smoke green — phase not "done" yet);
+   flip the CLAUDE.md architecture-vs-reality ADF row to built.
+
+---
+
+**(historical) chunk-1 context** — chunk 1 is LIVE (S18, 2026-06-05): `pipelineiq-adf-dev`
 factory + 4 linked services + 2 parameterised datasets all applied/published.
 See `docs/forward_plan.md` for the S18→S21 outline.
 
@@ -329,6 +374,26 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-06-07 (Session 19 — Tier 6 ADF chunk 2: Architecture-repo enablers authored; IaC + deploy + smoke handed off)
+**Objective:** Refine + execute the chunk-2 plan (metadata-driven master copy pipeline + medallion orchestration, build_order 6.4–6.11). Remote session; checkout was `PipelineIQ-Architecture` only, container had no `az`/`POSTGRES_URL` (no Azure/Postgres reach) — so this session landed every chunk-2 artifact that lives in this repo and handed off the IaC + Azure-side steps.
+**Built (Architecture repo):**
+- `functions/function_app.py` — new `GET /entities` endpoint (`get_entities`): active `entity_registry` rows ordered by `(priority, entity_name)`, returns `partition_date_column`. Mirrors the existing handler style (`_pool()`, `dict_row`, `_json_response`). DECISIONS #75.
+- `scripts/bootstrap_postgres.sql` — `entity_registry.partition_date_column VARCHAR(50) NULL` added to CREATE + seed (orders=`order_date`, inventory_snapshot=`snapshot_date`, other 10 NULL). `SCHEMA.md` updated. DECISIONS #76.
+- `notebooks/orchestrate_medallion.py` (NEW) — single notebook ADF invokes once over `ls_databricks` (MSI); chains bronze (10) → silver (10) → gold (8-task DAG) via sequential `dbutils.notebook.run`, reusing `catchup_medallion.py`'s exact lists. Threads `pipeline_run_id` (NOT `run_date` — verified the medallion notebooks don't take a date). DECISIONS #77.
+- `scripts/catchup_medallion.py` — `--upload-orchestrator` flag (reuses the existing `upload()` + `WorkspaceClient`) to push the orchestrator to `/Shared/pipelineiq/orchestrate_medallion`.
+- Docs: DECISIONS #75/#76/#77; build_order 6.4–6.11 → In progress with code-vs-IaC split; At-a-glance + Next task + this log.
+**Worked:**
+- Plan refinement caught three real issues before any code: (1) the draft's orchestrator passed `run_date` to bronze/silver/gold — they actually take `pipeline_run_id` and bronze reads ALL of `landing/<entity>/` recursively; (2) `partition_date_column` (not `load_type`) is the correct partition driver, matching `export_velora_to_landing.py`'s by_date set (orders + inventory only); (3) the whole thing spans two repos and only one was checked out.
+- All changed Python compiles (`py_compile` green on function_app, catchup_medallion, orchestrate_medallion).
+**Broke / blocked (expected, not errors):**
+- No Azure/Postgres access in the container (`az` missing, no `POSTGRES_URL`) → live `ALTER` of `entity_registry`, Function deploy, IaC apply, and the copy smoke are all hand-offs (queued step-by-step in `## Next task`).
+- The IaC pieces (`pipeline_master_copy.bicep`, `ls_function`, `trg_daily_0040`, diagnostics, KV `functions-host-key`) live in `PipelineIQ-IaC` — author them there next session.
+**Uncertainty:**
+- Watermark timing is committed per-copy (inside ForEach, before medallion), looser than build_order 6.8's strict end-to-end — recorded as a deliberate choice in DECISIONS #75; revisit if Phase 3 wants end-to-end semantics.
+- `RunMedallion` is the untested edge (first ADF MSI → Databricks call registers the MI as a workspace user) — most likely smoke-friction point.
+**Next:** S20 — live `ALTER` + Function deploy + verify `curl .../api/entities`; then `PipelineIQ-IaC` chunk-2 Bicep/TF + apply + copy smoke + cutover. Full order in `## Next task`.
+**Summary:** Chunk 2's "code that lives in the app repo" is done and pushed: the registry endpoint, the `partition_date_column` schema, the medallion orchestrator + its uploader, and all docs/DECISIONS. The refinement pass corrected a wrong notebook-param assumption and confirmed the partition mechanism against the scaffold, so the IaC author next session has an exact contract to wire against. Everything Azure-touching (Postgres ALTER, Function deploy, ADF Bicep apply, smoke, cutover) is sequenced in Next task and waits on VPN/az + the IaC checkout. Clean code-complete pause, same shape as S18 chunk 1.
 
 ### 2026-06-04 → 06-05 (Session 18 — Tier 6 ADF chunk 1: written + validated (6/04), APPLIED + LIVE on resume (6/05))
 **Objective:** Write Tier 6 ADF chunk 1 (build_order 6.1–6.3): the ADF factory Terraform module + 4 linked-service Bicep + 2 parameterised dataset Bicep, and apply/deploy + smoke. Half session.

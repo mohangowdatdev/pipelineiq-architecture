@@ -38,7 +38,10 @@ CREATE TABLE IF NOT EXISTS pipeline.entity_registry (
     schedule            VARCHAR(20)     NOT NULL DEFAULT 'daily',
     active              BOOLEAN         NOT NULL DEFAULT TRUE,
     priority            INT             NOT NULL DEFAULT 5,
-    depends_on          VARCHAR(100)    NULL                 -- entity_name of upstream dependency
+    depends_on          VARCHAR(100)    NULL,                -- entity_name of upstream dependency
+    partition_date_column VARCHAR(50)   NULL                 -- business-date column ADF extracts by;
+                                                             -- non-null ⇒ landing/<t>/date=<D>/,
+                                                             -- null ⇒ landing/<t>/full/ (DECISIONS #76)
 );
 
 -- ── pipeline.watermarks ───────────────────────────────────────────────────────
@@ -171,29 +174,34 @@ CREATE INDEX IF NOT EXISTS idx_iac_embeddings_resource_type
 -- Priority determines processing order within a run.
 -- depends_on enforces that upstream entities complete before downstream ones start.
 
+-- partition_date_column (last column): non-null only for the two entities ADF
+-- extracts by business date (orders, inventory_snapshot), exactly mirroring
+-- scripts/export_velora_to_landing.py's by_date set. All others land as full
+-- snapshots ⇒ NULL. This column — not load_type — drives ADF partitioning
+-- (DECISIONS #76).
 INSERT INTO pipeline.entity_registry
     (entity_name, source_schema, source_table, watermark_column,
-     load_type, schedule, active, priority, depends_on)
+     load_type, schedule, active, priority, depends_on, partition_date_column)
 VALUES
     -- OMS entities (orders must precede order_lines and status_log)
-    ('velora_oms.orders',               'velora_oms', 'orders',               'updated_at',   'incremental', 'daily', TRUE, 1, NULL),
-    ('velora_oms.order_lines',          'velora_oms', 'order_lines',          'updated_at',   'incremental', 'daily', TRUE, 2, 'velora_oms.orders'),
-    ('velora_oms.order_status_log',     'velora_oms', 'order_status_log',     'created_at',   'incremental', 'daily', TRUE, 3, 'velora_oms.orders'),
+    ('velora_oms.orders',               'velora_oms', 'orders',               'updated_at',   'incremental', 'daily', TRUE, 1, NULL,                  'order_date'),
+    ('velora_oms.order_lines',          'velora_oms', 'order_lines',          'updated_at',   'incremental', 'daily', TRUE, 2, 'velora_oms.orders',   NULL),
+    ('velora_oms.order_status_log',     'velora_oms', 'order_status_log',     'created_at',   'incremental', 'daily', TRUE, 3, 'velora_oms.orders',   NULL),
     -- CRM entities (customers must precede addresses)
-    ('velora_crm.customers',            'velora_crm', 'customers',            'updated_at',   'incremental', 'daily', TRUE, 1, NULL),
-    ('velora_crm.customer_addresses',   'velora_crm', 'customer_addresses',   'updated_at',   'incremental', 'daily', TRUE, 2, 'velora_crm.customers'),
+    ('velora_crm.customers',            'velora_crm', 'customers',            'updated_at',   'incremental', 'daily', TRUE, 1, NULL,                  NULL),
+    ('velora_crm.customer_addresses',   'velora_crm', 'customer_addresses',   'updated_at',   'incremental', 'daily', TRUE, 2, 'velora_crm.customers', NULL),
     -- PIM entities (products must precede pricing; inventory is full refresh)
-    ('velora_pim.products',             'velora_pim', 'products',             'updated_at',   'incremental', 'daily', TRUE, 1, NULL),
-    ('velora_pim.product_pricing',      'velora_pim', 'product_pricing',      'created_at',   'incremental', 'daily', TRUE, 2, 'velora_pim.products'),
-    ('velora_pim.inventory_snapshot',   'velora_pim', 'inventory_snapshot',   'snapshot_date','full',        'daily', TRUE, 3, NULL),
+    ('velora_pim.products',             'velora_pim', 'products',             'updated_at',   'incremental', 'daily', TRUE, 1, NULL,                  NULL),
+    ('velora_pim.product_pricing',      'velora_pim', 'product_pricing',      'created_at',   'incremental', 'daily', TRUE, 2, 'velora_pim.products', NULL),
+    ('velora_pim.inventory_snapshot',   'velora_pim', 'inventory_snapshot',   'snapshot_date','full',        'daily', TRUE, 3, NULL,                  'snapshot_date'),
     -- HRM entities (reps must precede assignments)
-    ('velora_hrm.sales_reps',           'velora_hrm', 'sales_reps',           'updated_at',   'incremental', 'daily', TRUE, 1, NULL),
-    ('velora_hrm.territory_assignments','velora_hrm', 'territory_assignments', 'created_at',  'incremental', 'daily', TRUE, 2, 'velora_hrm.sales_reps'),
+    ('velora_hrm.sales_reps',           'velora_hrm', 'sales_reps',           'updated_at',   'incremental', 'daily', TRUE, 1, NULL,                  NULL),
+    ('velora_hrm.territory_assignments','velora_hrm', 'territory_assignments', 'created_at',  'incremental', 'daily', TRUE, 2, 'velora_hrm.sales_reps', NULL),
     -- Static reference seeds (added in S9.5 / DECISIONS #60; seeded into
     -- entity_registry retroactively in S13). No real watermark — these
     -- tables only change when the generator/seed code changes.
-    ('velora_pim.product_categories',   'velora_pim', 'product_categories',   'category_id',  'full',        'daily', TRUE, 11, NULL),
-    ('velora_pim.stores',               'velora_pim', 'stores',               'opened_date',  'full',        'daily', TRUE, 12, NULL)
+    ('velora_pim.product_categories',   'velora_pim', 'product_categories',   'category_id',  'full',        'daily', TRUE, 11, NULL,                 NULL),
+    ('velora_pim.stores',               'velora_pim', 'stores',               'opened_date',  'full',        'daily', TRUE, 12, NULL,                 NULL)
 ON CONFLICT (entity_name) DO NOTHING;
 
 -- ── Seed initial watermarks ───────────────────────────────────────────────────

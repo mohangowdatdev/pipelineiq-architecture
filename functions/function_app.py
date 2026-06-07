@@ -97,6 +97,34 @@ def generator_timer(mytimer: func.TimerRequest) -> None:
     _generator_main(mytimer)
 
 
+@app.route(route="entities", methods=["GET"])
+def get_entities(req: func.HttpRequest) -> func.HttpResponse:
+    """Return the active entity_registry rows that drive the ADF master pipeline.
+
+    Ordered by (priority, entity_name) so the caller's ForEach processes
+    high-priority entities first. `partition_date_column` is non-null only
+    for entities ADF extracts by business date (orders, inventory_snapshot);
+    null means full-table dump.
+    """
+    try:
+        with _pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entity_name, source_schema, source_table,
+                       watermark_column, load_type, partition_date_column,
+                       priority
+                FROM pipeline.entity_registry
+                WHERE active = TRUE
+                ORDER BY priority, entity_name
+                """
+            )
+            rows = cur.fetchall()
+        return _json_response({"entities": rows})
+    except Exception as e:
+        log.exception("get_entities failed: %s", e)
+        return _server_error(str(e))
+
+
 @app.route(route="watermarks/{entity}", methods=["GET"])
 def get_watermark(req: func.HttpRequest) -> func.HttpResponse:
     entity = req.route_params["entity"]

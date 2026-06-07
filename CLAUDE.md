@@ -181,7 +181,7 @@ The diagram above is the **architected** topology, not the **built** one. Honest
 | Generator on Function App (Flex) → source DB | ✅ | Writes orders/lines/status_log/dim changes (its sweet spot). Inventory write **REMOVED** in S14 (DECISIONS #71) — see next row. |
 | **Databricks Job → inventory_snapshot** (S14, DECISIONS #71) | ✅ | Daily 00:35 UTC scheduled Job runs `notebooks/source_sim/write_inventory_snapshot.py`. Spark JDBC bulk insert, ~3-4 min wall. Replaces the Function App inventory write — S13's 3-pronged mitigation failed (11 consecutive partial fires 5/14-5/24). |
 | Logic App schedule | ✅ | Fires Function at 00:30 UTC; Databricks Workflow has its own cron trigger at 00:35 UTC. |
-| **ADF Copy Activity** landing extract | ⚠️ **Chunk 1 live (S18), copy pipeline pending** | ADF factory + 4 linked services + 2 `entity_registry`-parameterised datasets are deployed (`pipelineiq-adf-dev`). The actual master copy pipeline (ForEach → copy → Function watermark/file/run writes) is **chunk 2** — not built yet. Until chunk-2 cutover, `scripts/export_velora_to_landing.py` (laptop scaffold, hardcoded entity list) is still the prod landing-extract path. |
+| **ADF Copy Activity** landing extract | ⚠️ **Chunk 1 live (S18); chunk-2 code-side enablers authored (S19), IaC + deploy + smoke pending** | ADF factory + 4 linked services + 2 `entity_registry`-parameterised datasets are deployed (`pipelineiq-adf-dev`). S19 authored the chunk-2 enablers in this repo (`GET /entities`, `partition_date_column`, `orchestrate_medallion.py`). The actual master copy pipeline (ForEach → copy → Function watermark/file/run writes → medallion) is Bicep in `PipelineIQ-IaC` — **not built/deployed yet**. Until chunk-2 cutover, `scripts/export_velora_to_landing.py` (laptop scaffold, hardcoded entity list) is still the prod landing-extract path. |
 | ADLS Gen2 medallion (landing/bronze/silver/gold) | ✅ | Phase 2 fully complete |
 | Bronze/Silver/Gold Databricks notebooks | ✅ | Entity-agnostic ingestion, all 12 entities through gold |
 | Databricks SQL Warehouse | ✅ | Used for verification + future Power BI / VS Code |
@@ -516,21 +516,30 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   inventory writing OUT of the Function to a Databricks scheduled job, OR
   (b) upgrade Function App to EP1 Premium (always-on instance, no idle reaper).
   Verification SQL + KQL queued in PROGRESS.md `## Next task`.
-- **Tier 6 ADF — chunk 1 LIVE (S18, 2026-06-05); chunk 2 pending.** `PipelineIQ-IaC`
-  has `core/adf/` (factory TF module + MI + RBAC, wired into `clients/velora`),
-  4 linked-service Bicep + 2 parameterised dataset Bicep under `bicep/adf/`, and
-  `scripts/deploy_adf.sh`. **Applied:** `pipelineiq-adf-dev` factory (MI
-  `18e622b2-acdb-4fac-9d16-059d9aa14861`, +3 RBAC: ADLS Blob Contributor, KV
-  Secrets User, Databricks Contributor); 4 linked services (`ls_keyvault`,
-  `ls_azuresql_velora`, `ls_adls`, `ls_databricks` = MSI per DECISIONS #74) + 2
-  datasets (`ds_sql_source`, `ds_adls_sink`) published + listable. To redeploy
-  the Bicep objects: `bash scripts/deploy_adf.sh` (sources params from
-  `terraform output`). **Chunk 2 still pending:** master copy pipeline (6.4,
-  ForEach over `entity_registry` + Function Web Activities) + notebook activities
-  (6.5, first MSI-linked-service exercise — ADF MI registers as workspace user on
-  first call) + diagnostic settings (6.6) + cutover (6.11). The full copy smoke
-  (orders → `landing/`) is a chunk-2 deliverable. `scripts/export_velora_to_landing.py`
-  remains the prod fire path until chunk-2 cutover.
+- **Tier 6 ADF — chunk 1 LIVE (S18); chunk 2 IN PROGRESS (S19 authored the
+  Architecture-repo enablers; IaC + deploy + smoke pending).** Chunk 1 (S18):
+  `pipelineiq-adf-dev` factory (MI `18e622b2-acdb-4fac-9d16-059d9aa14861`, +3 RBAC)
+  + 4 linked services (`ls_keyvault`, `ls_azuresql_velora`, `ls_adls`,
+  `ls_databricks` = MSI per #74) + 2 datasets (`ds_sql_source`, `ds_adls_sink`),
+  all published. Redeploy Bicep: `bash scripts/deploy_adf.sh`.
+  **S19 (this repo) authored chunk-2 code:** `GET /entities`
+  (`functions/function_app.py`, #75); `entity_registry.partition_date_column`
+  (`bootstrap_postgres.sql` + `SCHEMA.md`, #76 — non-null only for orders +
+  inventory_snapshot, drives by_date-vs-full, NOT `load_type`);
+  `notebooks/orchestrate_medallion.py` + `catchup_medallion.py
+  --upload-orchestrator` (#77 — one notebook chains bronze→silver→gold via
+  `dbutils.notebook.run`, takes `pipeline_run_id` not `run_date`).
+  **Chunk 2 STILL PENDING (next session, needs VPN/az + `PipelineIQ-IaC` checkout):**
+  live `ALTER` of `entity_registry` (seed `ON CONFLICT DO NOTHING` won't back-fill
+  existing rows — see PROGRESS `## Next task` for the exact SQL); `bash
+  scripts/deploy_function.sh`; the IaC Bicep/TF (`pipeline_master_copy.bicep`,
+  `ls_function`, `trg_daily_0040` Stopped, diagnostics → `pipelineiq-logs-dev`, KV
+  `functions-host-key`); apply + deploy; copy smoke (one date, `RunMedallion` off
+  then on); cutover (6.11). **Watermark is committed per-copy inside the ForEach**
+  (DECISIONS #75) — looser than build_order 6.8's end-to-end; deliberate under
+  faithful reproduction. `scripts/export_velora_to_landing.py` remains the prod
+  fire path until chunk-2 cutover. Do NOT write `docs/pipeline.md` or flip the
+  architecture-vs-reality ADF row to "built" until the copy smoke is green.
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
 - ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Superseded (S18).**
   `scripts/inventory_only.py` (and `recover_inventory_batch.sh`) were retired —

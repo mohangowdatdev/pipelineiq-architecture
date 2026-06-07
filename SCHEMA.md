@@ -1156,6 +1156,11 @@ schedule            VARCHAR(20)   -- 'daily' | 'weekly' | 'monthly'
 active              BOOLEAN       DEFAULT true
 priority            INT           DEFAULT 5
 depends_on          VARCHAR(100)  NULL -- entity_name of dependency
+partition_date_column VARCHAR(50) NULL -- business-date col ADF extracts by
+                                       -- (orders='order_date',
+                                       --  inventory_snapshot='snapshot_date');
+                                       -- NULL ⇒ full-table dump. Drives ADF
+                                       -- partitioning, not load_type. DECISIONS #76
 ```
 
 ### pipeline.watermarks
