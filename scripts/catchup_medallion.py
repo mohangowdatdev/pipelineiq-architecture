@@ -76,8 +76,11 @@ GOLD_TASKS = [
     ("dim_customer", []),
     ("dim_product", []),
     ("dim_sales_rep", []),
-    ("dim_territory", []),
     ("static_dims", []),
+    # dim_territory reads gold.dim_store (built by static_dims) — declare the
+    # dependency so a clean from-scratch rebuild (gold dropped) orders correctly.
+    # Latent until S20: catch-up runs always had a pre-existing dim_store. (S20)
+    ("dim_territory", ["static_dims"]),
     ("fact_order_line", ["dim_customer", "dim_product", "dim_sales_rep", "dim_territory", "static_dims"]),
     ("fact_inventory_daily", ["dim_product", "static_dims"]),
     ("fact_daily_channel_revenue", ["fact_order_line", "static_dims"]),

@@ -24,7 +24,9 @@
 # COMMAND ----------
 
 import uuid
+from functools import reduce
 from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType, LongType, StructType, StructField
 
 # COMMAND ----------
 
@@ -62,11 +64,58 @@ print(f"target_table     = {bronze_catalog}.{bronze_schema}.{entity_name}")
 
 landing_path = f"abfss://landing@{landing_account}.dfs.core.windows.net/{entity_name}/"
 
-df_landing = (
-    spark.read
-        .option("recursiveFileLookup", "true")
-        .parquet(landing_path)
-)
+# Canonical-type enforcement (S20, DECISIONS #79). landing can hold Parquet from
+# two writers with divergent schemas for the SAME column: the laptop export
+# scaffold (pyarrow inference -> decimal(9..10,2), TIMESTAMP_NTZ, int64/BIGINT)
+# and ADF (from the SQL column type -> decimal(12,2), TIMESTAMP, int32/INT). ADF's
+# types are canonical (they derive from the real source schema).
+#
+# A single recursive read can't reconcile these: `mergeSchema` only widens
+# decimals (it refuses INT vs BIGINT, TIMESTAMP vs TIMESTAMP_NTZ), and forcing an
+# explicit read-schema hits low-level Parquet-converter ClassCasts (MutableInt vs
+# MutableLong). So instead we cast in the engine, not the reader:
+#   1. canonical = the newest landing file's schema (the most recent ADF write;
+#      post-cutover the only writer), with INT widened to BIGINT so historical
+#      int64 export columns never down-cast.
+#   2. read each landing sub-partition (date=*/ or full/) with its NATIVE schema
+#      — homogeneous within one writer's folder, so the fast vectorized reader
+#      works with no conversion.
+#   3. Catalyst-cast each to the canonical schema (int->long, decimal->decimal,
+#      ntz->timestamp all unify cleanly as logical casts) and unionByName.
+# session timeZone = UTC so the scaffold's naive TIMESTAMP_NTZ values cast to the
+# same wall-clock UTC instant ADF already writes.
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+
+def _newest_parquet(root: str) -> str:
+    stack, newest = [root], None
+    while stack:
+        for f in dbutils.fs.ls(stack.pop()):
+            if f.name.endswith("/"):
+                stack.append(f.path)
+            elif f.path.endswith(".parquet") and (newest is None or f.modificationTime > newest[1]):
+                newest = (f.path, f.modificationTime)
+    if newest is None:
+        raise RuntimeError(f"No Parquet under {root} — has the landing extract run for {entity_name}?")
+    return newest[0]
+
+
+def _widen(dt):
+    return LongType() if isinstance(dt, IntegerType) else dt
+
+
+_adf_schema = spark.read.parquet(_newest_parquet(landing_path)).schema
+canonical_schema = StructType([StructField(f.name, _widen(f.dataType), f.nullable) for f in _adf_schema])
+print(f"canonical schema (ADF newest, INT widened):\n{canonical_schema.simpleString()}")
+
+# Sub-partitions are homogeneous (one writer per folder); read native + cast.
+_subdirs = [f.path for f in dbutils.fs.ls(landing_path) if f.name.endswith("/")] or [landing_path]
+_cast_cols = [F.col(f.name).cast(f.dataType).alias(f.name) for f in canonical_schema]
+_parts = [
+    spark.read.option("recursiveFileLookup", "true").parquet(d).select(_cast_cols)
+    for d in _subdirs
+]
+df_landing = reduce(lambda a, b: a.unionByName(b), _parts)
 
 source_count = df_landing.count()
 print(f"Read {source_count:,} rows from {landing_path}")

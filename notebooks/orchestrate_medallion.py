@@ -95,13 +95,22 @@ SILVER_ENTITIES = [
 ]
 
 # Gold: one notebook per dim/fact (build_gold_<entity>), in topological order.
-# `static_dims` builds 5 reference dims. Facts follow the dims they read.
+# `static_dims` builds 5 reference dims (incl. dim_store). Facts follow the dims
+# they read.
+#
+# Order note (S20): `static_dims` MUST precede `dim_territory` — build_gold_dim_
+# territory reads gold.dim_store (built by static_dims) to collect observed
+# territory_ids. catchup_medallion.py declares dim_territory with depends_on=[]
+# (a latent bug), which only worked because catch-up runs always had a pre-
+# existing dim_store; a clean from-scratch rebuild (gold dropped) exposes it.
+# Sequential execution here honours this list order, so static_dims is placed
+# first. (catchup_medallion.py's GOLD_TASKS DAG carries the matching fix.)
 GOLD_ENTITIES = [
     "dim_customer",
     "dim_product",
     "dim_sales_rep",
-    "dim_territory",
     "static_dims",
+    "dim_territory",
     "fact_order_line",
     "fact_inventory_daily",
     "fact_daily_channel_revenue",

@@ -387,6 +387,24 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 
 ## Session Log
 
+### 2026-06-09 (Session 20 — fix RunMedallion (UC) + ADF-vs-scaffold canonical types + gold ordering; full medallion rebuild GREEN)
+**Objective:** Resolve the S19-deferred `RunMedallion` failure (DECISIONS #78) and land a green end-to-end medallion.
+**Built / did:**
+- **RunMedallion fix (DECISIONS #79, Option 1b):** new `core/medallion_workflow/` TF module — a `databricks_job` running `orchestrate_medallion` on a `SINGLE_USER` cluster (created+run-as `mohan.gowda` via azure-cli provider → UC access). Wired into `clients/velora` (+`medallion_job_id` output). ADF `pl_master_copy` `RunMedallion` rewired: `StartMedallion` (Web `jobs/run-now`, MSI) → `PollMedallion` (Until, vars-latched) → `AssertMedallion` (If/Fail). `main.bicep`+`deploy_adf.sh` thread `medallionJobId`. TF applied, ADF redeployed.
+- **Canonical-type bronze (DECISIONS #80):** `notebooks/bronze/ingest_to_bronze.py` reads each landing sub-partition native (vectorized) + Catalyst-casts to ADF-canonical schema (newest-ADF-file schema, INT→BIGINT widened), `unionByName`, session TZ=UTC. Adopted Option 2 (ADF types canonical) per user.
+- **Clean-slate rebuild:** dropped 10 bronze (kept 2 seeds) + 10 silver + 12 gold, rebuilt from `landing/`. bronze 12/12, silver 10/10, gold 12/12.
+- **Gold ordering fix (DECISIONS #81):** `dim_territory` reads `gold.dim_store` (static_dims) — reordered `orchestrate_medallion.py` list + added `("dim_territory", ["static_dims"])` to `catchup_medallion.py` DAG.
+**Worked:**
+- Standalone medallion job proved the UC fix (cluster reads landing + writes UC). Bronze canonical verified on orders (values byte-identical) + inventory (7M, int/bigint+ts+decimal all coerced).
+- Final medallion **all green**: `fact_order_line==silver.order_lines` 49,550; `fact_inventory_daily==silver.inventory_snapshot` 7,380,270 (exact); dim_customer 1,060 / 0 collisions; 0 FK orphans; `bronze.orders` total_amount=decimal(12,2), created_at=timestamp.
+**Broke / iterated:**
+- Original UC failure masked a deeper ADF-vs-scaffold Parquet **schema** incompatibility, surfaced one layer at a time: decimal precision → timestamp NTZ-vs-TZ → int/bigint. Three read-side fixes (mergeSchema; explicit-read-schema; explicit-INT) each failed on Parquet-converter ClassCasts; the working fix is **cast-in-engine** (native read + Catalyst cast), not reader coercion.
+- Gold ordering bug (latent; only a from-scratch rebuild with gold dropped exposes it).
+- Flaky laptop network (SSL EOF / timeouts) repeatedly killed poll/verify scripts — jobs themselves were unaffected; added retry/longer-timeout helpers.
+**Uncertainty / left:** **ADF end-to-end smoke not yet run** — the medallion *job* is proven, but ADF `pl_master_copy` → `run-now` → poll → medallion (the Web-activity wiring) is deployed-but-untested. Then cutover (start `trg_daily_0040`) + `docs/pipeline.md`.
+**Next:** Fire `pl_master_copy` for 2026-06-04 (manual), confirm `StartMedallion`/`PollMedallion`/`AssertMedallion` drive the job green + control-plane rows land; then cutover + docs.
+**Summary:** The S19 RunMedallion blocker is resolved (Option 1b TF job + ADF run-now). The real depth was an ADF-vs-laptop-scaffold Parquet type mismatch; fixed by making bronze enforce ADF-canonical types via engine-side casts, then a clean-slate rebuild. Medallion is fully green with ADF types and 0 collisions/orphans. Remaining: the ADF→job end-to-end smoke + cutover. Both repos committed.
+
 ### 2026-06-07 (Session 19 cont. — local: applied Architecture enablers + authored/deployed IaC chunk 2; COPY smoke green, RunMedallion deferred)
 **Objective:** Land the cloud-authored Architecture patch + build the `PipelineIQ-IaC` half of ADF chunk 2 + smoke it.
 **Built / did:**
