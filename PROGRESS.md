@@ -25,7 +25,7 @@
 | Gold facts | ✅ 3/3 facts, 1:1 reconciles exact | `fact_order_line` **48,392**; `fact_inventory_daily` **7,190,640**; `fact_daily_channel_revenue` 13,978. 0 FK orphans. |
 | Quarantine | ✅ Wired | Routing on every Silver. 0 rows so far (clean OLTP). |
 | Observability | ✅ Flex telemetry flows | `azure-monitor-opentelemetry` SDK in generator + diagnostic settings → LA workspace (S12, DECISIONS #66). Query via `AppTraces` in LA, not classic AI. |
-| ADF Bicep (Tier 6) | ✅ **Chunk 1 LIVE (S18)**; ✅ **Chunk 2 deployed (S19) — COPY+control-plane smoke GREEN**; ⚠️ **RunMedallion deferred** | Chunk 1 (S18): factory + 4 LS + 2 datasets. **S19:** Architecture enablers (`GET /entities` #75, `entity_registry.partition_date_column` #76, `orchestrate_medallion` #77) + IaC (`PipelineIQ-IaC` `45b56d7`: `pl_master_copy` + `ls_function` + `trg_daily_0040` Stopped + diagnostics + KV `functions-host-key`) applied & deployed. **Copy smoke green** (run `0e323e94`, 2026-06-04): metadata-driven `GetEntities→ForEach(12)→Copy→RegisterFile→CommitWatermark→LogEntityEnd`, landing + watermark advance proven. **`RunMedallion` failed** — ADF cluster lacks `data_security_mode=SINGLE_USER` (no UC access); fix is the UC-cluster follow-up (DECISIONS #78). Trigger Stopped, no cutover — `export_velora_to_landing.py` still prod path. |
+| ADF Bicep (Tier 6) | ✅ **Chunk 2 END-TO-END SMOKE GREEN (S20)** — cutover pending (trigger Stopped) | Full `pl_master_copy` live: `GetEntities→ForEach(12: copy+control-plane)→StartMedallion(run-now)→PollMedallion→AssertMedallion→LogRunEnd`. Smoke `215da040` (2026-06-04): **100/100 activities Succeeded**. `RunMedallion` UC blocker (#78) resolved via TF `SINGLE_USER` job `core/medallion_workflow` + ADF run-now (#79); bronze ADF-canonical types (#80); gold ordering (#81); Function retry:4 hardening. Medallion rebuilt clean-slate to ADF types (12/10/12, facts reconcile exact, 0 collisions/orphans). **`trg_daily_0040` still Stopped; `export_velora_to_landing.py` still prod** until cutover (start the trigger — weigh bronze re-append growth first; see CLAUDE.md carry-over). |
 | Phase 3 (failure injection + incident store) | ⏳ Not started | `failure_injector.py` written, end-to-end unverified. |
 | Phase 4 (pgvector RCA) | ⏳ Not started | |
 | Phase 5 (FastAPI + Slack) | ⏳ Not started | |
@@ -94,10 +94,27 @@ S15 (architecture migration only, no new columns/tables).
 
 ## Next task
 
-**Tier 6 ADF chunk 2 — finish the IaC + deploy + smoke.** S19 (this session,
-Architecture repo) authored the chunk-2 enablers; the IaC + Azure-side steps
-remain because the `PipelineIQ-IaC` repo was not in S19's checkout and the
-container had no Azure/Postgres access.
+**Tier 6 ADF chunk 2 — DONE, end-to-end smoke GREEN (S20).** `pl_master_copy`
+drives copy + medallion end-to-end (run `215da040`, 100/100 activities). Two
+items remain before Tier 6 is fully closed:
+
+1. **Cutover (build_order 6.11) — held for explicit go.** Start the daily trigger
+   (`az datafactory trigger start --resource-group pipelineiq-rg-dev
+   --factory-name pipelineiq-adf-dev --name trg_daily_0040`) and demote
+   `scripts/export_velora_to_landing.py` to recovery-only. **Decide first:** bronze
+   re-reads ALL `landing/<entity>/` and **appends** every run — fine occasionally,
+   but a nightly trigger grows bronze by a full landing snapshot per night
+   (silver/gold stay exact via MERGE). Consider making bronze read only the new
+   partition (or pruning old landing) before going autonomous.
+2. **`docs/pipeline.md`** — written S20 (was the last blocked phase doc). Verify it
+   reflects the run-now/poll/assert design + the canonical-types + gold-ordering fixes.
+3. **Postgres control-plane verify (needs VPN):** confirm `pipeline_exec_log`
+   (1 master + 12 entity rows for `215da040`, master=success), `file_registry` (12),
+   `watermarks` (advanced to 2026-06-04).
+
+**(historical — the S19/S20 chunk-2 build steps below are now all Done.)**
+
+**Tier 6 ADF chunk 2 — original pickup (S19/S20, now complete).**
 
 **S19 already landed (Architecture repo, committed):**
 - `GET /entities` endpoint (`functions/function_app.py`) — DECISIONS #75.
