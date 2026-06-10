@@ -94,23 +94,32 @@ S15 (architecture migration only, no new columns/tables).
 
 ## Next task
 
-**Tier 6 ADF chunk 2 — DONE, end-to-end smoke GREEN (S20).** `pl_master_copy`
-drives copy + medallion end-to-end (run `215da040`, 100/100 activities). Two
-items remain before Tier 6 is fully closed:
+**Tier 6 ADF — DONE + AUTONOMOUS (S21).** Cutover complete, bronze incremental,
+full chain validated end-to-end. The data platform (phases 0-2 + Tier 6) is
+complete and self-driving. Two follow-ups, then the project moves to the
+AI-native half:
 
-1. **Cutover (build_order 6.11) — held for explicit go.** Start the daily trigger
-   (`az datafactory trigger start --resource-group pipelineiq-rg-dev
-   --factory-name pipelineiq-adf-dev --name trg_daily_0040`) and demote
-   `scripts/export_velora_to_landing.py` to recovery-only. **Decide first:** bronze
-   re-reads ALL `landing/<entity>/` and **appends** every run — fine occasionally,
-   but a nightly trigger grows bronze by a full landing snapshot per night
-   (silver/gold stay exact via MERGE). Consider making bronze read only the new
-   partition (or pruning old landing) before going autonomous.
-2. **`docs/pipeline.md`** — written S20 (was the last blocked phase doc). Verify it
-   reflects the run-now/poll/assert design + the canonical-types + gold-ordering fixes.
-3. **Postgres control-plane verify (needs VPN):** confirm `pipeline_exec_log`
-   (1 master + 12 entity rows for `215da040`, master=success), `file_registry` (12),
-   `watermarks` (advanced to 2026-06-04).
+1. **Confirm the first autonomous fire (06-11 01:00 UTC, writes 06-10).** The
+   trigger's 06-10 window did NOT fire (started at/after the startTime anchor);
+   re-armed S21. Verify tomorrow: a `trg_daily_0100` trigger-run exists AND
+   `pl_master_copy` Succeeded AND medallion advanced to 06-10 (incremental bronze
+   `replaceWhere` for the new `_load_date`). If it no-shows again, escalate the
+   schedule anchor (bump startTime to a near-future time + re-start).
+   ```bash
+   az datafactory trigger-run query-by-factory -g pipelineiq-rg-dev \
+     --factory-name pipelineiq-adf-dev --filters operand=TriggerName operator=Equals \
+     values=trg_daily_0100 --last-updated-after 2026-06-11T00:00:00Z \
+     --last-updated-before 2026-06-11T06:00:00Z
+   ```
+2. **Optional bronze hygiene:** 264 duplicate 06-07 orders in `bronze.orders`
+   (one-time scaffold landing artifact; silver dedups). Clears itself when ADF
+   re-lands 06-07, or delete the extra `landing/orders/date=2026-06-07/` file.
+
+**Then — Phase 4 (pgvector) → Phase 3 (failure injection + AI RCA):** the leap
+from data platform to AI co-pilot. See `docs/forward_plan.md`.
+
+**Deferred (needs VPN):** Postgres control-plane row verify (`pipeline_exec_log`,
+`file_registry`, `watermarks`) for the validated ADF runs.
 
 **(historical — the S19/S20 chunk-2 build steps below are now all Done.)**
 
@@ -403,6 +412,20 @@ Failure runbook written in docs/runbooks/inject_failure.md.
 ---
 
 ## Session Log
+
+### 2026-06-10 (Session 21 — recover dropped S20-cont session: close gap + make ADF super-stable via incremental bronze)
+**Objective:** Recover a session that was closed mid-way (terminal shut during a medallion catch-up), then harden ADF to autonomous/self-driving — kill the laptop-scaffold dependency.
+**Built / did:**
+- **Reconstructed the dropped session:** the S20-cont cutover (`trg_daily_0040`→`trg_daily_0100`, 01:00 UTC, Started) had committed, but its gap-catch-up medallion run had silently FAILED (watcher exited 0 on terminal state, not success). Medallion was stuck at 06-04 with a 4-day gap.
+- **Diagnosed + fixed 3 bronze mixed-writer bugs** (the gap was scaffold-backfilled, reintroducing ADF-vs-scaffold Parquet heterogeneity): (1) canonical schema picked newest-by-mtime → now prefers newest **ADF** (`data_*`) file; (2) per-folder read crashed on full-load `full/` mixing ADF INT96 + scaffold `timestamp_ntz` → now reads **per-file**; (3) all-null cols the scaffold mis-types (INT vs DATE) → typed NULL. Medallion run4 GREEN; gap closed (silver/fact through **06-08**, `fact_*==silver` exact).
+- **Incremental + idempotent bronze (DECISIONS #82):** `ingest_to_bronze.py` rewritten — `run_date` widget scopes ingestion to one partition; by-date `replaceWhere _load_date`, full-load overwrite-latest-snapshot; new `_load_date` partition col; `run_date=""`=rebuild. Threaded `run_date` ADF→`orchestrate_medallion`→bronze + `catchup_medallion.py --run-date`. ADF `StartMedallion` passes `run_date` (bicep deployed via `deploy_adf.sh`).
+- **Validated:** rebuild green 10/10 (bronze re-partitioned by `_load_date`, dupes cleaned); incremental 06-08 idempotent (totals unchanged); **full ADF chain green end-to-end** (manual `pl_master_copy` fire run_date=2026-06-08 → `StartMedallion`→incremental medallion, Succeeded). Trigger re-armed.
+- **Retired the scaffold:** `export_velora_to_landing.py` marked `⛔ DO NOT RUN`; recovery is now a manual `pl_master_copy` fire. CLAUDE.md + DECISIONS #82 updated.
+**Worked:** AAD-token REST (mint via `az`) cleanly substituted for the missing `databricks` CLI all session. The per-entity catchup harness (`--keep-job`) was the key diagnostic — surfaced the exact failing entity + trace each cycle. Bronze fixes converged (6→8.5→10.5 min, then green).
+**Broke / iterated:** 3 failed medallion cycles before green — each peeled one bronze layer (the orchestrator wrapper hides the child error, so each needed the per-entity harness). Flaky laptop network killed pollers twice (503, then 401 token-expiry) — hardened with per-cycle token refresh. Bronze had duplicate appends from the failed runs (silver/gold stayed exact via MERGE); the rebuild cleaned them.
+**Uncertainty:** the nightly trigger's 06-10 01:00 window did NOT fire (started at/after the startTime anchor) — re-armed; **must confirm the 06-11 01:00 autonomous fire**. The 264 duplicate 06-07 orders in bronze are a one-time scaffold landing artifact (silver dedups); gone once ADF re-lands.
+**Next:** Watch the 06-11 01:00 UTC autonomous fire (trigger-run + green `pl_master_copy` writing 06-10). If it no-shows, escalate the schedule anchor. Then Phase 4/3 (pgvector + AI RCA) — the AI-native half.
+**Summary:** Recovered a silently-failed session and turned the ADF pipeline from "built but laptop-dependent" into genuinely autonomous. The whole session's pain traced to one root — the laptop scaffold's pandas-inferred Parquet types diverge from ADF's SQL-schema types, and a scaffold gap-backfill mixed both into landing. Fixed bronze to be robust to that (3 cast fixes) AND incremental/idempotent so nightly autonomy is bounded (DECISIONS #82), then retired the scaffold so it can't recur. Gap closed through 06-08; full ADF→medallion chain validated end-to-end; trigger armed. The data platform (phases 0-2 + Tier 6) is now complete and self-driving.
 
 ### 2026-06-09 (Session 20 — fix RunMedallion (UC) + ADF-vs-scaffold canonical types + gold ordering; full medallion rebuild GREEN)
 **Objective:** Resolve the S19-deferred `RunMedallion` failure (DECISIONS #78) and land a green end-to-end medallion.

@@ -88,6 +88,9 @@ GOLD_TASKS = [
 
 SHARED_CLUSTER_KEY = "catchup_cluster"
 
+# Bronze run_date, set from --run-date in main(). "" => rebuild. DECISIONS #82.
+RUN_DATE = ""
+
 
 def upload(w: WorkspaceClient, local: Path, ws_path: str) -> None:
     parent = ws_path.rsplit("/", 1)[0]
@@ -138,6 +141,9 @@ def build_tasks(layer: str, mapping: dict[str, str], run_id: str) -> list[jobs.T
                         base_parameters={
                             "entity_name": e,
                             "pipeline_run_id": run_id,
+                            # "" => rebuild (ingest all landing partitions); a date
+                            # => incremental (just that day). DECISIONS #82.
+                            "run_date": RUN_DATE,
                         },
                     ),
                     job_cluster_key=SHARED_CLUSTER_KEY,
@@ -247,7 +253,16 @@ def main() -> None:
         "(no job run). The ADF master pipeline invokes this notebook.",
     )
     p.add_argument("--keep-job", action="store_true", help="Don't delete the job after run (useful for debug)")
+    p.add_argument(
+        "--run-date",
+        default="",
+        help="Bronze only. A date (YYYY-MM-DD) ingests just that landing partition "
+        "(incremental); empty (default) rebuilds from all partitions. DECISIONS #82.",
+    )
     args = p.parse_args()
+
+    global RUN_DATE
+    RUN_DATE = args.run_date.strip()
 
     w = WorkspaceClient(host=WORKSPACE_HOST)
 

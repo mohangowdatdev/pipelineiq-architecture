@@ -181,7 +181,7 @@ The diagram above is the **architected** topology, not the **built** one. Honest
 | Generator on Function App (Flex) → source DB | ✅ | Writes orders/lines/status_log/dim changes (its sweet spot). Inventory write **REMOVED** in S14 (DECISIONS #71) — see next row. |
 | **Databricks Job → inventory_snapshot** (S14, DECISIONS #71) | ✅ | Daily 00:35 UTC scheduled Job runs `notebooks/source_sim/write_inventory_snapshot.py`. Spark JDBC bulk insert, ~3-4 min wall. Replaces the Function App inventory write — S13's 3-pronged mitigation failed (11 consecutive partial fires 5/14-5/24). |
 | Logic App schedule | ✅ | Fires Function at 00:30 UTC; Databricks Workflow has its own cron trigger at 00:35 UTC. |
-| **ADF Copy Activity** landing extract | ✅ **Built + end-to-end smoke GREEN (S20); cutover pending (trigger Stopped)** | Full chunk-2 `pl_master_copy` is live (`pipelineiq-adf-dev`): `GetEntities`→`ForEach`(12, copy+control-plane)→`StartMedallion`(run-now the `core/medallion_workflow` job)→`PollMedallion`→`AssertMedallion`→`LogRunEnd`. Smoke `215da040` (2026-06-04): 100/100 activities Succeeded. `RunMedallion` UC blocker resolved via a TF-defined SINGLE_USER job (DECISIONS #79); bronze enforces ADF-canonical types (#80); gold ordering fixed (#81). **Not yet autonomous:** `trg_daily_0040` is **Stopped** and `scripts/export_velora_to_landing.py` remains the prod landing path until cutover (start the trigger). See `## Pending / carry-overs` for the bronze-growth concern to weigh before nightly cutover. |
+| **ADF Copy Activity** landing extract | ✅ **Built + AUTONOMOUS (S21) — cutover done, incremental bronze, end-to-end validated** | Full chunk-2 `pl_master_copy` is live + autonomous (`pipelineiq-adf-dev`): `GetEntities`→`ForEach`(12, copy+control-plane)→`StartMedallion`(run-now `core/medallion_workflow`, passing `run_date`)→`PollMedallion`→`AssertMedallion`→`LogRunEnd`. `RunMedallion` UC blocker resolved via a TF-defined SINGLE_USER job (DECISIONS #79); bronze enforces ADF-canonical types (#80) + is now **incremental/idempotent** (#82); gold ordering fixed (#81). **S21:** `trg_daily_0100` (01:00 UTC) **Started**; laptop scaffold **retired** (⛔); full chain validated end-to-end (manual fire run_date=2026-06-08 Succeeded, idempotent). **Remaining:** confirm the first autonomous fire (06-11 01:00 UTC) — see `## Pending / carry-overs`. |
 | ADLS Gen2 medallion (landing/bronze/silver/gold) | ✅ | Phase 2 fully complete |
 | Bronze/Silver/Gold Databricks notebooks | ✅ | Entity-agnostic ingestion, all 12 entities through gold |
 | Databricks SQL Warehouse | ✅ | Used for verification + future Power BI / VS Code |
@@ -241,7 +241,7 @@ managed_by  = "terraform"
 | IaC source_connectors/azure_sql | Stable | Phase 0 — applied |
 | IaC core/databricks_uc | **Stable (S8)** | Adopted system metastore + **4 catalogs** (`bronze/silver/gold/quarantine`) + 5 external locations + storage credential + cluster policy + SQL warehouse + secret scope. DECISIONS #46. `quarantine` catalog added in S8 (variable default updated 3→4). |
 | IaC core/adf (+ `bicep/adf/`) | **Chunk 1 live (S18)** | `core/adf/` owns the `pipelineiq-adf-dev` factory + system MI + 3 RBAC grants only (ADLS Blob Contributor, KV Secrets User, Databricks Contributor). ADF-internal objects (4 linked services + 2 parameterised datasets) are Bicep in `PipelineIQ-IaC/bicep/adf/`, published via `scripts/deploy_adf.sh` (`az deployment group create`, params from `terraform output`) — same TF-owns-compute / script-deploys-artifacts split as bronze/silver/gold notebooks. DBX linked service = MSI (DECISIONS #74). Chunk 2 (copy pipeline + notebook activities + diagnostics) pending. |
-| scripts/export_velora_to_landing.py | Stable (scaffold) | Phase 2 — substitutes for ADF until Tier 6 lands. DECISIONS #47. |
+| scripts/export_velora_to_landing.py | **⛔ DO NOT RUN (S21)** | Was the pre-ADF landing scaffold (DECISIONS #47). **ADF (`pl_master_copy`) is now the sole landing writer.** Running this scaffold writes pandas-inferred Parquet (`decimal(10,2)`, `timestamp_ntz`, `large_string`) that diverges from ADF's SQL-schema types — that writer-heterogeneity is exactly what broke the medallion in S21 (DECISIONS #82). **Gap/backfill recovery is now a manual ADF fire** (`az datafactory pipeline create-run … --name pl_master_copy --parameters '{"run_date":"YYYY-MM-DD"}'`), never this script. Kept for reference only; deletion deferred (user's call). |
 | scripts/run_bronze_smoke.py | Stable (scaffold) | Phase 2 — driver for one-off Bronze ingestion. Replaced by ADF + scheduled Job in Tier 6. |
 
 ---
@@ -532,18 +532,23 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   `215da040`, 2026-06-04, 100/100 activities Succeeded): copy 12 entities → control-plane
   writes → run-now medallion → poll → assert → `LogRunEnd`. Redeploy Bicep:
   `bash scripts/deploy_adf.sh`.
-  ▶ **REMAINING: (1) cutover** — start `trg_daily_0040` (`az datafactory trigger start`,
-  00:40 UTC daily) + demote `scripts/export_velora_to_landing.py` to recovery; **(2)**
-  write `docs/pipeline.md` + flip the architecture-vs-reality ADF row to "built".
-  `trg_daily_0040` is **still Stopped** and the laptop scaffold is **still prod** until
-  cutover. **Watermark is committed per-copy inside the ForEach** (DECISIONS #75) — looser
-  than build_order 6.8's end-to-end; deliberate under faithful reproduction.
-  ⚠️ **Pre-cutover design concern (not yet addressed):** bronze re-reads ALL of
-  `landing/<entity>/` and **appends** every run (it's an append-only audit layer; silver/gold
-  MERGE-dedup so they stay exact). Occasional catch-up runs are fine, but a **nightly**
-  autonomous trigger makes bronze grow by a full landing snapshot per night — unbounded.
-  Consider making bronze read only the new partition (or pruning old landing) **before**
-  starting the nightly trigger.
+  ▶ **CUTOVER DONE (S21):** trigger renamed `trg_daily_0040`→`trg_daily_0100` (01:00 UTC,
+  safer buffer after the 00:35 inventory job) and **Started** (re-armed S21). Scaffold
+  **retired** (`⛔ DO NOT RUN`); ADF is sole landing writer. Bronze is **incremental** now
+  (DECISIONS #82) so nightly autonomy is bounded. Full `pl_master_copy`→`StartMedallion(
+  run_date)`→incremental-medallion chain **validated end-to-end** (manual fire run_date=
+  2026-06-08, Succeeded, idempotent). **Watermark committed per-copy inside the ForEach**
+  (DECISIONS #75). ▶ **REMAINING: verify the first autonomous fire** (06-11 01:00 UTC writes
+  06-10) — the trigger's 06-10 window did NOT fire (started after/at the startTime anchor;
+  re-armed S21, next occurrence 06-11). Confirm a `trg_daily_0100` trigger-run + green
+  `pl_master_copy` tomorrow; if it no-shows again, escalate the schedule-anchor.
+  ✅ **Bronze-growth concern RESOLVED (S21, DECISIONS #82):** bronze is now **incremental +
+  idempotent** — it ingests only `run_date`'s partition (by-date: `replaceWhere _load_date`;
+  full-load: overwrite-latest-snapshot), partitioned by `_load_date`. A nightly trigger now
+  grows bronze by one day, not a full re-append. `run_date` is threaded ADF→orchestrator→
+  bronze (`StartMedallion` passes it; bicep deployed). Rebuild + incremental both verified
+  green, idempotency confirmed. The laptop scaffold is **retired** (`⛔ DO NOT RUN`) — ADF is
+  the sole landing writer; gap recovery is a manual `pl_master_copy` fire with `run_date`.
 - ~~`docs/runbooks/databricks_account_admin_bootstrap.md` step 5~~ **Fixed (S12).**
 - ~~`scripts/inventory_only.py` needs AAD auth mode~~ **Superseded (S18).**
   `scripts/inventory_only.py` (and `recover_inventory_batch.sh`) were retired —

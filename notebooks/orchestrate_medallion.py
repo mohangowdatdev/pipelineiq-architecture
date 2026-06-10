@@ -23,13 +23,17 @@
 # MAGIC | name | example | required |
 # MAGIC |---|---|---|
 # MAGIC | `pipeline_run_id` | ADF run id | no — ADF passes `@{pipeline().RunId}`; falls back to a random uuid for manual runs |
+# MAGIC | `run_date` | `2026-06-09` | no — ADF passes `@{pipeline().parameters.run_date}`; empty = "ALL" (rebuild) |
 # MAGIC
 # MAGIC ## Contract notes
 # MAGIC
-# MAGIC - The medallion notebooks take `pipeline_run_id` (+ catalog/schema widgets),
-# MAGIC   **not** `run_date`. Bronze reads *all* of `landing/<entity>/` recursively
-# MAGIC   (date-agnostic); silver's MERGE dedups the re-read history. So no per-date
-# MAGIC   param is threaded — this is byte-for-byte the catch-up behavior.
+# MAGIC - Bronze is **incremental** (DECISIONS #82): it ingests only `run_date`'s
+# MAGIC   landing partition (by-date entities) or the latest `full/` snapshot
+# MAGIC   (full-load entities), idempotently. `run_date` is threaded to Bronze only;
+# MAGIC   Silver/Gold take just `pipeline_run_id`, read all of Bronze/Silver and
+# MAGIC   MERGE-dedup, so they stay date-agnostic.
+# MAGIC - Empty `run_date` ("ALL") puts Bronze in rebuild mode (ingest every landing
+# MAGIC   partition in one pass) — used for the one-time backfill, not nightly runs.
 # MAGIC - Bronze covers the 10 dynamic entities (catch-up parity). `product_categories`
 # MAGIC   + `stores` are landed by ADF (registry-driven) but their bronze tables stay
 # MAGIC   the S9.5 hydration; gold `static_dims` reads those existing bronze tables.
@@ -47,6 +51,14 @@ import uuid
 dbutils.widgets.text("pipeline_run_id", "")
 pipeline_run_id = dbutils.widgets.get("pipeline_run_id").strip() or str(uuid.uuid4())
 print(f"pipeline_run_id = {pipeline_run_id}")
+
+# run_date scopes Bronze ingestion to one day's landing partition (DECISIONS #82).
+# ADF passes the pipeline's run_date; a manual/empty value means "ALL" (rebuild —
+# ingest every landing partition). Only Bronze consumes it; Silver/Gold read all
+# of Bronze/Silver and MERGE-dedup, so they stay date-agnostic.
+dbutils.widgets.text("run_date", "")
+run_date = dbutils.widgets.get("run_date").strip()
+print(f"run_date        = {run_date or '(ALL — rebuild)'}")
 
 # Per-notebook timeout (seconds). Generous — inventory silver is the long pole.
 NOTEBOOK_TIMEOUT_S = 3600
@@ -150,7 +162,10 @@ def run_layer(name: str, calls: list[tuple[str, dict]]) -> None:
 run_layer(
     "bronze",
     [
-        (BRONZE_NOTEBOOK_WS, {"entity_name": e, "pipeline_run_id": pipeline_run_id})
+        (
+            BRONZE_NOTEBOOK_WS,
+            {"entity_name": e, "pipeline_run_id": pipeline_run_id, "run_date": run_date},
+        )
         for e in BRONZE_ENTITIES
     ],
 )
