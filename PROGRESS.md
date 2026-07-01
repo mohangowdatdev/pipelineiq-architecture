@@ -33,6 +33,12 @@
 
 ## Current phase
 
+**S22 (2026-07-01): Data platform CONFIRMED self-driving** (`trg_daily_0100`
+green ~20 nights 06-11→06-30). **Active track is now the AI half (Phases
+3/4/5), re-scoped around a navigation-first RCA design** — see
+`docs/rca_retrieval_design.md` + DECISIONS #83. Design/discussion stage, no
+code yet.
+
 **Phase 0 — Done. Phase 1 — Done. Phase 2 — MEDALLION FULLY COMPLETE
 THROUGH 2026-06-02 (S17 catch-up, verify all green).** Bronze 12/12, Silver 10/10, Gold 12/12.
 All reconciles exact, 0 SCD-2 collisions, 0 FK orphans. **S16 closed the
@@ -115,8 +121,12 @@ the active track.**
    (one-time scaffold landing artifact; silver dedups). Clears itself when ADF
    re-lands 06-07, or delete the extra `landing/orders/date=2026-06-07/` file.
 
-**Then — Phase 4 (pgvector) → Phase 3 (failure injection + AI RCA):** the leap
-from data platform to AI co-pilot. See `docs/forward_plan.md`.
+**Then — the AI half (Phases 3/4/5), re-scoped navigation-first (S22).** RCA
+retrieval is now navigation-first, not embedding-first — see
+`docs/rca_retrieval_design.md` + DECISIONS #83. First artifact = the manifest
+(`component_registry`) schema + Router/Dependency-expander + the DevOps-webhook
+checkout-sync in the FastAPI plan. **Continue the design discussion before
+coding** — open questions in the design doc §9. See also `docs/forward_plan.md`.
 
 **Deferred (needs VPN):** Postgres control-plane row verify (`pipeline_exec_log`,
 `file_registry`, `watermarks`) for the validated ADF runs.
@@ -407,11 +417,24 @@ Failure runbook written in docs/runbooks/inject_failure.md.
     becomes real anyway.
 
 ---
-*Updated: 2026-05-01 (Session 5 wrap). Update this file at the end of every session before closing.*
+*Updated: 2026-07-01 (Session 22 wrap). Update this file at the end of every session before closing.*
 
 ---
 
 ## Session Log
+
+### 2026-07-01 (Session 22 — resume-after-gap review + verification, and the RCA-retrieval architecture pivot)
+**Objective:** Jog memory after a ~2-week gap (last work S21). Reconcile docs vs. git, verify the S21 "confirm the first autonomous fire" carry-over, and think through the AI half. No code — review, verification, and architecture design.
+**Built / did:**
+- **State reconciliation (both repos):** confirmed `PipelineIQ-Architecture` + `PipelineIQ-IaC` both clean/pushed, tips S21 (`84903c8` / `46d306e`). Cross-checked the "dropped session" narrative against git — the S20-cont session (06-09 eve) committed the cutover (`2fb071d`, `trg_daily_0040`→`trg_daily_0100`+STARTED), then its catch-up silently failed *uncommitted*; S21 recovered it. Fully corroborated across both repos, not just prose.
+- **Autonomy CONFIRMED (user-verified):** `trg_daily_0100` has fired green end-to-end **every night 06-11 → 06-30** (~20 consecutive runs, 30–40 min each, 01:00 UTC / 06:30 IST), no recoveries. The 06-10 skip was correct (startTime anchor strictly-after `2026-06-10T01:00:00Z`). Data platform (phases 0-2 + Tier 6) is fully self-driving. Closed the S21 carry-over.
+- **Doc fixes:** `build_order.md` 6.11 Pending→Done (`trg_daily_0040`→`0100`); CLAUDE.md arch-row + carry-over flipped to CONFIRMED; PROGRESS Next-task item 1 → Done. Committed `a963c92`.
+- **RCA-retrieval architecture pivot (the substance of the session):** worked through *how* the AI half should find relevant code at failure time. Concluded **navigation-first (agentic/structural retrieval), not embedding-first** — `pgvector` demoted to a semantic fallback. 4-layer progressive fallback (Router → Dependency-expander → Agentic-nav → pgvector), driven by a metadata **manifest** (code-plane analog of `entity_registry`) ⇒ architecture-agnostic for the conglomerate scale. Wrote **`docs/rca_retrieval_design.md`** (full design + worked schema-drift example over real files + the "playground" = git-checkout-on-Azure-Files kept fresh by the existing DevOps webhook + read-only tools + open questions). Logged **DECISIONS #83**.
+**Worked:** git cross-checking cleanly explained the abrupt-end memory (measured, not assumed). The 15K-token IaC measurement reframed the whole RAG-vs-navigation question. The `entity_registry`→manifest symmetry landed as the unifying idea.
+**Broke / iterated:** none — no code changed beyond docs. My first "pre-S21 dropped session" claim was relayed-from-docs, not verified; user pushed, I checked git and it held up (a good catch on rigor).
+**Uncertainty / open:** RCA design is DIRECTION only, not built. Main undecided dial = agentic (Layer 3) vs. deterministic (Layer 1) balance. Manifest schema, failure taxonomy (map the 6 `failure_injector` scenarios), dependency parsers, and pgvector's final weight all still to spec. User has more questions/understanding to add next session before any code. All captured in `docs/rca_retrieval_design.md` §9.
+**Next:** Phase 4/3 build, but re-scoped around navigation-first. First real artifact = the manifest (`component_registry`) schema + the Router/Dependency-expander modules + wiring the DevOps-webhook checkout-sync into the FastAPI plan (Phase 5). Continue the design discussion first — don't code until the open questions in the design doc are settled.
+**Summary:** A resume/verification session that closed the last data-platform loose end (autonomy confirmed across ~20 nights) and reconciled every doc against git so nothing was silently missed. The real output is an architecture pivot for the AI half: RCA retrieval becomes navigation-first (route to the exact artifact by structured failure signal + a client manifest, follow its deps, fall back to an LLM-with-tools agent, and only then to pgvector) — chosen for reliability on structured failures and O(blast-radius) scaling to a huge client architecture, reusing the project's own metadata-driven philosophy. Captured in `docs/rca_retrieval_design.md` + DECISIONS #83 so the understanding survives the gap. Nothing built yet; discussion continues next session.
 
 ### 2026-06-10 (Session 21 — recover dropped S20-cont session: close gap + make ADF super-stable via incremental bronze)
 **Objective:** Recover a session that was closed mid-way (terminal shut during a medallion catch-up), then harden ADF to autonomous/self-driving — kill the laptop-scaffold dependency.

@@ -481,6 +481,16 @@ Claude needs that cannot be derived from reading the project files directly.
 Active items that cross session boundaries. Remove a row once resolved — do
 not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`.
 
+- **NEXT UP — AI half (Phases 3/4/5), re-scoped navigation-first (S22, DECISIONS #83).**
+  RCA retrieval is **navigation-first, not embedding-first**: route to the exact
+  failing artifact by structured failure signal + a client **manifest**
+  (`component_registry`, the code-plane analog of `entity_registry`), follow its
+  deps, fall back to an LLM-with-read-only-tools agent, then to `pgvector` last.
+  Full design + worked example + the "playground" (git checkout on Azure Files,
+  kept fresh by the existing DevOps webhook) + open questions in
+  **`docs/rca_retrieval_design.md`**. **DESIGN ONLY — no code yet; continue the
+  discussion (open questions in §9) before building.** First artifact = the
+  manifest schema + Router/Dependency-expander + webhook checkout-sync.
 - ~~Generator `--dry-run` mode is broken~~ **Fixed (S18, build_order 9.1).** On an
   unseeded DB, dry-run built the catalogue in memory, skipped the INSERT, then
   `load_from_db` returned empty → `ValueError: product_pool is empty` in orders.
@@ -604,6 +614,7 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
 | Writing a specific service's code | docs/{service}.md if it exists |
 | ADF pipeline structure | docs/pipeline.md |
 | pgvector / AI RCA logic | docs/ai_rca.md |
+| How RCA finds relevant code (navigation-first retrieval) | docs/rca_retrieval_design.md (+ DECISIONS #83) |
 | Fixing a PostgreSQL schema issue | scripts/bootstrap_postgres.sql |
 | Fixing an Azure SQL schema issue | scripts/bootstrap_sql.sql |
 | Hit an error that feels familiar | docs/incident_log.md — check Index table before chasing speculative causes |
