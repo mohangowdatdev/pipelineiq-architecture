@@ -94,22 +94,22 @@ S15 (architecture migration only, no new columns/tables).
 
 ## Next task
 
-**Tier 6 ADF — DONE + AUTONOMOUS (S21).** Cutover complete, bronze incremental,
-full chain validated end-to-end. The data platform (phases 0-2 + Tier 6) is
-complete and self-driving. Two follow-ups, then the project moves to the
-AI-native half:
+**Tier 6 ADF — DONE + AUTONOMOUS (S21), AUTONOMY CONFIRMED (2026-07-01).** Cutover
+complete, bronze incremental, full chain validated end-to-end. The data platform
+(phases 0-2 + Tier 6) is complete and self-driving. **The AI-native half is now
+the active track.**
 
-1. **Confirm the first autonomous fire (06-11 01:00 UTC, writes 06-10).** The
-   trigger's 06-10 window did NOT fire (started at/after the startTime anchor);
-   re-armed S21. Verify tomorrow: a `trg_daily_0100` trigger-run exists AND
-   `pl_master_copy` Succeeded AND medallion advanced to 06-10 (incremental bronze
-   `replaceWhere` for the new `_load_date`). If it no-shows again, escalate the
-   schedule anchor (bump startTime to a near-future time + re-start).
+1. ✅ **DONE — first autonomous fire confirmed (user-verified 2026-07-01).**
+   `trg_daily_0100` fired green end-to-end every night 06-11 → 06-30 (~20
+   consecutive runs, 30–40 min each, 01:00 UTC / 06:30 IST), no recoveries. The
+   06-10 window was correctly skipped (startTime anchor strictly-after
+   `2026-06-10T01:00:00Z`); first real fire was 06-11 as predicted. Query for
+   re-audit if needed:
    ```bash
    az datafactory trigger-run query-by-factory -g pipelineiq-rg-dev \
      --factory-name pipelineiq-adf-dev --filters operand=TriggerName operator=Equals \
      values=trg_daily_0100 --last-updated-after 2026-06-11T00:00:00Z \
-     --last-updated-before 2026-06-11T06:00:00Z
+     --last-updated-before 2026-07-01T06:00:00Z
    ```
 2. **Optional bronze hygiene:** 264 duplicate 06-07 orders in `bronze.orders`
    (one-time scaffold landing artifact; silver dedups). Clears itself when ADF

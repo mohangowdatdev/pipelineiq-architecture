@@ -181,7 +181,7 @@ The diagram above is the **architected** topology, not the **built** one. Honest
 | Generator on Function App (Flex) → source DB | ✅ | Writes orders/lines/status_log/dim changes (its sweet spot). Inventory write **REMOVED** in S14 (DECISIONS #71) — see next row. |
 | **Databricks Job → inventory_snapshot** (S14, DECISIONS #71) | ✅ | Daily 00:35 UTC scheduled Job runs `notebooks/source_sim/write_inventory_snapshot.py`. Spark JDBC bulk insert, ~3-4 min wall. Replaces the Function App inventory write — S13's 3-pronged mitigation failed (11 consecutive partial fires 5/14-5/24). |
 | Logic App schedule | ✅ | Fires Function at 00:30 UTC; Databricks Workflow has its own cron trigger at 00:35 UTC. |
-| **ADF Copy Activity** landing extract | ✅ **Built + AUTONOMOUS (S21) — cutover done, incremental bronze, end-to-end validated** | Full chunk-2 `pl_master_copy` is live + autonomous (`pipelineiq-adf-dev`): `GetEntities`→`ForEach`(12, copy+control-plane)→`StartMedallion`(run-now `core/medallion_workflow`, passing `run_date`)→`PollMedallion`→`AssertMedallion`→`LogRunEnd`. `RunMedallion` UC blocker resolved via a TF-defined SINGLE_USER job (DECISIONS #79); bronze enforces ADF-canonical types (#80) + is now **incremental/idempotent** (#82); gold ordering fixed (#81). **S21:** `trg_daily_0100` (01:00 UTC) **Started**; laptop scaffold **retired** (⛔); full chain validated end-to-end (manual fire run_date=2026-06-08 Succeeded, idempotent). **Remaining:** confirm the first autonomous fire (06-11 01:00 UTC) — see `## Pending / carry-overs`. |
+| **ADF Copy Activity** landing extract | ✅ **Built + AUTONOMOUS (S21) — cutover done, incremental bronze, end-to-end validated** | Full chunk-2 `pl_master_copy` is live + autonomous (`pipelineiq-adf-dev`): `GetEntities`→`ForEach`(12, copy+control-plane)→`StartMedallion`(run-now `core/medallion_workflow`, passing `run_date`)→`PollMedallion`→`AssertMedallion`→`LogRunEnd`. `RunMedallion` UC blocker resolved via a TF-defined SINGLE_USER job (DECISIONS #79); bronze enforces ADF-canonical types (#80) + is now **incremental/idempotent** (#82); gold ordering fixed (#81). **S21:** `trg_daily_0100` (01:00 UTC) **Started**; laptop scaffold **retired** (⛔); full chain validated end-to-end (manual fire run_date=2026-06-08 Succeeded, idempotent). **AUTONOMY CONFIRMED (2026-07-01):** `trg_daily_0100` has fired green end-to-end every night 06-11 → 06-30 (~20 consecutive runs, 30–40 min each, 01:00 UTC / 06:30 IST) — the platform is fully self-driving, no recoveries needed. |
 | ADLS Gen2 medallion (landing/bronze/silver/gold) | ✅ | Phase 2 fully complete |
 | Bronze/Silver/Gold Databricks notebooks | ✅ | Entity-agnostic ingestion, all 12 entities through gold |
 | Databricks SQL Warehouse | ✅ | Used for verification + future Power BI / VS Code |
@@ -538,10 +538,11 @@ not let this list grow stale. Full context lives in PROGRESS.md `## Session Log`
   (DECISIONS #82) so nightly autonomy is bounded. Full `pl_master_copy`→`StartMedallion(
   run_date)`→incremental-medallion chain **validated end-to-end** (manual fire run_date=
   2026-06-08, Succeeded, idempotent). **Watermark committed per-copy inside the ForEach**
-  (DECISIONS #75). ▶ **REMAINING: verify the first autonomous fire** (06-11 01:00 UTC writes
-  06-10) — the trigger's 06-10 window did NOT fire (started after/at the startTime anchor;
-  re-armed S21, next occurrence 06-11). Confirm a `trg_daily_0100` trigger-run + green
-  `pl_master_copy` tomorrow; if it no-shows again, escalate the schedule-anchor.
+  (DECISIONS #75). ✅ **AUTONOMY CONFIRMED (2026-07-01):** `trg_daily_0100` fired green
+  end-to-end every night 06-11 → 06-30 (~20 consecutive runs, 30–40 min each, 01:00 UTC /
+  06:30 IST), no recoveries. The 06-10 window was correctly skipped (startTime anchor is
+  strictly-after `2026-06-10T01:00:00Z`); first real fire was 06-11 as predicted. The data
+  platform (phases 0-2 + Tier 6) is fully self-driving — this carry-over is CLOSED.
   ✅ **Bronze-growth concern RESOLVED (S21, DECISIONS #82):** bronze is now **incremental +
   idempotent** — it ingests only `run_date`'s partition (by-date: `replaceWhere _load_date`;
   full-load: overwrite-latest-snapshot), partitioned by `_load_date`. A nightly trigger now
